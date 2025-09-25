@@ -1244,10 +1244,6 @@ export type Database = {
           supabase_auth_id: string
         }[]
       }
-      get_user_id_by_email: {
-        Args: { user_email: string }
-        Returns: string
-      }
       link_client_auth_id: {
         Args: Record<PropertyKey, never>
         Returns: undefined
