@@ -336,11 +336,13 @@ async function syncToMailerLite(supabaseClient: any, headers: any, options: Sync
 async function bidirectionalSync(supabaseClient: any, headers: any, syncType: string, options: SyncOptions) {
   console.log('Starting bidirectional sync with conflict detection');
   
-  // First, partially sync from MailerLite to get latest data (respecting limits)
-  const fromML = await syncFromMailerLite(supabaseClient, headers, options);
+  // First, fully sync from MailerLite (remove limits for full import)
+  const fullSyncOptions = { ...options, maxRecords: 0 }; // Ensure unlimited
+  const fromML = await syncFromMailerLite(supabaseClient, headers, fullSyncOptions);
   
-  // Then detect conflicts on the synced subset
-  const conflicts = await detectConflicts(supabaseClient, headers, options);
+  // Then detect conflicts on a limited subset (for performance)
+  const conflictOptions = { ...options, maxRecords: 2000 }; // Limit only conflict detection
+  const conflicts = await detectConflicts(supabaseClient, headers, conflictOptions);
   
   // Log conflicts for manual resolution
   for (const conflict of conflicts) {
