@@ -37,7 +37,7 @@ serve(async (req) => {
   try {
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_ANON_KEY') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
       {
         auth: {
           autoRefreshToken: false,
@@ -49,7 +49,7 @@ serve(async (req) => {
     const { 
       syncType, 
       direction, 
-      batchSize = 100, 
+      batchSize = 500, 
       maxRecords = 0,
       offset = 0,
       fieldMappings = []
@@ -127,6 +127,7 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
   let totalSynced = 0;
   let currentOffset = options.offset;
   const { batchSize, maxRecords } = options;
+  let batchCount = 0;
   
   while (true) {
     // Build MailerLite API URL with pagination
@@ -153,33 +154,48 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
       break;
     }
 
-    // Process batch of subscribers
+    // Process batch of subscribers with better error handling
+    const subscriberBatch = [];
     for (const subscriber of subscribers) {
       const mappedData = mapFields(subscriber, options.fieldMappings, 'mailerlite_to_supabase');
       
-      await supabaseClient
-        .from('ml_subscribers')
-        .upsert({
-          ml_id: subscriber.id,
-          email: subscriber.email,
-          name: mappedData.name || subscriber.fields?.name || null,
-          status: subscriber.status,
-          consent: subscriber.opted_in_at ? 'single_opt_in' : null,
-          fields: subscriber.fields || {},
-          updated_at: new Date().toISOString()
-        });
+      subscriberBatch.push({
+        ml_id: subscriber.id,
+        email: subscriber.email,
+        name: mappedData.name || subscriber.fields?.name || null,
+        status: subscriber.status,
+        consent: subscriber.opted_in_at ? 'single_opt_in' : null,
+        fields: subscriber.fields || {},
+        updated_at: new Date().toISOString()
+      });
+    }
 
-      totalSynced++;
-      
-      // Check if we've reached the max records limit
-      if (maxRecords > 0 && totalSynced >= maxRecords) {
-        console.log(`Reached max records limit: ${maxRecords}`);
-        return { 
-          subscribersSynced: totalSynced, 
-          hasMore: subscribers.length === batchSize,
-          nextOffset: currentOffset + batchSize
-        };
-      }
+    // Batch upsert for better performance
+    const { error } = await supabaseClient
+      .from('ml_subscribers')
+      .upsert(subscriberBatch);
+
+    if (error) {
+      console.error('Batch upsert error:', error);
+      throw new Error(`Failed to sync batch: ${error.message}`);
+    }
+
+    totalSynced += subscribers.length;
+    batchCount++;
+    
+    // Progress logging every 10 batches (for large syncs)
+    if (batchCount % 10 === 0) {
+      console.log(`Progress: ${totalSynced} subscribers synced (${batchCount} batches processed)`);
+    }
+    
+    // Check if we've reached the max records limit
+    if (maxRecords > 0 && totalSynced >= maxRecords) {
+      console.log(`Reached max records limit: ${maxRecords}`);
+      return { 
+        subscribersSynced: totalSynced, 
+        hasMore: subscribers.length === batchSize,
+        nextOffset: currentOffset + batchSize
+      };
     }
 
     currentOffset += batchSize;
