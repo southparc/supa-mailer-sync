@@ -334,86 +334,182 @@ async function syncToMailerLite(supabaseClient: any, headers: any, options: Sync
 }
 
 async function bidirectionalSync(supabaseClient: any, headers: any, syncType: string, options: SyncOptions) {
-  console.log('Starting bidirectional sync with conflict detection');
+  console.log('Starting comprehensive bidirectional sync with full conflict detection');
   
-  // First, fully sync from MailerLite (remove limits for full import)
-  const fullSyncOptions = { ...options, maxRecords: 0 }; // Ensure unlimited
-  const fromML = await syncFromMailerLite(supabaseClient, headers, fullSyncOptions);
+  // First, import all data from MailerLite (no limits)
+  const importOptions = { ...options, maxRecords: 0 }; // Remove any limits for import
+  console.log('Step 1: Importing all data from MailerLite...');
+  const fromML = await syncFromMailerLite(supabaseClient, headers, importOptions);
   
-  // Then detect conflicts on a limited subset (for performance)
-  const conflictOptions = { ...options, maxRecords: 2000 }; // Limit only conflict detection
-  const conflicts = await detectConflicts(supabaseClient, headers, conflictOptions);
+  // Then detect conflicts across all imported records
+  console.log('Step 2: Detecting conflicts across all records...');
+  const conflicts = await detectConflicts(supabaseClient, headers, options);
   
-  // Log conflicts for manual resolution
-  for (const conflict of conflicts) {
-    await supabaseClient
-      .from('ml_outbox')
-      .insert({
+  // Log all conflicts for manual resolution (don't let conflicts stop the sync)
+  if (conflicts.length > 0) {
+    console.log(`Found ${conflicts.length} conflicts, logging them for review...`);
+    
+    // Batch insert conflicts to avoid overwhelming the database
+    const conflictBatches = [];
+    for (let i = 0; i < conflicts.length; i += 50) {
+      conflictBatches.push(conflicts.slice(i, i + 50));
+    }
+    
+    for (const batch of conflictBatches) {
+      const conflictRecords = batch.map(conflict => ({
         action: 'conflict_detected',
         entity_type: 'subscriber',
         payload: conflict,
-        status: 'pending'
-      });
+        status: 'pending',
+        dedupe_key: `conflict_${conflict.email}_${conflict.field}`
+      }));
+      
+      const { error } = await supabaseClient
+        .from('ml_outbox')
+        .upsert(conflictRecords, { onConflict: 'dedupe_key' });
+        
+      if (error) {
+        console.error('Error logging conflicts:', error);
+      }
+    }
   }
   
   return {
     ...fromML,
-    conflictsDetected: conflicts.length
+    conflictsDetected: conflicts.length,
+    conflictsSummary: {
+      total: conflicts.length,
+      types: {
+        value_mismatch: conflicts.filter(c => c.conflict_type === 'value_mismatch').length,
+        field_mismatch: conflicts.filter(c => c.conflict_type === 'field_mismatch').length,
+        missing_in_mailerlite: conflicts.filter(c => c.conflict_type === 'missing_in_mailerlite').length
+      }
+    }
   };
 }
 
 async function detectConflicts(supabaseClient: any, headers: any, options: SyncOptions) {
-  console.log('Detecting conflicts between MailerLite and Supabase');
+  console.log('Detecting conflicts between MailerLite and Supabase for all records');
   
   const conflicts = [];
-  const { batchSize, maxRecords } = options;
+  let processedCount = 0;
+  let offset = 0;
+  const batchSize = 100; // Smaller batches for conflict detection
   
-  // Get subscribers from Supabase (limited by our options)
-  const { data: supabaseSubscribers } = await supabaseClient
-    .from('ml_subscribers')
-    .select('*')
-    .limit(maxRecords > 0 ? Math.min(maxRecords, 1000) : 1000); // Limit conflict detection
+  while (true) {
+    // Get batch of subscribers from Supabase
+    const { data: supabaseSubscribers, error } = await supabaseClient
+      .from('ml_subscribers')
+      .select('*')
+      .range(offset, offset + batchSize - 1)
+      .order('email');
 
-  // Get corresponding subscribers from MailerLite
-  for (const supabaseSub of supabaseSubscribers) {
-    try {
-      const searchResponse = await fetch(`https://connect.mailerlite.com/api/subscribers?filter[email]=${supabaseSub.email}`, {
-        headers
-      });
-      
-      if (searchResponse.ok) {
-        const { data: mlSubscribers } = await searchResponse.json();
+    if (error) {
+      console.error('Error fetching Supabase subscribers:', error);
+      break;
+    }
+
+    if (!supabaseSubscribers || supabaseSubscribers.length === 0) {
+      console.log('No more Supabase subscribers to process for conflict detection');
+      break;
+    }
+
+    console.log(`Checking conflicts for batch ${Math.floor(offset/batchSize) + 1}: ${supabaseSubscribers.length} subscribers`);
+
+    // Check each subscriber against MailerLite
+    for (const supabaseSub of supabaseSubscribers) {
+      try {
+        // Search for matching email in MailerLite
+        const searchUrl = `https://connect.mailerlite.com/api/subscribers?filter[email]=${encodeURIComponent(supabaseSub.email)}`;
+        const searchResponse = await fetch(searchUrl, { headers });
         
-        if (mlSubscribers.length > 0) {
-          const mlSub = mlSubscribers[0];
+        if (searchResponse.ok) {
+          const { data: mlSubscribers } = await searchResponse.json();
           
-          // Compare fields and detect differences
-          if (supabaseSub.name !== (mlSub as any).fields?.name) {
+          if (mlSubscribers && mlSubscribers.length > 0) {
+            const mlSub = mlSubscribers[0];
+            const detectedConflicts = [];
+            
+            // Compare name fields
+            const mlName = mlSub.fields?.name || mlSub.name || '';
+            const supabaseName = supabaseSub.name || '';
+            if (mlName !== supabaseName) {
+              detectedConflicts.push({
+                email: supabaseSub.email,
+                field: 'name',
+                supabase_value: supabaseName,
+                mailerlite_value: mlName,
+                conflict_type: 'value_mismatch'
+              });
+            }
+            
+            // Compare status
+            if (supabaseSub.status !== mlSub.status) {
+              detectedConflicts.push({
+                email: supabaseSub.email,
+                field: 'status',
+                supabase_value: supabaseSub.status,
+                mailerlite_value: mlSub.status,
+                conflict_type: 'value_mismatch'
+              });
+            }
+            
+            // Compare custom fields (if any)
+            const mlFields = mlSub.fields || {};
+            const supabaseFields = supabaseSub.fields || {};
+            
+            // Check for field differences
+            const allFieldKeys = new Set([...Object.keys(mlFields), ...Object.keys(supabaseFields)]);
+            for (const fieldKey of allFieldKeys) {
+              if (fieldKey !== 'name' && mlFields[fieldKey] !== supabaseFields[fieldKey]) {
+                detectedConflicts.push({
+                  email: supabaseSub.email,
+                  field: `fields.${fieldKey}`,
+                  supabase_value: supabaseFields[fieldKey],
+                  mailerlite_value: mlFields[fieldKey],
+                  conflict_type: 'field_mismatch'
+                });
+              }
+            }
+            
+            conflicts.push(...detectedConflicts);
+            
+            if (detectedConflicts.length > 0) {
+              console.log(`Found ${detectedConflicts.length} conflicts for ${supabaseSub.email}`);
+            }
+          } else {
+            // Subscriber exists in Supabase but not in MailerLite
             conflicts.push({
               email: supabaseSub.email,
-              field: 'name',
-              supabase_value: supabaseSub.name,
-              mailerlite_value: (mlSub as any).fields?.name,
-              conflict_type: 'value_mismatch'
-            });
-          }
-          
-          if (supabaseSub.status !== (mlSub as any).status) {
-            conflicts.push({
-              email: supabaseSub.email,
-              field: 'status', 
-              supabase_value: supabaseSub.status,
-              mailerlite_value: (mlSub as any).status,
-              conflict_type: 'value_mismatch'
+              field: 'existence',
+              supabase_value: 'exists',
+              mailerlite_value: 'missing',
+              conflict_type: 'missing_in_mailerlite'
             });
           }
         }
+        
+        processedCount++;
+        
+        // Add small delay to avoid rate limiting
+        if (processedCount % 10 === 0) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        
+      } catch (error) {
+        console.error(`Error checking conflicts for ${supabaseSub.email}:`, error);
       }
-    } catch (error) {
-      console.error(`Error checking conflicts for ${supabaseSub.email}:`, error);
+    }
+    
+    offset += batchSize;
+    
+    // Progress logging
+    if (offset % 500 === 0) {
+      console.log(`Conflict detection progress: ${processedCount} records processed, ${conflicts.length} conflicts found`);
     }
   }
   
+  console.log(`Conflict detection completed: ${processedCount} records processed, ${conflicts.length} total conflicts found`);
   return conflicts;
 }
 
