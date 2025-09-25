@@ -35,6 +35,8 @@ serve(async (req) => {
   }
 
   try {
+    console.log('=== SYNC FUNCTION STARTED ===');
+    
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
@@ -45,6 +47,7 @@ serve(async (req) => {
         }
       }
     );
+    console.log('✓ Supabase client created');
 
     const { 
       syncType, 
@@ -55,13 +58,15 @@ serve(async (req) => {
       fieldMappings = []
     }: SyncRequest = await req.json();
     
-    console.log(`Starting ${syncType} sync in ${direction} direction with batch size ${batchSize}`);
+    console.log(`✓ Request parsed - ${syncType} sync in ${direction} direction with batch size ${batchSize}`);
 
     // Initialize MailerLite API client
     const mailerLiteApiKey = Deno.env.get('MAILERLITE_API_KEY');
     if (!mailerLiteApiKey) {
+      console.error('✗ MailerLite API key not found');
       throw new Error('MailerLite API key not configured');
     }
+    console.log('✓ MailerLite API key found');
 
     const mailerLiteHeaders = {
       'Authorization': `Bearer ${mailerLiteApiKey}`,
@@ -74,21 +79,30 @@ serve(async (req) => {
       offset,
       fieldMappings
     };
+    console.log('✓ Sync options prepared');
 
     let result = {};
 
+    console.log(`Executing sync direction: ${direction}`);
     switch (direction) {
       case 'from_mailerlite':
+        console.log('→ Starting syncFromMailerLite');
         result = await syncFromMailerLite(supabaseClient, mailerLiteHeaders, syncOptions);
+        console.log('✓ syncFromMailerLite completed');
         break;
       case 'to_mailerlite': 
+        console.log('→ Starting syncToMailerLite');
         result = await syncToMailerLite(supabaseClient, mailerLiteHeaders, syncOptions);
+        console.log('✓ syncToMailerLite completed');
         break;
       case 'bidirectional':
+        console.log('→ Starting bidirectionalSync');
         result = await bidirectionalSync(supabaseClient, mailerLiteHeaders, syncType, syncOptions);
+        console.log('✓ bidirectionalSync completed');
         break;
     }
 
+    console.log('→ Updating sync state...');
     // Update sync state
     await supabaseClient
       .from('ml_sync_state')
@@ -97,6 +111,9 @@ serve(async (req) => {
         last_full_backfill_at: new Date().toISOString(),
         last_incremental_since: new Date().toISOString()
       });
+    
+    console.log('✓ Sync state updated successfully');
+    console.log('=== SYNC FUNCTION COMPLETED ===', result);
 
     return new Response(
       JSON.stringify({ success: true, result }),
@@ -107,7 +124,11 @@ serve(async (req) => {
     );
 
   } catch (error) {
-    console.error('Sync error:', error);
+    console.error('Sync error details:', {
+      message: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined,
+      error: error
+    });
     return new Response(
       JSON.stringify({ 
         error: error instanceof Error ? error.message : 'Unknown error',
