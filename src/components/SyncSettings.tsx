@@ -43,18 +43,138 @@ const defaultConfig: SyncConfig = {
       is_required: true
     },
     {
-      id: '2', 
+      id: '2',
       mailerlite_field: 'fields.name',
-      supabase_field: 'name',
+      supabase_field: 'first_name',
       field_type: 'text',
       is_required: false
     },
     {
       id: '3',
-      mailerlite_field: 'status',
-      supabase_field: 'status',
+      mailerlite_field: 'fields.last_name',
+      supabase_field: 'last_name',
       field_type: 'text',
       is_required: false
+    },
+    {
+      id: '4',
+      mailerlite_field: 'fields.phone',
+      supabase_field: 'phone',
+      field_type: 'text',
+      is_required: false
+    },
+    {
+      id: '5',
+      mailerlite_field: 'fields.company',
+      supabase_field: 'company',
+      field_type: 'text',
+      is_required: false
+    },
+    {
+      id: '6',
+      mailerlite_field: 'fields.city',
+      supabase_field: 'city',
+      field_type: 'text',
+      is_required: false
+    },
+    {
+      id: '7',
+      mailerlite_field: 'fields.country',
+      supabase_field: 'country',
+      field_type: 'text',
+      is_required: false
+    },
+    {
+      id: '8',
+      mailerlite_field: 'fields.zip',
+      supabase_field: 'zip',
+      field_type: 'text',
+      is_required: false
+    },
+    {
+      id: '9',
+      mailerlite_field: 'fields.birth_date',
+      supabase_field: 'birth_date',
+      field_type: 'date',
+      is_required: false
+    },
+    {
+      id: '10',
+      mailerlite_field: 'fields.gender',
+      supabase_field: 'gender',
+      field_type: 'text',
+      is_required: false
+    },
+    {
+      id: '11',
+      mailerlite_field: 'fields.gross_income',
+      supabase_field: 'gross_income',
+      field_type: 'number',
+      is_required: false
+    },
+    {
+      id: '12',
+      mailerlite_field: 'fields.net_monthly_income',
+      supabase_field: 'net_monthly_income',
+      field_type: 'number',
+      is_required: false
+    },
+    {
+      id: '13',
+      mailerlite_field: 'fields.net_monthly_spending',
+      supabase_field: 'net_monthly_spending',
+      field_type: 'number',
+      is_required: false
+    },
+    {
+      id: '14',
+      mailerlite_field: 'fields.saving_balance',
+      supabase_field: 'saving_balance',
+      field_type: 'number',
+      is_required: false
+    },
+    {
+      id: '15',
+      mailerlite_field: 'fields.investment_balance',
+      supabase_field: 'investment_balance',
+      field_type: 'number',
+      is_required: false
+    },
+    {
+      id: '16',
+      mailerlite_field: 'fields.pension_income',
+      supabase_field: 'pension_income',
+      field_type: 'number',
+      is_required: false
+    },
+    {
+      id: '17',
+      mailerlite_field: 'fields.risk_profile',
+      supabase_field: 'risk_profile',
+      field_type: 'text',
+      is_required: false
+    },
+    {
+      id: '18',
+      mailerlite_field: 'fields.employment_type',
+      supabase_field: 'employment_type',
+      field_type: 'text',
+      is_required: false
+    },
+    {
+      id: '19',
+      mailerlite_field: 'fields.planning_status',
+      supabase_field: 'planning_status',
+      field_type: 'text',
+      is_required: false
+    },
+    {
+      id: '20',
+      mailerlite_field: 'status',
+      supabase_field: 'mailerlite_status',
+      field_type: 'text',
+      is_required: false,
+      default_value: 'active'
     }
   ],
   auto_resolve_conflicts: false,
