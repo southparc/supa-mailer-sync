@@ -430,10 +430,20 @@ async function detectConflicts(supabaseClient: any, headers: any, options: SyncO
             const mlSub = mlSubscribers[0];
             const detectedConflicts = [];
             
-            // Compare name fields
-            const mlName = mlSub.fields?.name || mlSub.name || '';
-            const supabaseName = supabaseSub.name || '';
-            if (mlName !== supabaseName) {
+            // Helper function to check if a value is empty (null, undefined, or empty string)
+            const isEmpty = (value: any) => {
+              return value === null || value === undefined || value === '';
+            };
+            
+            // Helper function to check if values are genuinely different (both non-empty and different)
+            const hasGenuineConflict = (value1: any, value2: any) => {
+              return !isEmpty(value1) && !isEmpty(value2) && value1 !== value2;
+            };
+
+            // Compare name fields - only flag if both have different non-empty values
+            const mlName = mlSub.fields?.name || mlSub.name || null;
+            const supabaseName = supabaseSub.name || null;
+            if (hasGenuineConflict(mlName, supabaseName)) {
               detectedConflicts.push({
                 email: supabaseSub.email,
                 field: 'name',
@@ -443,8 +453,8 @@ async function detectConflicts(supabaseClient: any, headers: any, options: SyncO
               });
             }
             
-            // Compare status
-            if (supabaseSub.status !== mlSub.status) {
+            // Compare status - only flag if both have different non-empty values
+            if (hasGenuineConflict(supabaseSub.status, mlSub.status)) {
               detectedConflicts.push({
                 email: supabaseSub.email,
                 field: 'status',
@@ -454,14 +464,14 @@ async function detectConflicts(supabaseClient: any, headers: any, options: SyncO
               });
             }
             
-            // Compare custom fields (if any)
+            // Compare custom fields - only flag genuine conflicts
             const mlFields = mlSub.fields || {};
             const supabaseFields = supabaseSub.fields || {};
             
-            // Check for field differences
+            // Check for field differences (excluding name which we already handled)
             const allFieldKeys = new Set([...Object.keys(mlFields), ...Object.keys(supabaseFields)]);
             for (const fieldKey of allFieldKeys) {
-              if (fieldKey !== 'name' && mlFields[fieldKey] !== supabaseFields[fieldKey]) {
+              if (fieldKey !== 'name' && hasGenuineConflict(mlFields[fieldKey], supabaseFields[fieldKey])) {
                 detectedConflicts.push({
                   email: supabaseSub.email,
                   field: `fields.${fieldKey}`,
