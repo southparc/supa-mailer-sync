@@ -9,6 +9,7 @@ import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
 import { ConflictResolution } from "@/components/ConflictResolution";
 import { SyncControls } from "@/components/SyncControls";
+import { SyncSettings } from "@/components/SyncSettings";
 import { SyncLogs } from "@/components/SyncLogs";
 import { LogOut, RefreshCw, AlertTriangle, Users, Database } from "lucide-react";
 
@@ -183,9 +184,10 @@ export default function Dashboard() {
 
         {/* Main Content Tabs */}
         <Tabs defaultValue="conflicts" className="space-y-6">
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="conflicts">Conflict Resolution</TabsTrigger>
             <TabsTrigger value="sync">Sync Controls</TabsTrigger>
+            <TabsTrigger value="settings">Settings</TabsTrigger>
             <TabsTrigger value="logs">Sync Logs</TabsTrigger>
           </TabsList>
 
@@ -213,6 +215,20 @@ export default function Dashboard() {
               </CardHeader>
               <CardContent>
                 <SyncControls onStatsUpdate={loadDashboardStats} />
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="settings" className="space-y-6">
+            <Card>
+              <CardHeader>
+                <CardTitle>Sync Configuration</CardTitle>
+                <CardDescription>
+                  Configure field mappings and batch processing for large datasets
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <SyncSettings />
               </CardContent>
             </Card>
           </TabsContent>
