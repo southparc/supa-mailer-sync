@@ -24,7 +24,7 @@ serve(async (req) => {
   try {
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_ANON_KEY') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
       {
         auth: {
           autoRefreshToken: false,
@@ -163,10 +163,39 @@ async function updateSupabaseSubscriber(resolution: ConflictResolution, supabase
     .from('ml_subscribers')
     .select('*')
     .eq('email', resolution.email)
-    .single();
+    .maybeSingle();
 
-  if (findError || !subscriber) {
-    throw new Error(`Subscriber ${resolution.email} not found in Supabase`);
+  if (findError) {
+    throw new Error(`Database error finding subscriber ${resolution.email}: ${findError.message}`);
+  }
+
+  let subscriberToUpdate = subscriber;
+
+  // If subscriber doesn't exist, create a new one
+  if (!subscriber) {
+    console.log(`Creating new subscriber for ${resolution.email}`);
+    
+    const newSubscriberData = {
+      email: resolution.email,
+      name: resolution.field === 'name' ? resolution.chosenValue : null,
+      status: resolution.field === 'status' ? resolution.chosenValue : 'active',
+      fields: resolution.field !== 'name' && resolution.field !== 'status' ? 
+        { [resolution.field]: resolution.chosenValue } : {},
+      updated_at: new Date().toISOString()
+    };
+
+    const { data: newSubscriber, error: insertError } = await supabaseClient
+      .from('ml_subscribers')
+      .insert(newSubscriberData)
+      .select()
+      .single();
+
+    if (insertError) {
+      throw new Error(`Failed to create new subscriber ${resolution.email}: ${insertError.message}`);
+    }
+
+    subscriberToUpdate = newSubscriber;
+    console.log(`Created new subscriber ${resolution.email} with ID ${newSubscriber.id}`);
   }
 
   // Prepare update data based on field
@@ -182,7 +211,7 @@ async function updateSupabaseSubscriber(resolution: ConflictResolution, supabase
     default:
       // For custom fields, update the fields JSON
       updateData.fields = {
-        ...subscriber.fields,
+        ...subscriberToUpdate.fields,
         [resolution.field]: resolution.chosenValue
       };
   }
@@ -193,7 +222,7 @@ async function updateSupabaseSubscriber(resolution: ConflictResolution, supabase
   const { error: updateError } = await supabaseClient
     .from('ml_subscribers')
     .update(updateData)
-    .eq('id', subscriber.id);
+    .eq('id', subscriberToUpdate.id);
 
   if (updateError) {
     throw new Error(`Failed to update Supabase subscriber: ${updateError.message}`);

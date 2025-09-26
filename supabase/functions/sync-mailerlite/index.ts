@@ -194,7 +194,7 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
     // Batch upsert for better performance
     const { error } = await supabaseClient
       .from('ml_subscribers')
-      .upsert(subscriberBatch);
+      .upsert(subscriberBatch, { onConflict: 'ml_id' });
 
     if (error) {
       console.error('Batch upsert error:', error);
@@ -243,7 +243,7 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
         ml_group_id: group.id,
         name: group.name,
         updated_at: new Date().toISOString()
-      });
+      }, { onConflict: 'ml_group_id' });
   }
 
   return { 
