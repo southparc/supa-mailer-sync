@@ -8,7 +8,7 @@ const corsHeaders = {
 
 interface SyncRequest {
   syncType: 'full' | 'incremental';
-  direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite';
+  direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite' | 'detect_conflicts';
   batchSize?: number;
   maxRecords?: number;
   offset?: number;
@@ -104,6 +104,11 @@ serve(async (req) => {
         console.log('→ Starting syncToMailerLite');
         result = await syncToMailerLite(supabaseClient, mailerLiteHeaders, syncOptions);
         console.log('✓ syncToMailerLite completed');
+        break;
+      case 'detect_conflicts':
+        console.log('→ Starting chunkedConflictDetection');
+        result = await chunkedConflictDetection(supabaseClient, mailerLiteHeaders, syncOptions);
+        console.log('✓ chunkedConflictDetection completed');
         break;
       case 'bidirectional':
         console.log('→ Starting bidirectionalSync');
@@ -392,65 +397,39 @@ async function bidirectionalSync(supabaseClient: any, headers: any, syncType: st
   
   // Then detect conflicts across all imported records
   console.log('Step 2: Detecting conflicts across all records...');
-  const conflicts = await detectConflicts(supabaseClient, headers, options);
+  const conflicts = await chunkedConflictDetection(supabaseClient, headers, { ...options, maxRecords: 0 });
   
-  // Log all conflicts for manual resolution (don't let conflicts stop the sync)
-  if (conflicts.length > 0) {
-    console.log(`Found ${conflicts.length} conflicts, logging them for review...`);
-    
-    // Batch insert conflicts to avoid overwhelming the database
-    const conflictBatches = [];
-    for (let i = 0; i < conflicts.length; i += 50) {
-      conflictBatches.push(conflicts.slice(i, i + 50));
-    }
-    
-    for (const batch of conflictBatches) {
-      const conflictRecords = batch.map(conflict => ({
-        action: 'conflict_detected',
-        entity_type: 'subscriber',
-        payload: conflict,
-        status: 'pending',
-        dedupe_key: `conflict_${conflict.email}_${conflict.field}`
-      }));
-      
-      const { error } = await supabaseClient
-        .from('ml_outbox')
-        .upsert(conflictRecords, { onConflict: 'dedupe_key' });
-        
-      if (error) {
-        console.error('Error logging conflicts:', error);
-      }
-    }
+  // Log all conflicts for manual resolution
+  if (conflicts.conflictsDetected > 0) {
+    console.log(`Found ${conflicts.conflictsDetected} conflicts, logging completed.`);
   }
   
   return {
     ...fromML,
-    conflictsDetected: conflicts.length,
+    conflictsDetected: conflicts.conflictsDetected || 0,
     conflictsSummary: {
-      total: conflicts.length,
-      types: {
-        value_mismatch: conflicts.filter(c => c.conflict_type === 'value_mismatch').length,
-        field_mismatch: conflicts.filter(c => c.conflict_type === 'field_mismatch').length,
-        missing_in_mailerlite: conflicts.filter(c => c.conflict_type === 'missing_in_mailerlite').length
-      }
+      total: conflicts.conflictsDetected || 0,
+      recordsProcessed: conflicts.recordsProcessed || 0
     }
   };
 }
 
-async function detectConflicts(supabaseClient: any, headers: any, options: SyncOptions) {
-  console.log('Detecting conflicts between MailerLite and Supabase for all records');
+async function chunkedConflictDetection(supabaseClient: any, headers: any, options: SyncOptions) {
+  console.log('Starting chunked conflict detection with pagination support');
   
-  const conflicts = [];
+  const conflicts: any[] = [];
   let processedCount = 0;
-  let offset = 0;
-  const batchSize = 100; // Smaller batches for conflict detection
+  let currentOffset = options.offset || 0;
+  const batchSize = Math.min(options.batchSize || 100, 100); // Smaller batches for conflict detection
+  const maxRecords = options.maxRecords || 1000; // Default chunk size for conflict detection
+  let supabaseSubscribers: any[] = [];
   
   while (true) {
     // Get batch of subscribers from Supabase
-    const { data: supabaseSubscribers, error } = await supabaseClient
+    const { data: subscribers, error } = await supabaseClient
       .from('ml_subscribers')
       .select('*')
-      .range(offset, offset + batchSize - 1)
+      .range(currentOffset, currentOffset + batchSize - 1)
       .order('email');
 
     if (error) {
@@ -458,12 +437,14 @@ async function detectConflicts(supabaseClient: any, headers: any, options: SyncO
       break;
     }
 
-    if (!supabaseSubscribers || supabaseSubscribers.length === 0) {
+    supabaseSubscribers = subscribers || [];
+
+    if (supabaseSubscribers.length === 0) {
       console.log('No more Supabase subscribers to process for conflict detection');
       break;
     }
 
-    console.log(`Checking conflicts for batch ${Math.floor(offset/batchSize) + 1}: ${supabaseSubscribers.length} subscribers`);
+    console.log(`Checking conflicts for batch ${Math.floor(currentOffset/batchSize) + 1}: ${supabaseSubscribers.length} subscribers`);
 
     // Check each subscriber against MailerLite
     for (const supabaseSub of supabaseSubscribers) {
@@ -560,16 +541,66 @@ async function detectConflicts(supabaseClient: any, headers: any, options: SyncO
       }
     }
     
-    offset += batchSize;
+    currentOffset += batchSize;
     
     // Progress logging
-    if (offset % 500 === 0) {
+    if (currentOffset % 500 === 0) {
       console.log(`Conflict detection progress: ${processedCount} records processed, ${conflicts.length} conflicts found`);
     }
+
+    // Check if we've processed our chunk limit
+    if (processedCount >= maxRecords) {
+      console.log(`Reached chunk limit: ${maxRecords} records processed`);
+      break;
+    }
+
+    // If we received fewer records than requested, we've reached the end
+    if (supabaseSubscribers.length < batchSize) {
+      console.log('Reached end of subscribers');
+      break;
+    }
   }
+
+  // Log any conflicts found in this chunk
+  if (conflicts.length > 0) {
+    console.log(`Found ${conflicts.length} conflicts in this chunk, logging them...`);
+    
+    const conflictRecords = conflicts.map(conflict => ({
+      action: 'conflict_detected',
+      entity_type: 'subscriber',
+      payload: conflict,
+      status: 'pending',
+      dedupe_key: `conflict_${conflict.email}_${conflict.field}`
+    }));
+    
+    // Batch insert conflicts to avoid overwhelming the database
+    const conflictBatches = [];
+    for (let i = 0; i < conflictRecords.length; i += 50) {
+      conflictBatches.push(conflictRecords.slice(i, i + 50));
+    }
+    
+    for (const batch of conflictBatches) {
+      const { error } = await supabaseClient
+        .from('ml_outbox')
+        .upsert(batch, { onConflict: 'dedupe_key' });
+        
+      if (error) {
+        console.error('Error logging conflicts:', error);
+      }
+    }
+  }
+
+  console.log(`Conflict detection chunk completed: ${processedCount} records processed, ${conflicts.length} conflicts found`);
   
-  console.log(`Conflict detection completed: ${processedCount} records processed, ${conflicts.length} total conflicts found`);
-  return conflicts;
+  // Check if we processed fewer records than the batch size, meaning we're at the end
+  const lastBatchSize = supabaseSubscribers ? supabaseSubscribers.length : 0;
+  
+  return { 
+    conflictsDetected: conflicts.length,
+    recordsProcessed: processedCount,
+    hasMore: processedCount >= maxRecords && lastBatchSize === batchSize,
+    nextOffset: currentOffset
+  };
 }
 
 function mapFields(sourceData: any, fieldMappings: any[], direction: 'mailerlite_to_supabase' | 'supabase_to_mailerlite') {

@@ -21,46 +21,102 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
     try {
       setSyncing(true);
       setSyncProgress(0);
-      setSyncStatus("Initializing full sync...");
+      setSyncStatus("Starting full sync...");
 
-      // Call edge function to start full sync
-      const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
-        body: { 
-          syncType: 'full',
-          direction: 'bidirectional'
+      // Phase 1: Import all data from MailerLite
+      let offset = 0;
+      let totalImported = 0;
+      let hasMoreImport = true;
+      const batchSize = 500;
+
+      setSyncStatus("Phase 1: Importing data from MailerLite...");
+      
+      while (hasMoreImport) {
+        setSyncStatus(`Importing batch ${Math.floor(offset/batchSize) + 1} (offset: ${offset})...`);
+        
+        const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
+          body: { 
+            syncType: 'full',
+            direction: 'from_mailerlite',
+            batchSize,
+            maxRecords: 0, // No limit for import phase
+            offset
+          }
+        });
+
+        if (error) {
+          throw error;
         }
-      });
 
-      if (error) {
-        throw error;
+        const result = data?.result || {};
+        totalImported += result.subscribersSynced || 0;
+        hasMoreImport = result.hasMore || false;
+        offset = result.nextOffset || offset + batchSize;
+
+        // Update progress for Phase 1 (0-50%)
+        setSyncProgress(Math.min(50, (totalImported / 10000) * 50));
+        setSyncStatus(`Imported ${totalImported} subscribers...`);
+
+        if (!hasMoreImport) {
+          break;
+        }
       }
 
-      // Simulate progress updates (in real implementation, this would come from the edge function)
-      const progressSteps = [
-        { progress: 20, status: "Fetching MailerLite subscribers..." },
-        { progress: 40, status: "Comparing with Supabase data..." },
-        { progress: 60, status: "Identifying conflicts..." },
-        { progress: 80, status: "Updating synchronized records..." },
-        { progress: 100, status: "Sync completed successfully!" }
-      ];
+      // Phase 2: Detect conflicts in chunks
+      setSyncStatus("Phase 2: Detecting conflicts...");
+      setSyncProgress(50);
+      
+      let conflictOffset = 0;
+      let totalConflicts = 0;
+      let hasMoreConflicts = true;
+      const conflictBatchSize = 500;
 
-      for (const step of progressSteps) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        setSyncProgress(step.progress);
-        setSyncStatus(step.status);
+      while (hasMoreConflicts) {
+        setSyncStatus(`Analyzing conflicts - batch ${Math.floor(conflictOffset/conflictBatchSize) + 1}...`);
+        
+        const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
+          body: { 
+            syncType: 'full',
+            direction: 'detect_conflicts',
+            batchSize: conflictBatchSize,
+            maxRecords: 1000, // Process in chunks of 1000
+            offset: conflictOffset
+          }
+        });
+
+        if (error) {
+          throw error;
+        }
+
+        const result = data?.result || {};
+        totalConflicts += result.conflictsDetected || 0;
+        hasMoreConflicts = result.hasMore || false;
+        conflictOffset = result.nextOffset || conflictOffset + conflictBatchSize;
+
+        // Update progress for Phase 2 (50-100%)
+        const conflictProgress = Math.min(50, (conflictOffset / totalImported) * 50);
+        setSyncProgress(50 + conflictProgress);
+        setSyncStatus(`Found ${totalConflicts} conflicts so far...`);
+
+        if (!hasMoreConflicts) {
+          break;
+        }
       }
+
+      setSyncProgress(100);
+      setSyncStatus("Full sync completed successfully!");
 
       toast({
         title: "Sync Completed",
-        description: "Full synchronization completed successfully.",
+        description: `Imported ${totalImported} subscribers and detected ${totalConflicts} conflicts.`,
       });
 
       onStatsUpdate?.();
     } catch (error) {
       console.error('Sync error:', error);
       toast({
-        title: "Sync Failed",
-        description: "Failed to complete synchronization. Please try again.",
+        title: "Sync Failed", 
+        description: error instanceof Error ? error.message : "Failed to complete synchronization. Please try again.",
         variant: "destructive",
       });
     } finally {
