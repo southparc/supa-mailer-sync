@@ -37,8 +37,12 @@ serve(async (req) => {
   try {
     console.log('=== SYNC FUNCTION STARTED ===');
     
+    // Log masked connection details for debugging
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+    console.log(`Connecting to Supabase: ${supabaseUrl.substring(0, 20)}...`);
+    
     const supabaseClient = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
+      supabaseUrl,
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
       {
         auth: {
@@ -48,6 +52,12 @@ serve(async (req) => {
       }
     );
     console.log('✓ Supabase client created');
+
+    // Check initial subscriber count
+    const { count: preCount } = await supabaseClient
+      .from('ml_subscribers')
+      .select('*', { count: 'exact', head: true });
+    console.log(`Pre-sync subscriber count: ${preCount}`);
 
     const { 
       syncType, 
@@ -113,10 +123,26 @@ serve(async (req) => {
       });
     
     console.log('✓ Sync state updated successfully');
+    
+    // Check final subscriber count
+    const { count: postCount } = await supabaseClient
+      .from('ml_subscribers')
+      .select('*', { count: 'exact', head: true });
+    console.log(`Post-sync subscriber count: ${postCount}`);
+    console.log(`Net change: ${(postCount || 0) - (preCount || 0)} subscribers`);
+    
     console.log('=== SYNC FUNCTION COMPLETED ===', result);
 
     return new Response(
-      JSON.stringify({ success: true, result }),
+      JSON.stringify({ 
+        success: true, 
+        result: {
+          ...result,
+          preCount,
+          postCount,
+          netChange: (postCount || 0) - (preCount || 0)
+        }
+      }),
       { 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         status: 200 
@@ -191,15 +217,17 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
       });
     }
 
-    // Batch upsert for better performance
+    // Batch upsert for better performance - use email as conflict resolution
     const { error } = await supabaseClient
       .from('ml_subscribers')
-      .upsert(subscriberBatch, { onConflict: 'ml_id' });
+      .upsert(subscriberBatch, { onConflict: 'email' });
 
     if (error) {
       console.error('Batch upsert error:', error);
       throw new Error(`Failed to sync batch: ${error.message}`);
     }
+
+    console.log(`✓ Successfully upserted ${subscriberBatch.length} subscribers`);
 
     totalSynced += subscribers.length;
     batchCount++;

@@ -108,22 +108,57 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
   const syncFromMailerLite = async () => {
     try {
       setSyncing(true);
-      setSyncStatus("Importing from MailerLite...");
+      setSyncProgress(0);
+      setSyncStatus("Starting MailerLite import...");
 
-      const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
-        body: { 
-          syncType: 'full',
-          direction: 'from_mailerlite'
+      let offset = 0;
+      let totalSynced = 0;
+      let hasMore = true;
+      const batchSize = 500;
+      const maxRecords = 5000; // Start with 5k for testing
+
+      while (hasMore) {
+        setSyncStatus(`Importing batch ${Math.floor(offset/batchSize) + 1} (offset: ${offset})...`);
+        
+        const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
+          body: { 
+            syncType: 'full',
+            direction: 'from_mailerlite',
+            batchSize,
+            maxRecords,
+            offset
+          }
+        });
+
+        if (error) {
+          console.error('Sync error:', error);
+          throw new Error(error.message || 'Sync failed');
         }
-      });
 
-      if (error) {
-        throw error;
+        console.log('Sync response:', data);
+        
+        const result = data?.result || {};
+        totalSynced += result.subscribersSynced || 0;
+        hasMore = result.hasMore || false;
+        offset = result.nextOffset || offset + batchSize;
+
+        // Update progress (rough estimate)
+        const progress = Math.min(90, (totalSynced / maxRecords) * 100);
+        setSyncProgress(progress);
+        setSyncStatus(`Imported ${totalSynced} subscribers so far...`);
+
+        // If we've reached our test limit or no more data, stop
+        if (totalSynced >= maxRecords || !hasMore) {
+          hasMore = false;
+        }
       }
+
+      setSyncProgress(100);
+      setSyncStatus("Import completed successfully!");
 
       toast({
         title: "Import Completed", 
-        description: "Data imported from MailerLite successfully.",
+        description: `Imported ${totalSynced} subscribers from MailerLite successfully.`,
       });
 
       onStatsUpdate?.();
@@ -131,11 +166,12 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       console.error('Import error:', error);
       toast({
         title: "Import Failed",
-        description: "Failed to import from MailerLite. Please try again.",
+        description: error instanceof Error ? error.message : "Failed to import from MailerLite. Please try again.",
         variant: "destructive",
       });
     } finally {
       setSyncing(false);
+      setSyncProgress(0);
       setSyncStatus("");
     }
   };
