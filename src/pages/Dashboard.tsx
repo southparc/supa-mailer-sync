@@ -15,7 +15,7 @@ import EnterpriseSyncDashboard from "@/components/EnterpriseSyncDashboard";
 import { LogOut, RefreshCw, AlertTriangle, Users, Database } from "lucide-react";
 
 interface DashboardStats {
-  totalSubscribers: number;
+  totalClients: number;
   totalGroups: number;
   pendingConflicts: number;
   lastSyncAt?: string;
@@ -26,7 +26,7 @@ export default function Dashboard() {
   const [session, setSession] = useState(null);
   const [loading, setLoading] = useState(true);
   const [stats, setStats] = useState<DashboardStats>({
-    totalSubscribers: 0,
+    totalClients: 0,
     totalGroups: 0,
     pendingConflicts: 0,
   });
@@ -67,16 +67,17 @@ export default function Dashboard() {
   const loadDashboardStats = async () => {
     try {
       // Load stats from various tables
-      const [subscribersResult, groupsResult, syncStateResult] = await Promise.all([
-        supabase.from('ml_subscribers').select('id', { count: 'exact' }),
+      const [clientsResult, groupsResult, conflictsResult, syncStateResult] = await Promise.all([
+        supabase.from('clients').select('id', { count: 'exact' }),
         supabase.from('ml_groups').select('id', { count: 'exact' }),
+        supabase.from('sync_conflicts').select('id', { count: 'exact' }).eq('status', 'pending'),
         supabase.from('ml_sync_state').select('*').single()
       ]);
 
       setStats({
-        totalSubscribers: subscribersResult.count || 0,
+        totalClients: clientsResult.count || 0,
         totalGroups: groupsResult.count || 0,
-        pendingConflicts: 0, // TODO: Calculate actual conflicts
+        pendingConflicts: conflictsResult.count || 0,
         lastSyncAt: syncStateResult.data?.last_full_backfill_at
       });
     } catch (error) {
@@ -139,11 +140,11 @@ export default function Dashboard() {
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
           <Card>
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm font-medium">Total Subscribers</CardTitle>
+              <CardTitle className="text-sm font-medium">Total Clients</CardTitle>
               <Users className="h-4 w-4 text-muted-foreground" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{stats.totalSubscribers}</div>
+              <div className="text-2xl font-bold">{stats.totalClients}</div>
             </CardContent>
           </Card>
 
