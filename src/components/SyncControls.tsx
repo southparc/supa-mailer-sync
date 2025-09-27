@@ -17,6 +17,23 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
   const [syncStatus, setSyncStatus] = useState<string>("");
   const { toast } = useToast();
 
+  // Retry wrapper for network resilience
+  const invokeWithRetry = async (functionName: string, body: any, retries = 3) => {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const result = await supabase.functions.invoke(functionName, { body });
+        return result;
+      } catch (error: any) {
+        console.error(`Attempt ${attempt} failed:`, error);
+        if (attempt === retries) throw error;
+        
+        // Exponential backoff: 400ms, 800ms, 1600ms
+        const delay = 400 * Math.pow(2, attempt - 1);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  };
+
   const startFullSync = async () => {
     try {
       setSyncing(true);
@@ -34,14 +51,12 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       while (hasMoreImport) {
         setSyncStatus(`Importing batch ${Math.floor(offset/batchSize) + 1} (offset: ${offset})...`);
         
-        const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
-          body: { 
-            syncType: 'full',
-            direction: 'from_mailerlite',
-            batchSize,
-            maxRecords: 0, // No limit for import phase
-            offset
-          }
+        const { data, error } = await invokeWithRetry('sync-mailerlite', { 
+          syncType: 'full',
+          direction: 'from_mailerlite',
+          batchSize,
+          maxRecords: batchSize, // Process one batch per call
+          offset
         });
 
         if (error) {
@@ -74,14 +89,12 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       while (hasMoreConflicts) {
         setSyncStatus(`Analyzing conflicts - batch ${Math.floor(conflictOffset/conflictBatchSize) + 1}...`);
         
-        const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
-          body: { 
-            syncType: 'full',
-            direction: 'detect_conflicts',
-            batchSize: conflictBatchSize,
-            maxRecords: 1000, // Process in chunks of 1000
-            offset: conflictOffset
-          }
+        const { data, error } = await invokeWithRetry('sync-mailerlite', { 
+          syncType: 'full',
+          direction: 'detect_conflicts',
+          batchSize: conflictBatchSize,
+          maxRecords: 1000, // Process in chunks of 1000
+          offset: conflictOffset
         });
 
         if (error) {
@@ -112,11 +125,13 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       });
 
       onStatsUpdate?.();
-    } catch (error) {
+    } catch (error: any) {
       console.error('Sync error:', error);
+      const errorMessage = error?.message || error?.name || "Failed to complete synchronization. Please try again.";
+      const contextMessage = error?.context?.message ? ` (${error.context.message})` : "";
       toast({
         title: "Sync Failed", 
-        description: error instanceof Error ? error.message : "Failed to complete synchronization. Please try again.",
+        description: `${errorMessage}${contextMessage}`,
         variant: "destructive",
       });
     } finally {
@@ -131,11 +146,9 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       setSyncing(true);
       setSyncStatus("Starting incremental sync...");
 
-      const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
-        body: { 
-          syncType: 'incremental',
-          direction: 'bidirectional'
-        }
+      const { data, error } = await invokeWithRetry('sync-mailerlite', { 
+        syncType: 'incremental',
+        direction: 'bidirectional'
       });
 
       if (error) {
@@ -148,11 +161,13 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       });
 
       onStatsUpdate?.();
-    } catch (error) {
+    } catch (error: any) {
       console.error('Incremental sync error:', error);
+      const errorMessage = error?.message || error?.name || "Failed to complete incremental sync. Please try again.";
+      const contextMessage = error?.context?.message ? ` (${error.context.message})` : "";
       toast({
         title: "Sync Failed",
-        description: "Failed to complete incremental sync. Please try again.",
+        description: `${errorMessage}${contextMessage}`,
         variant: "destructive",
       });
     } finally {
@@ -171,19 +186,16 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       let totalSynced = 0;
       let hasMore = true;
       const batchSize = 500;
-      const maxRecords = 5000; // Start with 5k for testing
 
       while (hasMore) {
         setSyncStatus(`Importing batch ${Math.floor(offset/batchSize) + 1} (offset: ${offset})...`);
         
-        const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
-          body: { 
-            syncType: 'full',
-            direction: 'from_mailerlite',
-            batchSize,
-            maxRecords,
-            offset
-          }
+        const { data, error } = await invokeWithRetry('sync-mailerlite', { 
+          syncType: 'full',
+          direction: 'from_mailerlite',
+          batchSize,
+          maxRecords: batchSize, // Process one batch per call
+          offset
         });
 
         if (error) {
@@ -198,14 +210,14 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
         hasMore = result.hasMore || false;
         offset = result.nextOffset || offset + batchSize;
 
-        // Update progress (rough estimate)
-        const progress = Math.min(90, (totalSynced / maxRecords) * 100);
+        // Update progress (rough estimate based on batch count)
+        const progress = Math.min(90, (totalSynced / 10000) * 100);
         setSyncProgress(progress);
         setSyncStatus(`Imported ${totalSynced} subscribers so far...`);
 
-        // If we've reached our test limit or no more data, stop
-        if (totalSynced >= maxRecords || !hasMore) {
-          hasMore = false;
+        // Continue until no more data
+        if (!hasMore) {
+          break;
         }
       }
 
@@ -218,11 +230,13 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       });
 
       onStatsUpdate?.();
-    } catch (error) {
+    } catch (error: any) {
       console.error('Import error:', error);
+      const errorMessage = error?.message || error?.name || "Failed to import from MailerLite. Please try again.";
+      const contextMessage = error?.context?.message ? ` (${error.context.message})` : "";
       toast({
         title: "Import Failed",
-        description: error instanceof Error ? error.message : "Failed to import from MailerLite. Please try again.",
+        description: `${errorMessage}${contextMessage}`,
         variant: "destructive",
       });
     } finally {
@@ -237,11 +251,9 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       setSyncing(true);
       setSyncStatus("Exporting to MailerLite...");
 
-      const { data, error } = await supabase.functions.invoke('sync-mailerlite', {
-        body: { 
-          syncType: 'full',
-          direction: 'to_mailerlite'
-        }
+      const { data, error } = await invokeWithRetry('sync-mailerlite', { 
+        syncType: 'full',
+        direction: 'to_mailerlite'
       });
 
       if (error) {
@@ -254,11 +266,13 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       });
 
       onStatsUpdate?.();
-    } catch (error) {
+    } catch (error: any) {
       console.error('Export error:', error);
+      const errorMessage = error?.message || error?.name || "Failed to export to MailerLite. Please try again.";
+      const contextMessage = error?.context?.message ? ` (${error.context.message})` : "";
       toast({
         title: "Export Failed",
-        description: "Failed to export to MailerLite. Please try again.",
+        description: `${errorMessage}${contextMessage}`,
         variant: "destructive",
       });
     } finally {

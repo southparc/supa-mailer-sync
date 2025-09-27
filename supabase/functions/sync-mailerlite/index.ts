@@ -181,82 +181,124 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
   const { batchSize, maxRecords } = options;
   let batchCount = 0;
   
-  while (true) {
-    // Build MailerLite API URL with pagination
-    const subscribersUrl = new URL('https://connect.mailerlite.com/api/subscribers');
-    subscribersUrl.searchParams.set('limit', batchSize.toString());
-    subscribersUrl.searchParams.set('offset', currentOffset.toString());
-    
-    console.log(`Fetching batch: offset=${currentOffset}, limit=${batchSize}`);
-    
-    // Fetch subscribers from MailerLite with pagination
-    const subscribersResponse = await fetch(subscribersUrl.toString(), { headers });
-    
-    if (!subscribersResponse.ok) {
-      throw new Error(`MailerLite API error: ${subscribersResponse.statusText}`);
-    }
-    
-    const subscribersData = await subscribersResponse.json();
-    const subscribers = subscribersData.data || [];
-    
-    console.log(`Received ${subscribers.length} subscribers in batch`);
-    
-    if (subscribers.length === 0) {
-      console.log('No more subscribers to process');
-      break;
-    }
+  // Build MailerLite API URL with pagination
+  const subscribersUrl = new URL('https://connect.mailerlite.com/api/subscribers');
+  subscribersUrl.searchParams.set('limit', batchSize.toString());
+  subscribersUrl.searchParams.set('offset', currentOffset.toString());
+  
+  console.log(`Fetching batch: offset=${currentOffset}, limit=${batchSize}`);
+  
+  // Fetch subscribers from MailerLite with pagination
+  const subscribersResponse = await fetch(subscribersUrl.toString(), { headers });
+  
+  if (!subscribersResponse.ok) {
+    throw new Error(`MailerLite API error: ${subscribersResponse.statusText}`);
+  }
+  
+  const subscribersData = await subscribersResponse.json();
+  const subscribers = subscribersData.data || [];
+  
+  console.log(`Received ${subscribers.length} subscribers in batch`);
+  
+  if (subscribers.length === 0) {
+    console.log('No more subscribers to process');
+    return { 
+      subscribersSynced: totalSynced,
+      groupsSynced: 0,
+      hasMore: false,
+      nextOffset: currentOffset
+    };
+  }
 
-    // Process batch of subscribers with better error handling
-    const subscriberBatch = [];
-    for (const subscriber of subscribers) {
-      const mappedData = mapFields(subscriber, options.fieldMappings, 'mailerlite_to_supabase');
+  // Process batch of subscribers with better error handling
+  const subscriberBatch = [];
+  for (const subscriber of subscribers) {
+    const mappedData = mapFields(subscriber, options.fieldMappings, 'mailerlite_to_supabase');
+    
+    subscriberBatch.push({
+      ml_id: subscriber.id,
+      email: subscriber.email,
+      name: mappedData.name || subscriber.fields?.name || null,
+      status: subscriber.status,
+      consent: subscriber.opted_in_at ? 'single_opt_in' : null,
+      fields: subscriber.fields || {},
+      updated_at: new Date().toISOString()
+    });
+  }
+
+  // Batch upsert for better performance - use email as conflict resolution
+  const { error } = await supabaseClient
+    .from('ml_subscribers')
+    .upsert(subscriberBatch, { onConflict: 'email' });
+
+  if (error) {
+    console.error('Batch upsert error:', error);
+    throw new Error(`Failed to sync batch: ${error.message}`);
+  }
+
+  console.log(`✓ Successfully upserted ${subscriberBatch.length} subscribers`);
+
+  totalSynced += subscribers.length;
+  batchCount++;
+  
+  currentOffset += batchSize;
+  
+  // Return after processing exactly one batch (when maxRecords matches batchSize)
+  if (maxRecords > 0 && maxRecords === batchSize) {
+    console.log(`Processed single batch as requested: ${totalSynced} subscribers`);
+    return { 
+      subscribersSynced: totalSynced, 
+      hasMore: subscribers.length === batchSize,
+      nextOffset: currentOffset
+    };
+  }
+  
+  // Legacy behavior: continue processing if maxRecords = 0 (import all)
+  if (maxRecords === 0) {
+    while (subscribers.length === batchSize) {
+      // Continue with additional batches for full import...
+      const nextUrl = new URL('https://connect.mailerlite.com/api/subscribers');
+      nextUrl.searchParams.set('limit', batchSize.toString());
+      nextUrl.searchParams.set('offset', currentOffset.toString());
       
-      subscriberBatch.push({
-        ml_id: subscriber.id,
-        email: subscriber.email,
-        name: mappedData.name || subscriber.fields?.name || null,
-        status: subscriber.status,
-        consent: subscriber.opted_in_at ? 'single_opt_in' : null,
-        fields: subscriber.fields || {},
-        updated_at: new Date().toISOString()
+      const nextResponse = await fetch(nextUrl.toString(), { headers });
+      if (!nextResponse.ok) break;
+      
+      const nextData = await nextResponse.json();
+      const nextSubscribers = nextData.data || [];
+      
+      if (nextSubscribers.length === 0) break;
+      
+      // Process next batch...
+      const nextBatch = nextSubscribers.map((subscriber: any) => {
+        const mappedData = mapFields(subscriber, options.fieldMappings, 'mailerlite_to_supabase');
+        return {
+          ml_id: subscriber.id,
+          email: subscriber.email,
+          name: mappedData.name || subscriber.fields?.name || null,
+          status: subscriber.status,
+          consent: subscriber.opted_in_at ? 'single_opt_in' : null,
+          fields: subscriber.fields || {},
+          updated_at: new Date().toISOString()
+        };
       });
-    }
-
-    // Batch upsert for better performance - use email as conflict resolution
-    const { error } = await supabaseClient
-      .from('ml_subscribers')
-      .upsert(subscriberBatch, { onConflict: 'email' });
-
-    if (error) {
-      console.error('Batch upsert error:', error);
-      throw new Error(`Failed to sync batch: ${error.message}`);
-    }
-
-    console.log(`✓ Successfully upserted ${subscriberBatch.length} subscribers`);
-
-    totalSynced += subscribers.length;
-    batchCount++;
-    
-    // Progress logging every 10 batches (for large syncs)
-    if (batchCount % 10 === 0) {
-      console.log(`Progress: ${totalSynced} subscribers synced (${batchCount} batches processed)`);
-    }
-    
-    // Check if we've reached the max records limit
-    if (maxRecords > 0 && totalSynced >= maxRecords) {
-      console.log(`Reached max records limit: ${maxRecords}`);
-      return { 
-        subscribersSynced: totalSynced, 
-        hasMore: subscribers.length === batchSize,
-        nextOffset: currentOffset + batchSize
-      };
-    }
-
-    currentOffset += batchSize;
-    
-    // If we received fewer records than requested, we've reached the end
-    if (subscribers.length < batchSize) {
-      break;
+      
+      const { error: nextError } = await supabaseClient
+        .from('ml_subscribers')
+        .upsert(nextBatch, { onConflict: 'email' });
+        
+      if (nextError) {
+        console.error('Next batch upsert error:', nextError);
+        break;
+      }
+      
+      totalSynced += nextSubscribers.length;
+      currentOffset += batchSize;
+      batchCount++;
+      
+      if (batchCount % 10 === 0) {
+        console.log(`Progress: ${totalSynced} subscribers synced (${batchCount} batches processed)`);
+      }
     }
   }
 
