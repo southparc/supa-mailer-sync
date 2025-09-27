@@ -7,14 +7,13 @@ import { supabase } from "@/integrations/supabase/client";
 import { RefreshCw, Calendar, AlertCircle, CheckCircle, XCircle, Clock } from "lucide-react";
 
 interface SyncLog {
-  id: number;
+  id: string;
+  email: string;
   action: string;
-  status: 'pending' | 'completed' | 'failed';
-  entity_type: string;
-  payload: any;
+  direction: string;
+  result: string;
+  field?: string;
   created_at: string;
-  last_error?: string;
-  try_count: number;
 }
 
 export function SyncLogs() {
@@ -29,9 +28,8 @@ export function SyncLogs() {
     try {
       setLoading(true);
       
-      // Load from ml_outbox table which tracks sync operations
       const { data, error } = await supabase
-        .from('ml_outbox')
+        .from('sync_log')
         .select('*')
         .order('created_at', { ascending: false })
         .limit(50);
@@ -40,10 +38,18 @@ export function SyncLogs() {
         throw error;
       }
 
-      setLogs((data || []).map(log => ({
-        ...log,
-        status: log.status as 'pending' | 'completed' | 'failed'
-      })));
+      if (data) {
+        const logs: SyncLog[] = data.map(item => ({
+          id: item.id,
+          email: item.email,
+          action: item.action,
+          direction: item.direction,
+          result: item.result,
+          field: item.field,
+          created_at: item.created_at
+        }));
+        setLogs(logs);
+      }
     } catch (error) {
       console.error('Error loading sync logs:', error);
     } finally {
@@ -51,45 +57,34 @@ export function SyncLogs() {
     }
   };
 
-  const getStatusIcon = (status: SyncLog['status']) => {
-    switch (status) {
-      case 'completed':
+  const getStatusIcon = (result: string) => {
+    switch (result) {
+      case 'applied':
         return <CheckCircle className="h-4 w-4 text-green-500" />;
-      case 'failed':
+      case 'conflict':
         return <XCircle className="h-4 w-4 text-red-500" />;
-      case 'pending':
+      case 'skipped':
         return <Clock className="h-4 w-4 text-yellow-500" />;
       default:
         return <AlertCircle className="h-4 w-4 text-gray-500" />;
     }
   };
 
-  const getStatusBadgeVariant = (status: SyncLog['status']) => {
-    switch (status) {
-      case 'completed':
+  const getStatusBadgeVariant = (result: string) => {
+    switch (result) {
+      case 'applied':
         return 'default' as const;
-      case 'failed':
+      case 'conflict':
         return 'destructive' as const;
-      case 'pending':
+      case 'skipped':
         return 'secondary' as const;
       default:
         return 'outline' as const;
     }
   };
 
-  const formatPayload = (payload: any) => {
-    if (!payload) return 'N/A';
-    
-    // Show relevant fields from payload
-    if (payload.email) {
-      return payload.email;
-    }
-    
-    if (typeof payload === 'object') {
-      return JSON.stringify(payload, null, 2);
-    }
-    
-    return String(payload);
+  const formatPayload = (log: SyncLog) => {
+    return `${log.email} - ${log.field || 'all fields'}`;
   };
 
   if (loading) {
@@ -137,10 +132,10 @@ export function SyncLogs() {
               <CardHeader className="pb-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
-                    {getStatusIcon(log.status)}
+                    {getStatusIcon(log.result)}
                     <div>
                       <CardTitle className="text-base">
-                        {log.action} - {log.entity_type}
+                        {log.action} - {log.direction}
                       </CardTitle>
                       <CardDescription className="flex items-center gap-2">
                         <Calendar className="h-3 w-3" />
@@ -149,34 +144,20 @@ export function SyncLogs() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Badge variant={getStatusBadgeVariant(log.status)}>
-                      {log.status}
+                    <Badge variant={getStatusBadgeVariant(log.result)}>
+                      {log.result}
                     </Badge>
-                    {log.try_count > 1 && (
-                      <Badge variant="outline">
-                        Try #{log.try_count}
-                      </Badge>
-                    )}
                   </div>
                 </div>
               </CardHeader>
               <CardContent className="pt-0">
                 <div className="space-y-3">
                   <div>
-                    <p className="text-sm font-medium mb-1">Payload:</p>
+                    <p className="text-sm font-medium mb-1">Details:</p>
                     <div className="p-2 bg-muted rounded text-xs font-mono">
-                      {formatPayload(log.payload)}
+                      {formatPayload(log)}
                     </div>
                   </div>
-                  
-                  {log.last_error && (
-                    <div>
-                      <p className="text-sm font-medium text-red-600 mb-1">Error:</p>
-                      <div className="p-2 bg-red-50 border border-red-200 rounded text-xs">
-                        {log.last_error}
-                      </div>
-                    </div>
-                  )}
                 </div>
               </CardContent>
             </Card>

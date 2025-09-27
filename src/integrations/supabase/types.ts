@@ -129,13 +129,6 @@ export type Database = {
             referencedRelation: "clients"
             referencedColumns: ["id"]
           },
-          {
-            foreignKeyName: "appointments_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
-          },
         ]
       }
       audit_logs: {
@@ -200,13 +193,6 @@ export type Database = {
             isOneToOne: false
             referencedRelation: "clients"
             referencedColumns: ["id"]
-          },
-          {
-            foreignKeyName: "client_group_mappings_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
           },
           {
             foreignKeyName: "client_group_mappings_group_id_fkey"
@@ -403,13 +389,6 @@ export type Database = {
             referencedRelation: "clients"
             referencedColumns: ["id"]
           },
-          {
-            foreignKeyName: "contracts_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
-          },
         ]
       }
       estate_planning_documents: {
@@ -441,13 +420,6 @@ export type Database = {
             isOneToOne: false
             referencedRelation: "clients"
             referencedColumns: ["id"]
-          },
-          {
-            foreignKeyName: "estate_planning_documents_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
           },
         ]
       }
@@ -486,13 +458,6 @@ export type Database = {
             isOneToOne: false
             referencedRelation: "clients"
             referencedColumns: ["id"]
-          },
-          {
-            foreignKeyName: "financial_goals_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
           },
         ]
       }
@@ -559,13 +524,6 @@ export type Database = {
             referencedRelation: "clients"
             referencedColumns: ["id"]
           },
-          {
-            foreignKeyName: "house_objects_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
-          },
         ]
       }
       insurances: {
@@ -613,14 +571,34 @@ export type Database = {
             referencedRelation: "clients"
             referencedColumns: ["id"]
           },
-          {
-            foreignKeyName: "insurances_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
-          },
         ]
+      }
+      integration_crosswalk: {
+        Row: {
+          a_id: string | null
+          b_id: string | null
+          created_at: string
+          email: string
+          id: string
+          updated_at: string
+        }
+        Insert: {
+          a_id?: string | null
+          b_id?: string | null
+          created_at?: string
+          email: string
+          id?: string
+          updated_at?: string
+        }
+        Update: {
+          a_id?: string | null
+          b_id?: string | null
+          created_at?: string
+          email?: string
+          id?: string
+          updated_at?: string
+        }
+        Relationships: []
       }
       investments: {
         Row: {
@@ -657,13 +635,6 @@ export type Database = {
             isOneToOne: false
             referencedRelation: "clients"
             referencedColumns: ["id"]
-          },
-          {
-            foreignKeyName: "investments_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
           },
         ]
       }
@@ -702,13 +673,6 @@ export type Database = {
             isOneToOne: false
             referencedRelation: "clients"
             referencedColumns: ["id"]
-          },
-          {
-            foreignKeyName: "liabilities_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
           },
         ]
       }
@@ -968,13 +932,6 @@ export type Database = {
             referencedRelation: "clients"
             referencedColumns: ["id"]
           },
-          {
-            foreignKeyName: "partners_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
-          },
         ]
       }
       pensions: {
@@ -1013,14 +970,112 @@ export type Database = {
             referencedRelation: "clients"
             referencedColumns: ["id"]
           },
-          {
-            foreignKeyName: "pensions_client_id_fkey"
-            columns: ["client_id"]
-            isOneToOne: false
-            referencedRelation: "v_clients_for_ml"
-            referencedColumns: ["client_id"]
-          },
         ]
+      }
+      sync_conflicts: {
+        Row: {
+          a_value: string | null
+          b_value: string | null
+          created_at: string
+          detected_at: string
+          email: string
+          field: string
+          id: string
+          resolved_at: string | null
+          resolved_value: string | null
+          status: string
+          updated_at: string
+        }
+        Insert: {
+          a_value?: string | null
+          b_value?: string | null
+          created_at?: string
+          detected_at?: string
+          email: string
+          field: string
+          id?: string
+          resolved_at?: string | null
+          resolved_value?: string | null
+          status?: string
+          updated_at?: string
+        }
+        Update: {
+          a_value?: string | null
+          b_value?: string | null
+          created_at?: string
+          detected_at?: string
+          email?: string
+          field?: string
+          id?: string
+          resolved_at?: string | null
+          resolved_value?: string | null
+          status?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      sync_log: {
+        Row: {
+          action: string
+          created_at: string
+          dedupe_key: string | null
+          direction: string
+          email: string
+          field: string | null
+          id: string
+          new_value: string | null
+          old_value: string | null
+          result: string
+        }
+        Insert: {
+          action: string
+          created_at?: string
+          dedupe_key?: string | null
+          direction: string
+          email: string
+          field?: string | null
+          id?: string
+          new_value?: string | null
+          old_value?: string | null
+          result: string
+        }
+        Update: {
+          action?: string
+          created_at?: string
+          dedupe_key?: string | null
+          direction?: string
+          email?: string
+          field?: string | null
+          id?: string
+          new_value?: string | null
+          old_value?: string | null
+          result?: string
+        }
+        Relationships: []
+      }
+      sync_shadow: {
+        Row: {
+          created_at: string
+          email: string
+          id: string
+          snapshot: Json
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          email: string
+          id?: string
+          snapshot?: Json
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          email?: string
+          id?: string
+          snapshot?: Json
+          updated_at?: string
+        }
+        Relationships: []
       }
       tax_parameters: {
         Row: {
@@ -1078,50 +1133,7 @@ export type Database = {
       }
     }
     Views: {
-      v_clients_for_ml: {
-        Row: {
-          client_id: string | null
-          email: string | null
-          first_name: string | null
-          last_name: string | null
-          updated_at: string | null
-        }
-        Insert: {
-          client_id?: string | null
-          email?: string | null
-          first_name?: string | null
-          last_name?: string | null
-          updated_at?: string | null
-        }
-        Update: {
-          client_id?: string | null
-          email?: string | null
-          first_name?: string | null
-          last_name?: string | null
-          updated_at?: string | null
-        }
-        Relationships: []
-      }
-      v_tax_parameters_current: {
-        Row: {
-          code: string | null
-          country: string | null
-          currency: string | null
-          id: string | null
-          name: string | null
-          regime: string | null
-          source_ref: string | null
-          source_url: string | null
-          status: string | null
-          unit: string | null
-          updated_at: string | null
-          valid_from: string | null
-          valid_to: string | null
-          value_numeric: number | null
-          value_text: string | null
-        }
-        Relationships: []
-      }
+      [_ in never]: never
     }
     Functions: {
       full_client: {

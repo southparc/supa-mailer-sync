@@ -35,29 +35,25 @@ const EnterpriseConflictResolution: React.FC<ConflictResolutionProps> = ({ onSta
     try {
       setLoading(true);
       
-      // Get conflicts from ml_outbox table for now (until new schema is deployed)
+      // Get conflicts from sync_conflicts table
       const { data, error } = await supabase
-        .from('ml_outbox')
+        .from('sync_conflicts')
         .select('*')
-        .eq('action', 'conflict_detected')
         .eq('status', 'pending')
-        .order('created_at', { ascending: false })
+        .order('detected_at', { ascending: false })
         .limit(100);
 
       if (error) throw error;
 
-      const formattedConflicts: Conflict[] = data.map(item => {
-        const payload = item.payload as any; // Cast to handle Json type
-        return {
-          id: item.id.toString(),
-          email: payload?.email || 'unknown@email.com',
-          field: payload?.field || 'unknown_field',
-          a_value: payload?.a_value || '',
-          b_value: payload?.b_value || '',
-          detected_at: payload?.detected_at || item.created_at,
-          status: payload?.status === 'resolved' ? 'resolved' : 'open'
-        };
-      });
+      const formattedConflicts: Conflict[] = data.map(item => ({
+        id: item.id.toString(),
+        email: item.email,
+        field: item.field,
+        a_value: item.a_value || '',
+        b_value: item.b_value || '',
+        detected_at: item.detected_at,
+        status: item.status === 'resolved' ? 'resolved' : 'open'
+      }));
 
       setConflicts(formattedConflicts);
       onStatsUpdate?.({ conflicts: formattedConflicts.filter(c => c.status === 'open').length });
@@ -80,20 +76,15 @@ const EnterpriseConflictResolution: React.FC<ConflictResolutionProps> = ({ onSta
       const conflict = conflicts.find(c => c.id === conflictId);
       if (!conflict) return;
 
-      // Update the ml_outbox record to mark as completed
+      // Update the sync_conflicts record to mark as resolved
       const { error } = await supabase
-        .from('ml_outbox')
+        .from('sync_conflicts')
         .update({ 
-          status: 'completed',
-          payload: {
-            ...conflicts.find(c => c.id === conflictId),
-            status: 'resolved',
-            resolved_at: new Date().toISOString(),
-            chosen_value: chosenValue,
-            resolved_value: chosenValue === 'a' ? conflict.a_value : conflict.b_value
-          }
+          status: 'resolved',
+          resolved_value: chosenValue === 'a' ? conflict.a_value : conflict.b_value,
+          resolved_at: new Date().toISOString()
         })
-        .eq('id', parseInt(conflictId));
+        .eq('id', conflictId);
 
       if (error) throw error;
 

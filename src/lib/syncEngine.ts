@@ -76,6 +76,7 @@ export function detectChanges(
 
 /**
  * Core sync decision logic for a single field
+ * Implements "non-empty overwrites empty" rule
  */
 export function decideSyncAction(
   field: string,
@@ -112,7 +113,7 @@ export function decideSyncAction(
     return { action: 'skip', field }; // Same value, just update shadow
   }
 
-  // Both changed, different values - check empty/fill rule
+  // Both changed, different values - apply "non-empty overwrites empty" rule
   if (normA === null && normB !== null) {
     return { action: 'update_a', field, direction: 'B→A' };
   }
@@ -134,8 +135,82 @@ export function decideSyncAction(
 }
 
 /**
- * Process sync for a single record
- * Note: Currently using localStorage for shadow state until new DB schema is deployed
+ * Email normalization helper
+ */
+function normalizeEmail(email: string): string {
+  return email.toLowerCase().trim();
+}
+
+/**
+ * Get shadow state from database
+ */
+export async function getShadowState(email: string): Promise<{
+  aData: Record<string, any>;
+  bData: Record<string, any>;
+} | null> {
+  try {
+    const { data, error } = await supabase
+      .from('sync_shadow')
+      .select('snapshot')
+      .eq('email', normalizeEmail(email))
+      .maybeSingle();
+
+    if (error) {
+      console.error('Failed to get shadow state:', error);
+      return null;
+    }
+
+    if (!data?.snapshot) {
+      return { aData: {}, bData: {} }; // Return empty if no shadow exists
+    }
+
+    const snapshot = data.snapshot as any;
+    return {
+      aData: snapshot.a || {},
+      bData: snapshot.b || {}
+    };
+  } catch (error) {
+    console.error('Failed to get shadow state:', error);
+    return { aData: {}, bData: {} };
+  }
+}
+
+/**
+ * Update shadow state in database
+ */
+export async function updateShadowState(
+  email: string,
+  aData: Record<string, any>,
+  bData: Record<string, any>
+): Promise<void> {
+  try {
+    const snapshot = {
+      a: aData,
+      b: bData,
+      synced_at: new Date().toISOString()
+    };
+    
+    const { error } = await supabase
+      .from('sync_shadow')
+      .upsert({
+        email: normalizeEmail(email),
+        snapshot
+      }, {
+        onConflict: 'email'
+      });
+
+    if (error) {
+      console.error('Failed to update shadow state:', error);
+      throw error;
+    }
+  } catch (error) {
+    console.error('Failed to update shadow state:', error);
+    throw error;
+  }
+}
+
+/**
+ * Process sync for a single record with database-backed shadow state
  */
 export async function syncRecord(
   email: string,
@@ -146,10 +221,10 @@ export async function syncRecord(
   conflicts: FieldConflict[];
   logs: Array<{ field: string; action: string; direction?: string; result: string }>;
 }> {
-  // Get shadow state from localStorage for now
-  const shadowKey = `sync_shadow_${email}`;
-  const shadowData = localStorage.getItem(shadowKey);
-  const shadow = shadowData ? JSON.parse(shadowData) : { a: {}, b: {} };
+  // Get shadow state from database
+  const shadowState = await getShadowState(email);
+  const shadowA = shadowState?.aData || {};
+  const shadowB = shadowState?.bData || {};
   
   const updates: { field: string; direction: 'A→B' | 'B→A'; value: any }[] = [];
   const conflicts: FieldConflict[] = [];
@@ -161,8 +236,8 @@ export async function syncRecord(
       aField,
       aData[aField],
       bData[bField],
-      shadow.a[aField],
-      shadow.b[bField]
+      shadowA[aField],
+      shadowB[bField]
     );
 
     switch (decision.action) {
@@ -219,122 +294,130 @@ export async function syncRecord(
 }
 
 /**
- * Update shadow state after sync
- * Note: Currently using localStorage until new DB schema is deployed
- */
-export async function updateShadowState(
-  email: string,
-  aData: Record<string, any>,
-  bData: Record<string, any>
-): Promise<void> {
-  const shadowKey = `sync_shadow_${email}`;
-  const snapshot = {
-    a: aData,
-    b: bData,
-    synced_at: new Date().toISOString()
-  };
-
-  localStorage.setItem(shadowKey, JSON.stringify(snapshot));
-}
-
-/**
- * Log sync activities using ml_outbox table for now
+ * Log sync activities to database
  */
 export async function logSyncActivity(
   email: string,
   logs: Array<{ field: string; action: string; direction?: string; result: string }>
 ): Promise<void> {
-  // Use existing ml_outbox table to log sync activities for now
-  const logEntries = logs.map(log => ({
-    action: 'sync_log',
-    entity_type: 'sync_activity',
-    payload: {
-      email,
-      field: log.field,
+  try {
+    const logEntries = logs.map(log => ({
+      email: normalizeEmail(email),
+      direction: (log.direction as 'A→B' | 'B→A' | 'bidirectional') || 'bidirectional',
       action: log.action,
-      direction: log.direction || 'none',
       result: log.result,
-      timestamp: new Date().toISOString()
-    },
-    status: 'completed' as const
-  }));
+      field: log.field,
+      dedupe_key: `${email}_${log.field}_${log.action}_${Date.now()}`
+    }));
 
-  if (logEntries.length > 0) {
-    await supabase
-      .from('ml_outbox')
-      .insert(logEntries);
+    if (logEntries.length > 0) {
+      const { error } = await supabase
+        .from('sync_log')
+        .insert(logEntries);
+
+      if (error) {
+        console.error('Failed to log sync activities:', error);
+        throw error;
+      }
+    }
+  } catch (error) {
+    console.error('Failed to log sync activities:', error);
+    throw error;
   }
 }
 
 /**
- * Store conflicts using ml_outbox table for now
+ * Store conflicts in database
  */
 export async function storeConflicts(
   email: string,
   conflicts: FieldConflict[]
 ): Promise<void> {
-  const conflictEntries = conflicts.map(conflict => ({
-    action: 'conflict_detected',
-    entity_type: 'sync_conflict',
-    payload: {
-      email,
+  try {
+    const conflictEntries = conflicts.map(conflict => ({
+      email: normalizeEmail(email),
       field: conflict.field,
-      a_value: conflict.a_value,
-      b_value: conflict.b_value,
-      a_updated_at: conflict.a_updated_at,
-      b_updated_at: conflict.b_updated_at,
-      detected_at: new Date().toISOString(),
-      status: 'open'
-    },
-    status: 'pending' as const
-  }));
+      a_value: String(conflict.a_value || ''),
+      b_value: String(conflict.b_value || ''),
+      status: 'pending' as const
+    }));
 
-  if (conflictEntries.length > 0) {
-    await supabase
-      .from('ml_outbox')
-      .insert(conflictEntries);
+    if (conflictEntries.length > 0) {
+      const { error } = await supabase
+        .from('sync_conflicts')
+        .insert(conflictEntries);
+
+      if (error) {
+        console.error('Failed to store conflicts:', error);
+        throw error;
+      }
+    }
+  } catch (error) {
+    console.error('Failed to store conflicts:', error);
+    throw error;
   }
 }
 
 /**
- * Update crosswalk mapping - store in localStorage for now
+ * Update crosswalk mapping in database
  */
 export async function updateCrosswalk(
   email: string,
   aId: string,
   bId?: string
 ): Promise<void> {
-  const crosswalkKey = 'integration_crosswalk';
-  const existingData = localStorage.getItem(crosswalkKey);
-  const crosswalk = existingData ? JSON.parse(existingData) : {};
-  
-  crosswalk[email] = {
-    a_id: aId,
-    b_id: bId,
-    updated_at: new Date().toISOString()
-  };
-  
-  localStorage.setItem(crosswalkKey, JSON.stringify(crosswalk));
+  try {
+    const { error } = await supabase
+      .from('integration_crosswalk')
+      .upsert({
+        email: normalizeEmail(email),
+        a_id: aId,
+        b_id: bId
+      }, {
+        onConflict: 'email'
+      });
+
+    if (error) {
+      console.error('Failed to update crosswalk:', error);
+      throw error;
+    }
+  } catch (error) {
+    console.error('Failed to update crosswalk:', error);
+    throw error;
+  }
 }
 
 /**
- * Get crosswalk mapping
+ * Get crosswalk mapping from database
  */
 export async function getCrosswalk(email: string): Promise<{
   a_id: string;
   b_id?: string;
 } | null> {
-  const crosswalkKey = 'integration_crosswalk';
-  const existingData = localStorage.getItem(crosswalkKey);
-  
-  if (!existingData) return null;
-  
-  const crosswalk = JSON.parse(existingData);
-  return crosswalk[email] || null;
+  try {
+    const { data, error } = await supabase
+      .from('integration_crosswalk')
+      .select('a_id, b_id')
+      .eq('email', normalizeEmail(email))
+      .maybeSingle();
+
+    if (error) {
+      console.error('Failed to get crosswalk:', error);
+      return null;
+    }
+
+    return data ? {
+      a_id: data.a_id,
+      b_id: data.b_id
+    } : null;
+  } catch (error) {
+    console.error('Failed to get crosswalk:', error);
+    return null;
+  }
 }
 
 /**
- * Main sync orchestrator function
+ * Main sync orchestrator function - fully database-backed
  */
 export async function orchestrateSync(
   email: string,
@@ -347,29 +430,40 @@ export async function orchestrateSync(
   message: string;
 }> {
   try {
-    // Process the sync
+    console.log(`Starting orchestrated sync for ${email}`);
+    
+    // Process the sync with database-backed shadow state
     const { updates, conflicts, logs } = await syncRecord(email, clientData, mailerLiteData);
     
-    // Apply updates (this would be done by the calling code)
-    // Log the sync activity
-    await logSyncActivity(email, logs);
+    // Log sync activities to database
+    if (logs.length > 0) {
+      await logSyncActivity(email, logs);
+    }
     
-    // Store any conflicts
+    // Store conflicts in database
     if (conflicts.length > 0) {
       await storeConflicts(email, conflicts);
     }
     
-    // Update shadow state
+    // Update shadow state in database
     await updateShadowState(email, clientData, mailerLiteData);
     
-    // Update crosswalk
-    await updateCrosswalk(email, clientData.id, mailerLiteData.id);
+    // Update crosswalk in database
+    const clientId = clientData.id || clientData.email;
+    const mailerLiteId = mailerLiteData.id;
+    if (clientId) {
+      await updateCrosswalk(email, clientId, mailerLiteId);
+    }
+    
+    const message = conflicts.length > 0 
+      ? `Sync completed with ${conflicts.length} conflicts requiring resolution`
+      : `Sync completed successfully with ${updates.length} updates applied`;
     
     return {
       success: true,
       conflicts,
       appliedUpdates: updates.length,
-      message: `Processed ${updates.length} updates, ${conflicts.length} conflicts detected`
+      message
     };
     
   } catch (error) {
@@ -378,7 +472,7 @@ export async function orchestrateSync(
       success: false,
       conflicts: [],
       appliedUpdates: 0,
-      message: `Sync failed: ${error}`
+      message: `Sync failed: ${error instanceof Error ? error.message : 'Unknown error'}`
     };
   }
 }
