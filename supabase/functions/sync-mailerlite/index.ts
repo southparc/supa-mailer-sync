@@ -269,8 +269,9 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
   const { batchSize, maxRecords } = options;
   let batchCount = 0;
   
-  // Safety check: prevent processing beyond reasonable limits
-  const MAX_SAFE_OFFSET = 5000; // Reduced limit to prevent excessive credit burn
+  // Safety check: prevent processing beyond reasonable limits for individual requests
+  // Allow larger limits for bidirectional sync but keep safety for single direction syncs
+  const MAX_SAFE_OFFSET = maxRecords === 0 ? 25000 : 5000; // No limit for full sync, 5k for partial
   if (currentOffset > MAX_SAFE_OFFSET) {
     console.log(`Offset ${currentOffset} exceeds safety limit ${MAX_SAFE_OFFSET}, stopping`);
     return { 
