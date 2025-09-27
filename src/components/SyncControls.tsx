@@ -176,11 +176,14 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       let offset = 0;
       let totalImported = 0;
       let hasMoreImport = true;
+      let emptyBatchCount = 0;
       const initialBatchSize = safeMode ? 100 : networkSpeed === 'slow' ? 250 : 500;
+      const MAX_IMPORT_OFFSET = 50000; // Safety limit to prevent infinite loops
+      const MAX_EMPTY_BATCHES = 3; // Stop after consecutive empty batches
 
       setSyncStatus("Phase 1: Importing data from MailerLite...");
       
-      while (hasMoreImport) {
+      while (hasMoreImport && offset < MAX_IMPORT_OFFSET) {
         setSyncStatus(`Importing batch ${Math.floor(offset/initialBatchSize) + 1} (offset: ${offset})...`);
         
         const { data, error } = await invokeWithRetry('sync-mailerlite', { 
@@ -208,15 +211,31 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
         }
 
         const result = data?.result || {};
-        totalImported += result.subscribersSynced || 0;
+        const batchSynced = result.subscribersSynced || 0;
+        totalImported += batchSynced;
         hasMoreImport = result.hasMore || false;
         offset = result.nextOffset || offset + initialBatchSize;
 
+        // Track empty batches to prevent infinite loops
+        if (batchSynced === 0) {
+          emptyBatchCount++;
+          console.log(`Empty batch #${emptyBatchCount} at offset ${offset}`);
+        } else {
+          emptyBatchCount = 0; // Reset counter on successful batch
+        }
+
+        // Stop if we hit too many empty batches or safety limits
+        if (emptyBatchCount >= MAX_EMPTY_BATCHES) {
+          console.log(`Stopping after ${emptyBatchCount} consecutive empty batches`);
+          hasMoreImport = false;
+        }
+
         // Update progress for Phase 1 (0-50%)
-        setSyncProgress(Math.min(50, (totalImported / 10000) * 50));
-        setSyncStatus(`Imported ${totalImported} subscribers...`);
+        setSyncProgress(Math.min(50, (totalImported / 20000) * 50)); // Adjusted for more realistic totals
+        setSyncStatus(`Imported ${totalImported} subscribers (batch: ${batchSynced})...`);
 
         if (!hasMoreImport) {
+          setSyncStatus(`Import phase completed. Total imported: ${totalImported}`);
           break;
         }
       }
@@ -361,9 +380,12 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       let offset = 0;
       let totalSynced = 0;
       let hasMore = true;
+      let emptyBatchCount = 0;
       const batchSize = safeMode ? 100 : networkSpeed === 'slow' ? 250 : 500;
+      const MAX_IMPORT_OFFSET = 50000; // Safety limit
+      const MAX_EMPTY_BATCHES = 3;
 
-      while (hasMore) {
+      while (hasMore && offset < MAX_IMPORT_OFFSET) {
         setSyncStatus(`Importing batch ${Math.floor(offset/batchSize) + 1} (offset: ${offset})...`);
         
         const { data, error } = await invokeWithRetry('sync-mailerlite', { 
@@ -382,17 +404,33 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
         console.log('Sync response:', data);
         
         const result = data?.result || {};
-        totalSynced += result.subscribersSynced || 0;
+        const batchSynced = result.subscribersSynced || 0;
+        totalSynced += batchSynced;
         hasMore = result.hasMore || false;
         offset = result.nextOffset || offset + batchSize;
 
-        // Update progress (rough estimate based on batch count)
-        const progress = Math.min(90, (totalSynced / 10000) * 100);
+        // Track empty batches
+        if (batchSynced === 0) {
+          emptyBatchCount++;
+          console.log(`Empty batch #${emptyBatchCount} at offset ${offset}`);
+        } else {
+          emptyBatchCount = 0;
+        }
+
+        // Safety stops
+        if (emptyBatchCount >= MAX_EMPTY_BATCHES) {
+          console.log(`Stopping after ${emptyBatchCount} consecutive empty batches`);
+          break;
+        }
+
+        // Update progress (more realistic estimates)
+        const progress = Math.min(90, (totalSynced / 20000) * 100);
         setSyncProgress(progress);
-        setSyncStatus(`Imported ${totalSynced} subscribers so far...`);
+        setSyncStatus(`Imported ${totalSynced} subscribers (batch: ${batchSynced})...`);
 
         // Continue until no more data
         if (!hasMore) {
+          setSyncStatus(`Import completed. Total: ${totalSynced} subscribers`);
           break;
         }
       }

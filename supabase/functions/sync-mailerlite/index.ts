@@ -269,6 +269,18 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
   const { batchSize, maxRecords } = options;
   let batchCount = 0;
   
+  // Safety check: prevent processing beyond reasonable limits
+  const MAX_SAFE_OFFSET = 50000; // Reasonable limit for most MailerLite accounts
+  if (currentOffset > MAX_SAFE_OFFSET) {
+    console.log(`Offset ${currentOffset} exceeds safety limit ${MAX_SAFE_OFFSET}, stopping`);
+    return { 
+      subscribersSynced: 0,
+      groupsSynced: 0,
+      hasMore: false,
+      nextOffset: currentOffset
+    };
+  }
+  
   // Build MailerLite API URL with pagination
   const subscribersUrl = new URL('https://connect.mailerlite.com/api/subscribers');
   subscribersUrl.searchParams.set('limit', batchSize.toString());
@@ -286,10 +298,10 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
   const subscribersData = await subscribersResponse.json();
   const subscribers = subscribersData.data || [];
   
-  console.log(`Received ${subscribers.length} subscribers in batch`);
+  console.log(`Received ${subscribers.length} subscribers in batch (requested: ${batchSize})`);
   
   if (subscribers.length === 0) {
-    console.log('No more subscribers to process');
+    console.log('No subscribers in response - reached end of data');
     return { 
       subscribersSynced: totalSynced,
       groupsSynced: 0,
@@ -334,9 +346,19 @@ async function syncFromMailerLite(supabaseClient: any, headers: any, options: Sy
   // Return after processing exactly one batch (when maxRecords matches batchSize)
   if (maxRecords > 0 && maxRecords === batchSize) {
     console.log(`Processed single batch as requested: ${totalSynced} subscribers`);
+    
+    // FIXED: Proper hasMore logic - only continue if we got a FULL batch AND we're not at a reasonable limit
+    const hasMore = subscribers.length === batchSize && currentOffset < MAX_SAFE_OFFSET;
+    
+    if (!hasMore && subscribers.length < batchSize) {
+      console.log(`Batch incomplete (${subscribers.length}/${batchSize}) - reached end of MailerLite data`);
+    } else if (!hasMore && currentOffset >= MAX_SAFE_OFFSET) {
+      console.log(`Reached safety offset limit (${MAX_SAFE_OFFSET}) - stopping to prevent infinite loop`);
+    }
+    
     return { 
       subscribersSynced: totalSynced, 
-      hasMore: subscribers.length === batchSize,
+      hasMore,
       nextOffset: currentOffset
     };
   }
