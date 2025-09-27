@@ -52,23 +52,30 @@ serve(async (req) => {
     if (resolution.targetSource === 'mailerlite') {
       await updateMailerLiteSubscriber(resolution, mailerLiteHeaders);
     } else {
-      await updateSupabaseSubscriber(resolution, supabaseClient);
+      await updateSupabaseClient(resolution, supabaseClient);
     }
 
     // Log the resolution
     await supabaseClient
-      .from('ml_outbox')
+      .from('sync_log')
       .insert({
+        email: resolution.email,
         action: 'conflict_resolved',
-        entity_type: 'subscriber',
-        payload: {
-          email: resolution.email,
-          field: resolution.field,
-          resolved_value: resolution.chosenValue,
-          source: resolution.source
-        },
-        status: 'completed'
+        direction: resolution.targetSource === 'mailerlite' ? 'B→A' : 'A→B',
+        result: 'success',
+        field: resolution.field,
+        new_value: resolution.chosenValue?.toString()
       });
+
+    // Mark conflict as resolved
+    await supabaseClient
+      .from('sync_conflicts')
+      .update({
+        status: 'resolved',
+        resolved_value: resolution.chosenValue?.toString(),
+        resolved_at: new Date().toISOString()
+      })
+      .eq('id', resolution.conflictId);
 
     return new Response(
       JSON.stringify({ 
@@ -157,75 +164,48 @@ async function updateMailerLiteSubscriber(resolution: ConflictResolution, header
   console.log(`Updated ${resolution.email} in MailerLite with ${resolution.field}: ${resolution.chosenValue}`);
 }
 
-async function updateSupabaseSubscriber(resolution: ConflictResolution, supabaseClient: any) {
-  // Find the subscriber in Supabase
-  const { data: subscriber, error: findError } = await supabaseClient
-    .from('ml_subscribers')
+async function updateSupabaseClient(resolution: ConflictResolution, supabaseClient: any) {
+  // Find the client in Supabase
+  const { data: client, error: findError } = await supabaseClient
+    .from('clients')
     .select('*')
     .eq('email', resolution.email)
     .maybeSingle();
 
   if (findError) {
-    throw new Error(`Database error finding subscriber ${resolution.email}: ${findError.message}`);
+    throw new Error(`Database error finding client ${resolution.email}: ${findError.message}`);
   }
 
-  let subscriberToUpdate = subscriber;
-
-  // If subscriber doesn't exist, create a new one
-  if (!subscriber) {
-    console.log(`Creating new subscriber for ${resolution.email}`);
-    
-    const newSubscriberData = {
-      email: resolution.email,
-      name: resolution.field === 'name' ? resolution.chosenValue : null,
-      status: resolution.field === 'status' ? resolution.chosenValue : 'active',
-      fields: resolution.field !== 'name' && resolution.field !== 'status' ? 
-        { [resolution.field]: resolution.chosenValue } : {},
-      updated_at: new Date().toISOString()
-    };
-
-    const { data: newSubscriber, error: insertError } = await supabaseClient
-      .from('ml_subscribers')
-      .insert(newSubscriberData)
-      .select()
-      .single();
-
-    if (insertError) {
-      throw new Error(`Failed to create new subscriber ${resolution.email}: ${insertError.message}`);
-    }
-
-    subscriberToUpdate = newSubscriber;
-    console.log(`Created new subscriber ${resolution.email} with ID ${newSubscriber.id}`);
+  if (!client) {
+    throw new Error(`Client ${resolution.email} not found in Supabase`);
   }
 
-  // Prepare update data based on field
+  // Prepare update data based on field mapping
   let updateData: any = {};
   
-  switch (resolution.field) {
-    case 'name':
-      updateData.name = resolution.chosenValue;
-      break;
-    case 'status':
-      updateData.status = resolution.chosenValue;
-      break;
-    default:
-      // For custom fields, update the fields JSON
-      updateData.fields = {
-        ...subscriberToUpdate.fields,
-        [resolution.field]: resolution.chosenValue
-      };
-  }
-
+  // Map field names according to sync engine mapping
+  const fieldMappings: Record<string, string> = {
+    'name': 'first_name', // MailerLite 'name' -> Supabase 'first_name'
+    'first_name': 'first_name',
+    'last_name': 'last_name',
+    'email': 'email',
+    'phone': 'phone',
+    'city': 'city',
+    'country': 'country'
+  };
+  
+  const supabaseField = fieldMappings[resolution.field] || resolution.field;
+  updateData[supabaseField] = resolution.chosenValue;
   updateData.updated_at = new Date().toISOString();
 
-  // Update subscriber in Supabase
+  // Update client in Supabase
   const { error: updateError } = await supabaseClient
-    .from('ml_subscribers')
+    .from('clients')
     .update(updateData)
-    .eq('id', subscriberToUpdate.id);
+    .eq('id', client.id);
 
   if (updateError) {
-    throw new Error(`Failed to update Supabase subscriber: ${updateError.message}`);
+    throw new Error(`Failed to update Supabase client: ${updateError.message}`);
   }
 
   console.log(`Updated ${resolution.email} in Supabase with ${resolution.field}: ${resolution.chosenValue}`);

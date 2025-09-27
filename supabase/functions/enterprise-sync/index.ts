@@ -55,6 +55,27 @@ Deno.serve(async (req) => {
       throw new Error('MailerLite API key not configured')
     }
 
+    // Test MailerLite API connection first
+    console.log('Testing MailerLite API connection...')
+    try {
+      const testResponse = await fetch('https://connect.mailerlite.com/api/subscribers?limit=1', {
+        headers: {
+          'Authorization': `Bearer ${mailerLiteApiKey}`,
+          'Content-Type': 'application/json',
+        },
+      })
+      
+      if (!testResponse.ok) {
+        throw new Error(`MailerLite API test failed: ${testResponse.status} ${testResponse.statusText}`)
+      }
+      
+      const testData = await testResponse.json()
+      console.log(`MailerLite API connection successful. Total subscribers available: ${testData.meta?.total || 'unknown'}`)
+    } catch (error) {
+      console.error('MailerLite API connection failed:', error)
+      throw new Error(`Cannot connect to MailerLite API: ${error instanceof Error ? error.message : 'unknown error'}`)
+    }
+
     let result: SyncResult = {
       recordsProcessed: 0,
       conflictsDetected: 0,

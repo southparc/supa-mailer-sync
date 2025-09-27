@@ -66,19 +66,25 @@ export default function Dashboard() {
 
   const loadDashboardStats = async () => {
     try {
-      // Load stats from various tables
-      const [clientsResult, groupsResult, conflictsResult, syncStateResult] = await Promise.all([
+      // Load stats from available tables only
+      const [clientsResult, conflictsResult] = await Promise.all([
         supabase.from('clients').select('id', { count: 'exact' }),
-        supabase.from('ml_groups').select('id', { count: 'exact' }),
         supabase.from('sync_conflicts').select('id', { count: 'exact' }).eq('status', 'pending'),
-        supabase.from('ml_sync_state').select('*').single()
       ]);
+
+      // Get latest sync time from sync logs
+      const { data: lastSync } = await supabase
+        .from('sync_log')
+        .select('created_at')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
       setStats({
         totalClients: clientsResult.count || 0,
-        totalGroups: groupsResult.count || 0,
+        totalGroups: 0, // No more groups table
         pendingConflicts: conflictsResult.count || 0,
-        lastSyncAt: syncStateResult.data?.last_full_backfill_at
+        lastSyncAt: lastSync?.created_at || null
       });
     } catch (error) {
       console.error('Error loading dashboard stats:', error);
