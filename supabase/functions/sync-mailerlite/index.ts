@@ -7,8 +7,8 @@ const corsHeaders = {
 };
 
 interface SyncRequest {
-  syncType: 'full' | 'incremental';
-  direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite' | 'detect_conflicts';
+  syncType: 'full' | 'incremental' | 'health_check';
+  direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite' | 'detect_conflicts' | 'health_check';
   batchSize?: number;
   maxRecords?: number;
   offset?: number;
@@ -36,6 +36,7 @@ serve(async (req) => {
 
   try {
     console.log('=== SYNC FUNCTION STARTED ===');
+    const startTime = Date.now();
     
     // Log masked connection details for debugging
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
@@ -53,12 +54,6 @@ serve(async (req) => {
     );
     console.log('✓ Supabase client created');
 
-    // Check initial subscriber count
-    const { count: preCount } = await supabaseClient
-      .from('ml_subscribers')
-      .select('*', { count: 'exact', head: true });
-    console.log(`Pre-sync subscriber count: ${preCount}`);
-
     const { 
       syncType, 
       direction, 
@@ -69,6 +64,30 @@ serve(async (req) => {
     }: SyncRequest = await req.json();
     
     console.log(`✓ Request parsed - ${syncType} sync in ${direction} direction with batch size ${batchSize}`);
+
+    // Handle health check requests immediately
+    if (direction === 'health_check' || syncType === 'health_check') {
+      console.log('→ Performing health check');
+      const healthResult = await performHealthCheck(supabaseClient);
+      console.log('✓ Health check completed');
+      
+      return new Response(
+        JSON.stringify({ 
+          success: true, 
+          result: healthResult
+        }),
+        { 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 200 
+        },
+      );
+    }
+
+    // Check initial subscriber count
+    const { count: preCount } = await supabaseClient
+      .from('ml_subscribers')
+      .select('*', { count: 'exact', head: true });
+    console.log(`Pre-sync subscriber count: ${preCount}`);
 
     // Initialize MailerLite API client
     const mailerLiteApiKey = Deno.env.get('MAILERLITE_API_KEY');
@@ -136,7 +155,8 @@ serve(async (req) => {
     console.log(`Post-sync subscriber count: ${postCount}`);
     console.log(`Net change: ${(postCount || 0) - (preCount || 0)} subscribers`);
     
-    console.log('=== SYNC FUNCTION COMPLETED ===', result);
+    const executionTime = Date.now() - startTime;
+    console.log(`=== SYNC FUNCTION COMPLETED in ${executionTime}ms ===`, result);
 
     return new Response(
       JSON.stringify({ 
@@ -145,7 +165,8 @@ serve(async (req) => {
           ...result,
           preCount,
           postCount,
-          netChange: (postCount || 0) - (preCount || 0)
+          netChange: (postCount || 0) - (preCount || 0),
+          executionTime
         }
       }),
       { 
@@ -172,6 +193,73 @@ serve(async (req) => {
     );
   }
 });
+
+// Health check function to verify service readiness
+async function performHealthCheck(supabaseClient: any) {
+  console.log('Performing comprehensive health check...');
+  
+  const startTime = Date.now();
+  const checks: any = {
+    supabase: false,
+    mailerlite: false,
+    database_tables: false,
+    api_keys: false
+  };
+  
+  try {
+    // Check Supabase connection and required tables
+    const { data: subscriberCount, error: dbError } = await supabaseClient
+      .from('ml_subscribers')
+      .select('*', { count: 'exact', head: true });
+      
+    if (!dbError) {
+      checks.supabase = true;
+      checks.database_tables = true;
+      console.log(`✓ Supabase connected - ${subscriberCount} subscribers in database`);
+    } else {
+      console.error('✗ Supabase connection failed:', dbError);
+    }
+    
+    // Check MailerLite API
+    const mailerLiteApiKey = Deno.env.get('MAILERLITE_API_KEY');
+    if (mailerLiteApiKey) {
+      checks.api_keys = true;
+      
+      const testResponse = await fetch('https://connect.mailerlite.com/api/me', { 
+        headers: {
+          'Authorization': `Bearer ${mailerLiteApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        method: 'GET'
+      });
+      
+      if (testResponse.ok) {
+        checks.mailerlite = true;
+        const userData = await testResponse.json();
+        console.log(`✓ MailerLite API connected - Account: ${userData.data?.email || 'Unknown'}`);
+      } else {
+        console.error('✗ MailerLite API connection failed:', testResponse.statusText);
+      }
+    } else {
+      console.error('✗ MailerLite API key not found');
+    }
+    
+  } catch (error) {
+    console.error('Health check error:', error);
+  }
+  
+  const responseTime = Date.now() - startTime;
+  const allChecksPass = Object.values(checks).every(check => check === true);
+  
+  console.log(`Health check completed in ${responseTime}ms - Status: ${allChecksPass ? 'HEALTHY' : 'UNHEALTHY'}`);
+  
+  return {
+    status: allChecksPass ? 'healthy' : 'unhealthy',
+    responseTime,
+    checks,
+    timestamp: new Date().toISOString()
+  };
+}
 
 async function syncFromMailerLite(supabaseClient: any, headers: any, options: SyncOptions) {
   console.log(`Syncing from MailerLite to Supabase with options:`, options);
