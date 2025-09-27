@@ -28,6 +28,9 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
   const [syncStatus, setSyncStatus] = useState<string>("");
   const [safeMode, setSafeMode] = useState(false);
   const [networkSpeed, setNetworkSpeed] = useState<'fast' | 'medium' | 'slow'>('fast');
+  const [shouldCancelSync, setShouldCancelSync] = useState(false);
+  const [totalRecords, setTotalRecords] = useState(0);
+  const [estimatedTotal, setEstimatedTotal] = useState<number | null>(null);
   const { toast } = useToast();
 
   // Load saved progress on component mount
@@ -177,14 +180,26 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       let totalImported = 0;
       let hasMoreImport = true;
       let emptyBatchCount = 0;
+      let apiCallCount = 0;
       const initialBatchSize = safeMode ? 100 : networkSpeed === 'slow' ? 250 : 500;
-      const MAX_IMPORT_OFFSET = 50000; // Safety limit to prevent infinite loops
+      const MAX_IMPORT_OFFSET = 5000; // Reduced safety limit
       const MAX_EMPTY_BATCHES = 3; // Stop after consecutive empty batches
+      const MAX_API_CALLS = 50; // Prevent excessive credit burn
 
       setSyncStatus("Phase 1: Importing data from MailerLite...");
+      setShouldCancelSync(false);
+      setTotalRecords(0);
       
-      while (hasMoreImport && offset < MAX_IMPORT_OFFSET) {
-        setSyncStatus(`Importing batch ${Math.floor(offset/initialBatchSize) + 1} (offset: ${offset})...`);
+      while (hasMoreImport && offset < MAX_IMPORT_OFFSET && !shouldCancelSync && apiCallCount < MAX_API_CALLS) {
+        apiCallCount++;
+        const currentPage = Math.floor(offset/initialBatchSize) + 1;
+        const estimatedTotalText = estimatedTotal ? ` / ~${estimatedTotal}` : '';
+        setSyncStatus(`Records: ${totalImported}${estimatedTotalText} (Page ${currentPage}, API calls: ${apiCallCount})...`);
+        
+        if (shouldCancelSync) {
+          setSyncStatus("Sync cancelled by user");
+          break;
+        }
         
         const { data, error } = await invokeWithRetry('sync-mailerlite', { 
           syncType: 'full',
@@ -213,6 +228,7 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
         const result = data?.result || {};
         const batchSynced = result.subscribersSynced || 0;
         totalImported += batchSynced;
+        setTotalRecords(totalImported);
         hasMoreImport = result.hasMore || false;
         offset = result.nextOffset || offset + initialBatchSize;
 
@@ -230,12 +246,16 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
           hasMoreImport = false;
         }
 
+        if (apiCallCount >= MAX_API_CALLS) {
+          console.log(`Stopping after ${apiCallCount} API calls to prevent excessive credit burn`);
+          hasMoreImport = false;
+        }
+
         // Update progress for Phase 1 (0-50%)
         setSyncProgress(Math.min(50, (totalImported / 20000) * 50)); // Adjusted for more realistic totals
-        setSyncStatus(`Imported ${totalImported} subscribers (batch: ${batchSynced})...`);
 
         if (!hasMoreImport) {
-          setSyncStatus(`Import phase completed. Total imported: ${totalImported}`);
+          setSyncStatus(`Import phase completed. Total imported: ${totalImported} (${apiCallCount} API calls)`);
           break;
         }
       }
@@ -307,13 +327,22 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
       console.error('Sync error:', error);
       const errorMessage = error?.message || error?.name || "Failed to complete synchronization. Please try again.";
       const contextMessage = error?.context?.message ? ` (${error.context.message})` : "";
-      toast({
-        title: "Sync Failed", 
-        description: `${errorMessage}${contextMessage}`,
-        variant: "destructive",
-      });
+      
+      if (shouldCancelSync) {
+        toast({
+          title: "Sync Cancelled",
+          description: "The sync was stopped by user request.",
+        });
+      } else {
+        toast({
+          title: "Sync Failed", 
+          description: `${errorMessage}${contextMessage}`,
+          variant: "destructive",
+        });
+      }
     } finally {
       setSyncing(false);
+      setShouldCancelSync(false);
       setSyncProgress(0);
       setSyncStatus("");
       
@@ -617,15 +646,27 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
                   <Shield className="h-3 w-3 mr-1" />
                   Safe Mode
                 </Button>
-                <Button
-                  onClick={() => clearSyncProgress()}
-                  variant="outline"
-                  size="sm"
-                  className="flex-1"
-                  disabled={!localStorage.getItem('mailerlite_sync_progress')}
-                >
-                  Clear Progress
-                </Button>
+                {syncing && (
+                  <Button
+                    onClick={() => setShouldCancelSync(true)}
+                    variant="destructive"
+                    size="sm"
+                    className="flex-1"
+                  >
+                    Stop Sync
+                  </Button>
+                )}
+                {!syncing && (
+                  <Button
+                    onClick={() => clearSyncProgress()}
+                    variant="outline"
+                    size="sm"
+                    className="flex-1"
+                    disabled={!localStorage.getItem('mailerlite_sync_progress')}
+                  >
+                    Clear Progress
+                  </Button>
+                )}
               </div>
             </div>
             <Button 
