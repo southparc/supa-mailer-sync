@@ -5,3 +5,6 @@ verify_jwt = false
 
 [functions.resolve-conflict]
 verify_jwt = false
+
+[functions.enterprise-sync]
+verify_jwt = false

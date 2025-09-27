@@ -11,6 +11,7 @@ import { ConflictResolution } from "@/components/ConflictResolution";
 import { SyncControls } from "@/components/SyncControls";
 import { SyncSettings } from "@/components/SyncSettings";
 import { SyncLogs } from "@/components/SyncLogs";
+import EnterpriseSyncDashboard from "@/components/EnterpriseSyncDashboard";
 import { LogOut, RefreshCw, AlertTriangle, Users, Database } from "lucide-react";
 
 interface DashboardStats {
@@ -183,13 +184,18 @@ export default function Dashboard() {
         </div>
 
         {/* Main Content Tabs */}
-        <Tabs defaultValue="conflicts" className="space-y-6">
-          <TabsList className="grid w-full grid-cols-4">
+        <Tabs defaultValue="enterprise" className="space-y-6">
+          <TabsList className="grid w-full grid-cols-5">
+            <TabsTrigger value="enterprise">Enterprise Sync</TabsTrigger>
             <TabsTrigger value="conflicts">Conflict Resolution</TabsTrigger>
-            <TabsTrigger value="sync">Sync Controls</TabsTrigger>
+            <TabsTrigger value="sync">Legacy Controls</TabsTrigger>
             <TabsTrigger value="settings">Settings</TabsTrigger>
             <TabsTrigger value="logs">Sync Logs</TabsTrigger>
           </TabsList>
+
+          <TabsContent value="enterprise" className="space-y-6">
+            <EnterpriseSyncDashboard />
+          </TabsContent>
 
           <TabsContent value="conflicts" className="space-y-6">
             <Card>
