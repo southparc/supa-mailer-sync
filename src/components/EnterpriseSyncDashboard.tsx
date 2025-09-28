@@ -37,6 +37,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
     updatesApplied: 0 
   });
   const [currentClientCount, setCurrentClientCount] = useState<number>(0);
+  const [chunkProgress, setChunkProgress] = useState({ current: 0, total: 0 });
   const { toast } = useToast();
 
   // Fetch current client count on mount and after syncs
@@ -65,52 +66,93 @@ const EnterpriseSyncDashboard: React.FC = () => {
     'supabase-to-mailerlite';
 
   const handleSync = async (direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') => {
+    if (syncStatus === 'syncing') return;
+    
     try {
       setSyncStatus('syncing');
       setSyncProgress(0);
-
-      const { data, error } = await supabase.functions.invoke('enterprise-sync', {
-        body: {
-          direction: mapDirection(direction),
-          maxRecords: 300,
-          maxDurationMs: 120000,
-          dryRun: false
-        }
-      });
-
-      if (error) throw error;
-
-      const result = data || {};
+      setChunkProgress({ current: 0, total: 0 });
       
+      let totalRecordsProcessed = 0;
+      let totalUpdatesApplied = 0;
+      let totalConflictsDetected = 0;
+      let chunkCount = 0;
+      const maxChunks = 20; // Safety limit
+      
+      // Loop until sync is complete or we hit the safety limit
+      while (chunkCount < maxChunks) {
+        chunkCount++;
+        setChunkProgress({ current: chunkCount, total: 0 });
+        
+        const { data, error } = await supabase.functions.invoke('enterprise-sync', {
+          body: {
+            direction: mapDirection(direction),
+            maxRecords: 300,
+            maxDurationMs: 120000,
+            dryRun: false
+          }
+        });
+
+        if (error) throw error;
+
+        const result = data || {};
+        
+        // Accumulate totals
+        totalRecordsProcessed += result.recordsProcessed || 0;
+        totalUpdatesApplied += result.updatesApplied || 0;
+        totalConflictsDetected += result.conflictsDetected || 0;
+        
+        // Update progress - estimate based on chunk count
+        setSyncProgress(Math.min((chunkCount / 10) * 100, 95));
+        
+        // Refresh client count after each chunk
+        await fetchClientCount();
+        
+        // Show chunk completion toast
+        toast({
+          title: `Chunk ${chunkCount} Completed`,
+          description: `Processed ${result.recordsProcessed || 0} records in this chunk`,
+        });
+        
+        // If sync is done or no records processed, break the loop
+        if (result.done === true || (result.recordsProcessed || 0) === 0) {
+          break;
+        }
+        
+        // Small delay between chunks to prevent overwhelming
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      
+      // Update final stats
       setStats(prev => ({
         ...prev,
         lastSync: new Date().toISOString(),
-        recordsProcessed: prev.recordsProcessed + (result.recordsProcessed || 0),
-        updatesApplied: prev.updatesApplied + (result.updatesApplied || 0),
-        conflicts: prev.conflicts + (result.conflictsDetected || 0)
+        recordsProcessed: prev.recordsProcessed + totalRecordsProcessed,
+        updatesApplied: prev.updatesApplied + totalUpdatesApplied,
+        conflicts: prev.conflicts + totalConflictsDetected
       }));
-
-      // Refresh client count
-      await fetchClientCount();
 
       setSyncStatus('completed');
       setSyncProgress(100);
       
+      // Final completion toast
       toast({
         title: "Sync Completed",
-        description: `Processed ${result.recordsProcessed || 0} records, applied ${result.updatesApplied || 0} updates, detected ${result.conflictsDetected || 0} conflicts.`,
+        description: `All chunks processed! Total: ${totalRecordsProcessed} records, ${totalUpdatesApplied} updates, ${totalConflictsDetected} conflicts across ${chunkCount} chunks.`,
       });
 
       // Reset status after delay
       setTimeout(() => {
         setSyncStatus('idle');
         setSyncProgress(0);
+        setChunkProgress({ current: 0, total: 0 });
       }, 3000);
 
     } catch (error) {
       console.error('Sync failed:', error);
       setSyncStatus('idle');
       setSyncProgress(0);
+      setChunkProgress({ current: 0, total: 0 });
       
       toast({
         title: "Sync Failed",
@@ -162,7 +204,10 @@ const EnterpriseSyncDashboard: React.FC = () => {
           <CardContent>
             <Progress value={syncProgress} className="mb-2" />
             <p className="text-sm text-muted-foreground">
-              {syncStatus === 'syncing' ? 'Processing records...' : 'Sync completed!'}
+              {syncStatus === 'syncing' ? 
+                `Processing chunk ${chunkProgress.current}... ${Math.round(syncProgress)}% complete` : 
+                'Sync completed!'
+              }
             </p>
           </CardContent>
         </Card>
