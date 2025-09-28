@@ -45,9 +45,44 @@ Deno.serve(async (req) => {
 
     // Parse request body
     const body = await req.json()
-    const { direction = 'both', maxRecords = 1000, dryRun = false }: SyncOptions = body
+    let { direction = 'both', maxRecords = 1000, dryRun = false } = body
+
+    // Map synonym directions from UI
+    const directionMap: Record<string, string> = {
+      'bidirectional': 'both',
+      'from_mailerlite': 'mailerlite-to-supabase', 
+      'to_mailerlite': 'supabase-to-mailerlite'
+    }
+    
+    if (directionMap[direction]) {
+      direction = directionMap[direction]
+    }
+    
+    // Validate direction
+    const validDirections = ['both', 'mailerlite-to-supabase', 'supabase-to-mailerlite']
+    if (!validDirections.includes(direction)) {
+      console.error(`Invalid sync direction received: ${direction}. Valid options: ${validDirections.join(', ')}`)
+      return new Response(
+        JSON.stringify({ 
+          error: `Invalid sync direction: ${direction}. Valid options: ${validDirections.join(', ')}`,
+          recordsProcessed: 0,
+          conflictsDetected: 0,
+          updatesApplied: 0,
+          errors: 1
+        }),
+        {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 400
+        }
+      )
+    }
 
     console.log(`Sync direction: ${direction}, Max records: ${maxRecords}, Dry run: ${dryRun}`)
+    console.log(`→ Will execute branches: ${
+      direction === 'both' ? 'MailerLite→Supabase + Supabase→MailerLite' :
+      direction === 'mailerlite-to-supabase' ? 'MailerLite→Supabase only' :
+      'Supabase→MailerLite only'
+    }`)
 
     // Get MailerLite API key
     const mailerLiteApiKey = Deno.env.get('MAILERLITE_API_KEY')

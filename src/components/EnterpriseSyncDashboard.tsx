@@ -33,6 +33,12 @@ const EnterpriseSyncDashboard: React.FC = () => {
   const [stats, setStats] = useState<SyncStats>({ conflicts: 0 });
   const { toast } = useToast();
 
+  // Map UI directions to backend expectations
+  const mapDirection = (d: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') =>
+    d === 'bidirectional' ? 'both' :
+    d === 'from_mailerlite' ? 'mailerlite-to-supabase' :
+    'supabase-to-mailerlite';
+
   const handleSync = async (direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') => {
     try {
       setSyncStatus('syncing');
@@ -45,11 +51,9 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
       const { data, error } = await supabase.functions.invoke('enterprise-sync', {
         body: {
-          direction,
-          options: {
-            batchSize: 100,
-            maxRecords: 1000
-          }
+          direction: mapDirection(direction),
+          maxRecords: 1000,
+          dryRun: false
         }
       });
 
