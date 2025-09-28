@@ -404,82 +404,70 @@ export function SyncControls({ onStatsUpdate }: SyncControlsProps) {
 
       setSyncing(true);
       setSyncProgress(0);
-      setSyncStatus("Starting MailerLite import...");
+      setSyncStatus("Starting chunked MailerLite import...");
 
-      let offset = 0;
       let totalSynced = 0;
-      let hasMore = true;
-      let emptyBatchCount = 0;
-      const batchSize = safeMode ? 100 : networkSpeed === 'slow' ? 250 : 500;
-      const MAX_IMPORT_OFFSET = 50000; // Safety limit
-      const MAX_EMPTY_BATCHES = 3;
-
-      while (hasMore && offset < MAX_IMPORT_OFFSET) {
-        setSyncStatus(`Importing batch ${Math.floor(offset/batchSize) + 1} (offset: ${offset})...`);
+      let totalUpdates = 0;
+      let totalConflicts = 0;
+      let callCount = 0;
+      const maxCalls = 50; // Prevent infinite loops
+      
+      // Auto-resume orchestrator - keeps calling until done
+      while (callCount < maxCalls) {
+        callCount++;
+        setSyncStatus(`Import chunk ${callCount}: Processing batch...`);
         
-        const { data, error } = await invokeWithRetry('sync-mailerlite', { 
-          syncType: 'full',
-          direction: 'from_mailerlite',
-          batchSize,
-          maxRecords: batchSize, // Process one batch per call
-          offset
+        const { data, error } = await invokeWithRetry('enterprise-sync', { 
+          direction: 'mailerlite-to-supabase',
+          maxRecords: safeMode ? 100 : 300,
+          maxDurationMs: 120000,
+          dryRun: false
         });
 
         if (error) {
-          console.error('Sync error:', error);
-          throw new Error(error.message || 'Sync failed');
+          console.error('Import chunk error:', error);
+          throw new Error(error.message || 'Import chunk failed');
         }
 
-        console.log('Sync response:', data);
+        const result = data || {};
+        const chunkProcessed = result.recordsProcessed || 0;
+        totalSynced += chunkProcessed;
+        totalUpdates += result.updatesApplied || 0;
+        totalConflicts += result.conflictsDetected || 0;
         
-        const result = data?.result || {};
-        const batchSynced = result.subscribersSynced || 0;
-        totalSynced += batchSynced;
-        hasMore = result.hasMore || false;
-        offset = result.nextOffset || offset + batchSize;
-
-        // Track empty batches
-        if (batchSynced === 0) {
-          emptyBatchCount++;
-          console.log(`Empty batch #${emptyBatchCount} at offset ${offset}`);
-        } else {
-          emptyBatchCount = 0;
-        }
-
-        // Safety stops
-        if (emptyBatchCount >= MAX_EMPTY_BATCHES) {
-          console.log(`Stopping after ${emptyBatchCount} consecutive empty batches`);
-          break;
-        }
-
-        // Update progress (more realistic estimates)
-        const progress = Math.min(90, (totalSynced / 20000) * 100);
+        // Update progress
+        const progress = Math.min(95, (totalSynced / 18000) * 100);
         setSyncProgress(progress);
-        setSyncStatus(`Imported ${totalSynced} subscribers (batch: ${batchSynced})...`);
+        setSyncStatus(`Chunk ${callCount}: +${chunkProcessed} records (Total: ${totalSynced}, Updates: ${totalUpdates}, Conflicts: ${totalConflicts})`);
 
-        // Continue until no more data
-        if (!hasMore) {
-          setSyncStatus(`Import completed. Total: ${totalSynced} subscribers`);
+        // Check if done
+        if (result.done || chunkProcessed === 0) {
+          console.log(`Import completed after ${callCount} chunks`);
           break;
         }
+
+        // Small delay between chunks to prevent overload
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
       setSyncProgress(100);
-      setSyncStatus("Import completed successfully!");
+      setSyncStatus("Chunked import completed successfully!");
+      
+      // Clear any saved cursor state
+      localStorage.removeItem('mailerlite_import_cursor');
 
       toast({
         title: "Import Completed", 
-        description: `Imported ${totalSynced} subscribers from MailerLite successfully.`,
+        description: `Imported ${totalSynced} subscribers in ${callCount} chunks. Applied ${totalUpdates} updates, detected ${totalConflicts} conflicts.`,
       });
 
       onStatsUpdate?.();
     } catch (error: any) {
-      console.error('Import error:', error);
+      console.error('Chunked import error:', error);
       const errorMessage = error?.message || error?.name || "Failed to import from MailerLite. Please try again.";
-      const contextMessage = error?.context?.message ? ` (${error.context.message})` : "";
       toast({
         title: "Import Failed",
-        description: `${errorMessage}${contextMessage}`,
+        description: errorMessage,
         variant: "destructive",
       });
     } finally {

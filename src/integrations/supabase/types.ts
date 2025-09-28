@@ -868,6 +868,24 @@ export type Database = {
         }
         Relationships: []
       }
+      sync_state: {
+        Row: {
+          key: string
+          updated_at: string
+          value: Json
+        }
+        Insert: {
+          key: string
+          updated_at?: string
+          value?: Json
+        }
+        Update: {
+          key?: string
+          updated_at?: string
+          value?: Json
+        }
+        Relationships: []
+      }
       tax_parameters: {
         Row: {
           code: string

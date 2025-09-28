@@ -10,6 +10,8 @@ interface SyncOptions {
   direction: 'both' | 'mailerlite-to-supabase' | 'supabase-to-mailerlite'
   maxRecords?: number
   dryRun?: boolean
+  cursor?: string
+  maxDurationMs?: number
 }
 
 interface SyncResult {
@@ -18,6 +20,8 @@ interface SyncResult {
   updatesApplied: number
   errors: number
   message: string
+  done: boolean
+  nextCursor?: string
 }
 
 interface FieldConflict {
@@ -45,7 +49,7 @@ Deno.serve(async (req) => {
 
     // Parse request body
     const body = await req.json()
-    let { direction = 'both', maxRecords = 1000, dryRun = false } = body
+    let { direction = 'both', maxRecords = 300, dryRun = false, cursor, maxDurationMs = 120000 } = body
 
     // Map synonym directions from UI
     const directionMap: Record<string, string> = {
@@ -116,26 +120,36 @@ Deno.serve(async (req) => {
       conflictsDetected: 0,
       updatesApplied: 0,
       errors: 0,
-      message: 'Sync completed successfully'
+      message: 'Sync completed successfully',
+      done: true,
+      nextCursor: undefined
     }
 
-    // Execute sync based on direction
+    // Execute sync based on direction with time-bounded execution
+    const startTime = Date.now()
     if (direction === 'mailerlite-to-supabase' || direction === 'both') {
       console.log('→ Starting MailerLite → Supabase sync')
-      const mlToSupaResult = await syncFromMailerLite(supabase, mailerLiteApiKey, maxRecords, dryRun)
+      const mlToSupaResult = await syncFromMailerLite(supabase, mailerLiteApiKey, maxRecords, dryRun, cursor, maxDurationMs, startTime)
       result.recordsProcessed += mlToSupaResult.recordsProcessed
       result.conflictsDetected += mlToSupaResult.conflictsDetected
       result.updatesApplied += mlToSupaResult.updatesApplied
       result.errors += mlToSupaResult.errors
+      result.done = mlToSupaResult.done
+      result.nextCursor = mlToSupaResult.nextCursor
     }
 
     if (direction === 'supabase-to-mailerlite' || direction === 'both') {
       console.log('→ Starting Supabase → MailerLite sync')
-      const supaToMLResult = await syncToMailerLite(supabase, mailerLiteApiKey, maxRecords, dryRun)
+      const supaToMLResult = await syncToMailerLite(supabase, mailerLiteApiKey, maxRecords, dryRun, maxDurationMs, startTime)
       result.recordsProcessed += supaToMLResult.recordsProcessed
       result.conflictsDetected += supaToMLResult.conflictsDetected
       result.updatesApplied += supaToMLResult.updatesApplied
       result.errors += supaToMLResult.errors
+      // Only update done/cursor if we're not doing bidirectional or if MailerLite sync is done
+      if (direction === 'supabase-to-mailerlite' || result.done) {
+        result.done = supaToMLResult.done
+        result.nextCursor = supaToMLResult.nextCursor
+      }
     }
 
     console.log('=== ENTERPRISE SYNC COMPLETED ===', result)
@@ -164,14 +178,31 @@ Deno.serve(async (req) => {
   }
 })
 
-async function syncFromMailerLite(supabase: any, apiKey: string, maxRecords: number, dryRun: boolean): Promise<SyncResult> {
+async function syncFromMailerLite(supabase: any, apiKey: string, maxRecords: number, dryRun: boolean, startCursor?: string, maxDurationMs: number = 120000, startTime: number = Date.now()): Promise<SyncResult> {
   let recordsProcessed = 0
   let conflictsDetected = 0
   let updatesApplied = 0
   let errors = 0
-  let cursor: string | null = null
+  let cursor: string | null = startCursor || null
+
+  // Get persisted cursor if not provided
+  if (!cursor) {
+    const { data: syncState } = await supabase
+      .from('sync_state')
+      .select('value')
+      .eq('key', 'mailerlite:import:cursor')
+      .single()
+    
+    cursor = syncState?.value?.cursor || null
+    console.log(`Retrieved cursor from sync_state: ${cursor}`)
+  }
 
   while (recordsProcessed < maxRecords) {
+    // Check time bounds - leave 10s buffer for final operations
+    if (Date.now() - startTime > maxDurationMs - 10000) {
+      console.log(`Time bound reached (${Date.now() - startTime}ms), stopping early`)
+      break
+    }
     try {
       // Fetch MailerLite subscribers
       let url = `https://connect.mailerlite.com/api/subscribers?limit=100`
@@ -214,8 +245,19 @@ async function syncFromMailerLite(supabase: any, apiKey: string, maxRecords: num
         }
       }
 
-      // Update cursor for pagination
+      // Update cursor for pagination and save progress
       cursor = data.meta?.next_cursor
+      
+      if (cursor) {
+        // Save cursor to sync_state for resume capability
+        await supabase
+          .from('sync_state')
+          .upsert({
+            key: 'mailerlite:import:cursor',
+            value: { cursor, recordsProcessed, updatedAt: new Date().toISOString() }
+          })
+      }
+      
       if (!cursor) break
 
     } catch (error) {
@@ -225,10 +267,28 @@ async function syncFromMailerLite(supabase: any, apiKey: string, maxRecords: num
     }
   }
 
-  return { recordsProcessed, conflictsDetected, updatesApplied, errors, message: 'MailerLite sync completed' }
+  // Clear cursor if completed
+  const done = !cursor || recordsProcessed < maxRecords
+  if (done) {
+    await supabase
+      .from('sync_state')
+      .delete()
+      .eq('key', 'mailerlite:import:cursor')
+    console.log('Import completed, cursor cleared')
+  }
+
+  return { 
+    recordsProcessed, 
+    conflictsDetected, 
+    updatesApplied, 
+    errors, 
+    message: done ? 'MailerLite sync completed' : 'MailerLite sync partial (time bounded)',
+    done,
+    nextCursor: cursor || undefined
+  }
 }
 
-async function syncToMailerLite(supabase: any, apiKey: string, maxRecords: number, dryRun: boolean): Promise<SyncResult> {
+async function syncToMailerLite(supabase: any, apiKey: string, maxRecords: number, dryRun: boolean, maxDurationMs: number = 120000, startTime: number = Date.now()): Promise<SyncResult> {
   let recordsProcessed = 0
   let conflictsDetected = 0
   let updatesApplied = 0
@@ -237,6 +297,11 @@ async function syncToMailerLite(supabase: any, apiKey: string, maxRecords: numbe
   const limit = 100
 
   while (recordsProcessed < maxRecords) {
+    // Check time bounds
+    if (Date.now() - startTime > maxDurationMs - 10000) {
+      console.log(`Time bound reached for Supabase sync (${Date.now() - startTime}ms), stopping early`)
+      break
+    }
     try {
       console.log(`Fetching clients batch: offset=${offset}, limit=${limit}`)
       
@@ -282,7 +347,16 @@ async function syncToMailerLite(supabase: any, apiKey: string, maxRecords: numbe
     }
   }
 
-  return { recordsProcessed, conflictsDetected, updatesApplied, errors, message: 'Supabase sync completed' }
+  const done = recordsProcessed < maxRecords
+  return { 
+    recordsProcessed, 
+    conflictsDetected, 
+    updatesApplied, 
+    errors, 
+    message: done ? 'Supabase sync completed' : 'Supabase sync partial (time bounded)',
+    done,
+    nextCursor: undefined // Supabase sync doesn't use cursors, uses offset
+  }
 }
 
 async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boolean): Promise<{conflicts: number, updates: number}> {

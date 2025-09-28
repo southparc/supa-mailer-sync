@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -36,7 +36,27 @@ const EnterpriseSyncDashboard: React.FC = () => {
     recordsProcessed: 0, 
     updatesApplied: 0 
   });
+  const [currentClientCount, setCurrentClientCount] = useState<number>(0);
   const { toast } = useToast();
+
+  // Fetch current client count on mount and after syncs
+  const fetchClientCount = async () => {
+    try {
+      const { count } = await supabase
+        .from('clients')
+        .select('*', { count: 'exact', head: true });
+      
+      if (count !== null) {
+        setCurrentClientCount(count);
+      }
+    } catch (error) {
+      console.error('Error fetching client count:', error);
+    }
+  };
+
+  useEffect(() => {
+    fetchClientCount();
+  }, []);
 
   // Map UI directions to backend expectations
   const mapDirection = (d: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') =>
@@ -49,37 +69,36 @@ const EnterpriseSyncDashboard: React.FC = () => {
       setSyncStatus('syncing');
       setSyncProgress(0);
 
-      // Simulate progress updates
-      const progressInterval = setInterval(() => {
-        setSyncProgress(prev => Math.min(prev + 10, 90));
-      }, 500);
-
       const { data, error } = await supabase.functions.invoke('enterprise-sync', {
         body: {
           direction: mapDirection(direction),
-          maxRecords: 1000,
+          maxRecords: 300,
+          maxDurationMs: 120000,
           dryRun: false
         }
       });
 
-      clearInterval(progressInterval);
-      setSyncProgress(100);
-
       if (error) throw error;
 
+      const result = data || {};
+      
       setStats(prev => ({
         ...prev,
         lastSync: new Date().toISOString(),
-        recordsProcessed: data.recordsProcessed,
-        updatesApplied: data.updatesApplied,
-        conflicts: prev.conflicts + (data.conflictsDetected || 0)
+        recordsProcessed: prev.recordsProcessed + (result.recordsProcessed || 0),
+        updatesApplied: prev.updatesApplied + (result.updatesApplied || 0),
+        conflicts: prev.conflicts + (result.conflictsDetected || 0)
       }));
 
+      // Refresh client count
+      await fetchClientCount();
+
       setSyncStatus('completed');
+      setSyncProgress(100);
       
       toast({
         title: "Sync Completed",
-        description: `Processed ${data.recordsProcessed} records, applied ${data.updatesApplied} updates`,
+        description: `Processed ${result.recordsProcessed || 0} records, applied ${result.updatesApplied || 0} updates, detected ${result.conflictsDetected || 0} conflicts.`,
       });
 
       // Reset status after delay
@@ -151,6 +170,21 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
       {/* Stats Overview */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base">Total Clients</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center gap-2">
+              <Database className="h-5 w-5 text-blue-600" />
+              <span className="text-2xl font-bold">{currentClientCount.toLocaleString()}</span>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Current database count
+            </p>
+          </CardContent>
+        </Card>
+        
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-base">Active Conflicts</CardTitle>
