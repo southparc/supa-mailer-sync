@@ -289,6 +289,11 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
   const email = subscriber.email.toLowerCase()
   const dedupeKey = `ml-sync-${email}-${Date.now()}`
   
+  // ENTERPRISE FEATURE: Per-email locking to prevent concurrent syncs
+  await supabase.rpc('pg_advisory_xact_lock', { 
+    key: `hashtext('sync_${email}'::text)` 
+  })
+  
   // Get crosswalk mapping
   const { data: crosswalk } = await supabase
     .from('integration_crosswalk')
@@ -387,6 +392,11 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
 async function processClientSync(supabase: any, apiKey: string, client: any, dryRun: boolean): Promise<{conflicts: number, updates: number}> {
   const email = client.email.toLowerCase()
   const dedupeKey = `sb-sync-${email}-${Date.now()}`
+
+  // ENTERPRISE FEATURE: Per-email locking to prevent concurrent syncs
+  await supabase.rpc('pg_advisory_xact_lock', { 
+    key: `hashtext('sync_${email}'::text)` 
+  })
 
   // Get crosswalk mapping
   const { data: crosswalk } = await supabase
@@ -558,20 +568,31 @@ async function applySyncEngine(
         updates++
       }
       await logSyncActivity(supabase, email, 'update', 'B→A', 'success', dedupeKey, field, aValue, bValue)
-    } else {
-      // Neither changed but different - apply "non-empty overwrites empty" rule
+    } else if (aChanged && bChanged) {
+      // ENTERPRISE FEATURE: Both changed - apply "non-empty overwrites empty" rule
       if (isEmpty(aValue) && !isEmpty(bValue)) {
+        // B overwrites empty A
         if (!dryRun) {
           await updateSystemA(supabase, email, field, bValue, dedupeKey)
           updates++
         }
         await logSyncActivity(supabase, email, 'fill_empty', 'B→A', 'success', dedupeKey, field, aValue, bValue)
       } else if (!isEmpty(aValue) && isEmpty(bValue)) {
+        // A overwrites empty B
         if (!dryRun) {
           await updateSystemB(supabase, email, field, aValue, dedupeKey)
           updates++
         }
         await logSyncActivity(supabase, email, 'fill_empty', 'A→B', 'success', dedupeKey, field, bValue, aValue)
+      } else {
+        // Both filled and different = conflict
+        conflicts.push({
+          field,
+          aValue,
+          bValue,
+          aUpdated: new Date().toISOString(),
+          bUpdated: new Date().toISOString(),
+        })
       }
     }
   }
@@ -621,8 +642,50 @@ async function updateSystemA(supabase: any, email: string, field: string, value:
 }
 
 async function updateSystemB(supabase: any, email: string, field: string, value: any, dedupeKey: string) {
-  // Note: This would update MailerLite via API, simplified for this implementation
-  console.log(`Would update MailerLite subscriber ${email} field ${field} to ${value}`)
+  const apiKey = Deno.env.get('MAILERLITE_API_KEY')
+  if (!apiKey) {
+    console.error('MailerLite API key not available for updateSystemB')
+    return
+  }
+
+  try {
+    // Get MailerLite subscriber ID from crosswalk
+    const { data: crosswalk } = await supabase
+      .from('integration_crosswalk')
+      .select('b_id')
+      .eq('email', email)
+      .single()
+
+    if (!crosswalk?.b_id) {
+      console.error(`No MailerLite ID found in crosswalk for ${email}`)
+      return
+    }
+
+    // ENTERPRISE FEATURE: Retry logic with exponential backoff
+    await withRetry(async () => {
+      const response = await fetch(`https://connect.mailerlite.com/api/subscribers/${crosswalk.b_id}`, {
+        method: 'PATCH',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          fields: { [field]: value }
+        })
+      })
+
+      if (!response.ok) {
+        throw new Error(`MailerLite API error: ${response.status} ${response.statusText}`)
+      }
+
+      console.log(`Successfully updated MailerLite subscriber ${email} field ${field} to ${value}`)
+    })
+
+  } catch (error) {
+    console.error(`Error updating MailerLite subscriber ${email} field ${field}:`, error)
+    await logSyncActivity(supabase, email, 'update', 'A→B', 'error', dedupeKey, field, null, value)
+    throw error
+  }
 }
 
 async function logSyncActivity(
@@ -661,4 +724,23 @@ function normalize(value: any): string {
 
 function isEmpty(value: any): boolean {
   return value === null || value === undefined || String(value).trim() === ''
+}
+
+// ENTERPRISE FEATURE: Retry logic with exponential backoff
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      if (attempt === maxAttempts) {
+        console.error(`Final retry attempt failed:`, error)
+        throw error
+      }
+      
+      const delay = Math.pow(2, attempt) * 1000 // Exponential backoff: 2s, 4s, 8s
+      console.log(`Retry attempt ${attempt} failed, retrying in ${delay}ms:`, error)
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+  throw new Error('Unreachable code')
 }

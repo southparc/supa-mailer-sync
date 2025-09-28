@@ -30,7 +30,12 @@ interface SyncStats {
 const EnterpriseSyncDashboard: React.FC = () => {
   const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'completed'>('idle');
   const [syncProgress, setSyncProgress] = useState(0);
-  const [stats, setStats] = useState<SyncStats>({ conflicts: 0 });
+  const [stats, setStats] = useState<SyncStats>({ 
+    conflicts: 0, 
+    lastSync: undefined, 
+    recordsProcessed: 0, 
+    updatesApplied: 0 
+  });
   const { toast } = useToast();
 
   // Map UI directions to backend expectations
@@ -222,6 +227,44 @@ const EnterpriseSyncDashboard: React.FC = () => {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
+              {/* Backfill Sync Control */}
+              <div className="flex items-center justify-between p-4 border-2 border-dashed border-primary/30 rounded-lg bg-primary/5">
+                <div className="flex items-center gap-3">
+                  <Database className="h-5 w-5 text-primary" />
+                  <div>
+                    <h3 className="font-medium">Initial Backfill Sync</h3>
+                    <p className="text-sm text-muted-foreground">Build crosswalk mappings and shadow snapshots for all existing records</p>
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  onClick={async () => {
+                    try {
+                      setSyncStatus('syncing');
+                      const { data, error } = await supabase.functions.invoke('backfill-sync');
+                      if (error) throw error;
+                      toast({
+                        title: "Backfill Completed",
+                        description: `Created ${data.crosswalkCreated} crosswalk entries and ${data.shadowsCreated} shadow snapshots`,
+                      });
+                    } catch (error) {
+                      toast({
+                        title: "Backfill Failed", 
+                        description: "Check logs for details",
+                        variant: "destructive"
+                      });
+                    } finally {
+                      setSyncStatus('idle');
+                    }
+                  }}
+                  disabled={syncStatus === 'syncing'}
+                >
+                  <Database className="h-4 w-4 mr-2" />
+                  Run Backfill
+                </Button>
+              </div>
+
+              {/* Regular Sync Controls */}
               {(['bidirectional', 'from_mailerlite', 'to_mailerlite'] as const).map((direction) => {
                 const config = getSyncButtonProps(direction);
                 const IconComponent = config.icon;
