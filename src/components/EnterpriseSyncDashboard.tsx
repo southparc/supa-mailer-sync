@@ -65,6 +65,32 @@ const EnterpriseSyncDashboard: React.FC = () => {
     d === 'from_mailerlite' ? 'mailerlite-to-supabase' :
     'supabase-to-mailerlite';
 
+  const stopSync = async () => {
+    try {
+      // Clear the sync cursor to stop the import
+      await supabase
+        .from('sync_state')
+        .delete()
+        .eq('key', 'mailerlite:import:cursor');
+      
+      setSyncStatus('idle');
+      setSyncProgress(0);
+      setChunkProgress({ current: 0, total: 0 });
+      
+      toast({
+        title: "Sync Stopped",
+        description: "The sync has been manually stopped.",
+      });
+    } catch (error) {
+      console.error('Failed to stop sync:', error);
+      toast({
+        title: "Error",
+        description: "Failed to stop sync. Please try again.",
+        variant: "destructive",
+      });
+    }
+  };
+
   const handleSync = async (direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') => {
     if (syncStatus === 'syncing') return;
     
@@ -167,19 +193,19 @@ const EnterpriseSyncDashboard: React.FC = () => {
       bidirectional: {
         icon: ArrowLeftRight,
         label: 'Bidirectional Sync',
-        description: 'Smart sync both directions with conflict detection',
+        description: '⚠️ Imports ALL MailerLite subscribers (~18k+) and creates client records',
         variant: 'default' as const
       },
       from_mailerlite: {
         icon: ArrowRight,
         label: 'Import from MailerLite',
-        description: 'Import subscriber data from MailerLite to Supabase',
+        description: '⚠️ Imports ALL subscribers and creates new client records for each',
         variant: 'outline' as const
       },
       to_mailerlite: {
         icon: ArrowLeft,
         label: 'Export to MailerLite',
-        description: 'Export client data from Supabase to MailerLite',
+        description: 'Export existing client data from Supabase to MailerLite',
         variant: 'outline' as const
       }
     };
@@ -209,6 +235,16 @@ const EnterpriseSyncDashboard: React.FC = () => {
                 'Sync completed!'
               }
             </p>
+            {syncStatus === 'syncing' && (
+              <Button 
+                onClick={stopSync} 
+                variant="outline" 
+                size="sm" 
+                className="mt-2"
+              >
+                Stop Sync
+              </Button>
+            )}
           </CardContent>
         </Card>
       )}
