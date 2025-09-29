@@ -390,7 +390,6 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
       .from('clients')
       .insert({
         email,
-        mailerlite_id: subscriber.id,
         first_name: subscriber.fields?.name || '',
         last_name: subscriber.fields?.last_name || '',
         initials: subscriber.fields?.initials || null,
