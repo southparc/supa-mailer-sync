@@ -385,7 +385,7 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
     .single()
 
   if (!client && !dryRun) {
-    // Create new client from MailerLite data
+  // Create new client from MailerLite data
     const { data: newClient, error } = await supabase
       .from('clients')
       .insert({
@@ -395,6 +395,7 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
         phone: subscriber.fields?.phone || null,
         city: subscriber.fields?.city || null,
         country: subscriber.fields?.country || null,
+        figlorawsnapshot: subscriber, // Store complete MailerLite data
       })
       .select()
       .single()
@@ -416,7 +417,20 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
         b_id: subscriber.id,
       })
 
+    // Map MailerLite status to subscription status
+    const isSubscribed = mapMailerLiteStatusToSubscribed(subscriber.status)
+    
+    // Create client group mapping with subscription status
+    await supabase
+      .from('client_group_mappings')
+      .upsert({
+        client_id: clientId,
+        group_id: 1, // Default group - you may want to make this configurable
+        is_subscribed: isSubscribed,
+      })
+
     await logSyncActivity(supabase, email, 'created', 'ML→SB', 'success', dedupeKey)
+    console.log(`Created client ${email} with subscription status: ${subscriber.status} -> ${isSubscribed}`)
     return { conflicts: 0, updates: 1 }
   }
 
@@ -448,6 +462,27 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
     country: subscriber.fields?.country || '',
   }
 
+  // Update stored MailerLite snapshot if not dry run
+  if (!dryRun) {
+    await supabase
+      .from('clients')
+      .update({ figlorawsnapshot: subscriber })
+      .eq('email', email)
+  }
+
+  // Update subscription status in client_group_mappings
+  const isSubscribed = mapMailerLiteStatusToSubscribed(subscriber.status)
+  
+  if (!dryRun) {
+    await supabase
+      .from('client_group_mappings')
+      .upsert({
+        client_id: clientId,
+        group_id: 1, // Default group - you may want to make this configurable
+        is_subscribed: isSubscribed,
+      })
+  }
+
   // Apply smart sync logic
   const syncResult = await applySyncEngine(
     supabase,
@@ -460,6 +495,7 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
     dedupeKey
   )
 
+  console.log(`Updated subscription status for ${email}: ${subscriber.status} -> ${isSubscribed}`)
   return syncResult
 }
 
@@ -798,6 +834,12 @@ function normalize(value: any): string {
 
 function isEmpty(value: any): boolean {
   return value === null || value === undefined || String(value).trim() === ''
+}
+
+// Map MailerLite subscription status to boolean
+function mapMailerLiteStatusToSubscribed(status: string): boolean {
+  // MailerLite statuses: active, unsubscribed, bounced, junk, unconfirmed
+  return status === 'active'
 }
 
 // ENTERPRISE FEATURE: Retry logic with exponential backoff

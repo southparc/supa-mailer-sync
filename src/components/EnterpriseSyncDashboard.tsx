@@ -14,7 +14,10 @@ import {
   Database,
   Mail,
   Activity,
-  Clock
+  Clock,
+  Users,
+  CheckCircle,
+  XCircle
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
@@ -37,6 +40,11 @@ const EnterpriseSyncDashboard: React.FC = () => {
     updatesApplied: 0 
   });
   const [currentClientCount, setCurrentClientCount] = useState<number>(0);
+  const [subscriptionStats, setSubscriptionStats] = useState<{
+    total: number;
+    subscribed: number;
+    unsubscribed: number;
+  }>({ total: 0, subscribed: 0, unsubscribed: 0 });
   const [chunkProgress, setChunkProgress] = useState({ current: 0, total: 0 });
   const { toast } = useToast();
 
@@ -55,8 +63,38 @@ const EnterpriseSyncDashboard: React.FC = () => {
     }
   };
 
+  const fetchSubscriptionStats = async () => {
+    try {
+      // Get total clients
+      const { count: totalCount, error: totalError } = await supabase
+        .from('clients')
+        .select('*', { count: 'exact', head: true });
+
+      if (totalError) throw totalError;
+
+      // Get subscription counts from client_group_mappings
+      const { data: mappings, error: mappingError } = await supabase
+        .from('client_group_mappings')
+        .select('is_subscribed');
+
+      if (mappingError) throw mappingError;
+
+      const subscribedCount = mappings?.filter(m => m.is_subscribed === true).length || 0;
+      const unsubscribedCount = mappings?.filter(m => m.is_subscribed === false).length || 0;
+
+      setSubscriptionStats({
+        total: totalCount || 0,
+        subscribed: subscribedCount,
+        unsubscribed: unsubscribedCount,
+      });
+    } catch (error) {
+      console.error('Failed to fetch subscription stats:', error);
+    }
+  };
+
   useEffect(() => {
     fetchClientCount();
+    fetchSubscriptionStats();
   }, []);
 
   // Map UI directions to backend expectations
@@ -133,6 +171,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
         
         // Refresh client count after each chunk
         await fetchClientCount();
+        await fetchSubscriptionStats();
         
         // Show chunk completion toast
         toast({
@@ -250,18 +289,48 @@ const EnterpriseSyncDashboard: React.FC = () => {
       )}
 
       {/* Stats Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-base">Total Clients</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex items-center gap-2">
-              <Database className="h-5 w-5 text-blue-600" />
-              <span className="text-2xl font-bold">{currentClientCount.toLocaleString()}</span>
+              <Users className="h-5 w-5 text-blue-600" />
+              <span className="text-2xl font-bold">{subscriptionStats.total.toLocaleString()}</span>
             </div>
             <p className="text-xs text-muted-foreground mt-1">
-              Current database count
+              All imported contacts
+            </p>
+          </CardContent>
+        </Card>
+        
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base">Subscribed</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center gap-2">
+              <CheckCircle className="h-5 w-5 text-green-600" />
+              <span className="text-2xl font-bold text-green-600">{subscriptionStats.subscribed.toLocaleString()}</span>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Active subscribers
+            </p>
+          </CardContent>
+        </Card>
+        
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base">Unsubscribed</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center gap-2">
+              <XCircle className="h-5 w-5 text-red-600" />
+              <span className="text-2xl font-bold text-red-600">{subscriptionStats.unsubscribed.toLocaleString()}</span>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Unsubscribed/bounced
             </p>
           </CardContent>
         </Card>
