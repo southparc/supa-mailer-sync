@@ -8,3 +8,9 @@ verify_jwt = false
 
 [functions.enterprise-sync]
 verify_jwt = false
+
+[functions.backfill-sync]
+verify_jwt = false
+
+[functions.backfill-mailerlite-ids]
+verify_jwt = false

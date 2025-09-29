@@ -303,7 +303,7 @@ async function createInitialShadows(supabase: any, apiKey: string): Promise<{sha
               country: client.country,
             },
             bData: {
-              first_name: subscriber.fields?.first_name || '',
+              first_name: subscriber.fields?.name || '',
               last_name: subscriber.fields?.last_name || '',
               phone: subscriber.fields?.phone || '',
               city: subscriber.fields?.city || '',

@@ -390,11 +390,21 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
       .from('clients')
       .insert({
         email,
-        first_name: subscriber.fields?.first_name || '',
+        mailerlite_id: subscriber.id,
+        first_name: subscriber.fields?.name || '',
         last_name: subscriber.fields?.last_name || '',
+        initials: subscriber.fields?.initials || null,
+        prefix: subscriber.fields?.prefix || null,
         phone: subscriber.fields?.phone || null,
+        company: subscriber.fields?.company || null,
         city: subscriber.fields?.city || null,
+        zip: subscriber.fields?.zip || subscriber.fields?.z_i_p || null,
+        location: subscriber.fields?.location || null,
         country: subscriber.fields?.country || null,
+        gender: subscriber.fields?.gender || null,
+        age: subscriber.fields?.leeftijd ? parseInt(subscriber.fields.leeftijd) : null,
+        planning_status: subscriber.fields?.planning_status || null,
+        referer: subscriber.fields?.doorverwijzer || null,
         figlorawsnapshot: subscriber, // Store complete MailerLite data
       })
       .select()
@@ -429,6 +439,51 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
         is_subscribed: isSubscribed,
       })
 
+    // Sync partner data if present
+    if (subscriber.fields?.partner_email || subscriber.fields?.partner_first_name) {
+      await supabase
+        .from('partners')
+        .upsert({
+          client_id: clientId,
+          figlosourceid: `ml_partner_${subscriber.id}`,
+          email: subscriber.fields?.partner_email || null,
+          first_name: subscriber.fields?.partner_first_name || '',
+          last_name: subscriber.fields?.partner_last_name || '',
+          initials: subscriber.fields?.partner_initials || null,
+          prefix: subscriber.fields?.partner_prefix || null,
+          gender: subscriber.fields?.partner_gender || null,
+        }, {
+          onConflict: 'client_id,figlosourceid'
+        })
+    }
+
+    // Link to existing advisor by name
+    if (subscriber.fields?.advisor) {
+      const { data: advisor } = await supabase
+        .from('advisors')
+        .select('id')
+        .ilike('name', subscriber.fields.advisor)
+        .maybeSingle()
+      
+      if (advisor) {
+        await supabase
+          .from('clients')
+          .update({ advisor_id: advisor.id })
+          .eq('id', clientId)
+      }
+    }
+
+    // Sync contract data if present
+    if (subscriber.fields?.dvo || subscriber.fields?.schadeklant) {
+      await supabase
+        .from('contracts')
+        .upsert({
+          client_id: clientId,
+          dvo: subscriber.fields?.dvo ? parseFloat(subscriber.fields.dvo) : null,
+          is_damage_client: subscriber.fields?.schadeklant === 'ja' || subscriber.fields?.schadeklant === 'true',
+        })
+    }
+
     await logSyncActivity(supabase, email, 'created', 'ML→SB', 'success', dedupeKey)
     console.log(`Created client ${email} with subscription status: ${subscriber.status} -> ${isSubscribed}`)
     return { conflicts: 0, updates: 1 }
@@ -455,7 +510,7 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
   }
 
   const mailerLiteData = {
-    first_name: subscriber.fields?.first_name || '',
+    first_name: subscriber.fields?.name || '',
     last_name: subscriber.fields?.last_name || '',
     phone: subscriber.fields?.phone || '',
     city: subscriber.fields?.city || '',
@@ -542,7 +597,7 @@ async function processClientSync(supabase: any, apiKey: string, client: any, dry
     const createPayload = {
       email,
       fields: {
-        first_name: client.first_name || '',
+        name: client.first_name || '',
         last_name: client.last_name || '',
         phone: client.phone || '',
         city: client.city || '',
@@ -604,7 +659,7 @@ async function processClientSync(supabase: any, apiKey: string, client: any, dry
   }
 
   const mailerLiteData = {
-    first_name: subscriber.fields?.first_name || '',
+    first_name: subscriber.fields?.name || '',
     last_name: subscriber.fields?.last_name || '',
     phone: subscriber.fields?.phone || '',
     city: subscriber.fields?.city || '',
