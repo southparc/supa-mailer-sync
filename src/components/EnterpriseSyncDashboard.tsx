@@ -72,10 +72,11 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
       if (totalError) throw totalError;
 
-      // Get subscription counts from client_group_mappings
+      // Get subscription counts by joining clients with mappings to satisfy RLS
       const { data: mappings, error: mappingError } = await supabase
         .from('client_group_mappings')
-        .select('is_subscribed');
+        .select('is_subscribed, clients!inner(*)')
+        .not('clients', 'is', null);
 
       if (mappingError) throw mappingError;
 
