@@ -44,29 +44,38 @@ Deno.serve(async (req) => {
     let processed = 0
     let updated = 0
     let errors = 0
+    let skipped = 0
 
-    // Process in batches to avoid overwhelming MailerLite API
-    const batchSize = 50
+    // Process in smaller batches with rate limiting
+    const batchSize = 5 // Much smaller to respect MailerLite rate limits
     for (let i = 0; i < crosswalkData.length; i += batchSize) {
       const batch = crosswalkData.slice(i, i + batchSize)
       
-      await Promise.all(
-        batch.map(async (entry) => {
-          try {
-            // Check if subscription status already exists
-            const { data: existing } = await supabaseClient
-              .from('client_group_mappings')
-              .select('*')
-              .eq('client_id', entry.a_id)
-              .maybeSingle()
+      console.log(`Processing batch ${i / batchSize + 1}/${Math.ceil(crosswalkData.length / batchSize)}`)
+      
+      // Process sequentially within batch to avoid rate limits
+      for (const entry of batch) {
+        try {
+          // Check if subscription status already exists
+          const { data: existing } = await supabaseClient
+            .from('client_group_mappings')
+            .select('*')
+            .eq('client_id', entry.a_id)
+            .maybeSingle()
 
-            if (existing) {
-              processed++
-              return // Already has subscription status
-            }
+          if (existing) {
+            skipped++
+            processed++
+            continue // Already has subscription status
+          }
 
-            // Fetch subscriber from MailerLite
-            const response = await fetch(
+          // Fetch subscriber from MailerLite with retry logic
+          let retries = 0
+          const maxRetries = 3
+          let response: Response | null = null
+          
+          while (retries < maxRetries) {
+            response = await fetch(
               `https://connect.mailerlite.com/api/subscribers/${entry.b_id}`,
               {
                 headers: {
@@ -76,43 +85,63 @@ Deno.serve(async (req) => {
               }
             )
 
-            if (!response.ok) {
-              console.error(`Failed to fetch subscriber ${entry.email}: ${response.status}`)
-              errors++
-              return
+            if (response.status === 429) {
+              // Rate limited - wait longer
+              const waitTime = Math.pow(2, retries) * 2000 // Exponential backoff: 2s, 4s, 8s
+              console.log(`Rate limited for ${entry.email}, waiting ${waitTime}ms...`)
+              await new Promise(resolve => setTimeout(resolve, waitTime))
+              retries++
+              continue
             }
 
-            const subscriber: { data: MailerLiteSubscriber } = await response.json()
-            const isSubscribed = subscriber.data.status === 'active'
-
-            // Insert subscription status
-            const { error: insertError } = await supabaseClient
-              .from('client_group_mappings')
-              .insert({
-                client_id: entry.a_id,
-                group_id: 1,
-                is_subscribed: isSubscribed,
-              })
-
-            if (insertError) {
-              console.error(`Failed to insert subscription for ${entry.email}:`, insertError)
-              errors++
-            } else {
-              updated++
-              console.log(`Updated ${entry.email}: ${subscriber.data.status} -> ${isSubscribed}`)
+            if (response.ok) {
+              break
             }
 
-            processed++
-          } catch (error) {
-            console.error(`Error processing ${entry.email}:`, error)
+            console.error(`Failed to fetch subscriber ${entry.email}: ${response.status}`)
             errors++
+            processed++
+            break
           }
-        })
-      )
 
-      // Rate limiting: wait 100ms between batches
+          if (!response || !response.ok) {
+            continue
+          }
+
+          const subscriber: { data: MailerLiteSubscriber } = await response.json()
+          const isSubscribed = subscriber.data.status === 'active'
+
+          // Insert subscription status
+          const { error: insertError } = await supabaseClient
+            .from('client_group_mappings')
+            .insert({
+              client_id: entry.a_id,
+              group_id: 1,
+              is_subscribed: isSubscribed,
+            })
+
+          if (insertError) {
+            console.error(`Failed to insert subscription for ${entry.email}:`, insertError)
+            errors++
+          } else {
+            updated++
+            console.log(`Updated ${entry.email}: ${subscriber.data.status} -> ${isSubscribed}`)
+          }
+
+          processed++
+
+          // Wait between each request to respect rate limits
+          await new Promise(resolve => setTimeout(resolve, 250))
+        } catch (error) {
+          console.error(`Error processing ${entry.email}:`, error)
+          errors++
+          processed++
+        }
+      }
+
+      // Wait between batches
       if (i + batchSize < crosswalkData.length) {
-        await new Promise(resolve => setTimeout(resolve, 100))
+        await new Promise(resolve => setTimeout(resolve, 1000))
       }
     }
 
@@ -120,8 +149,9 @@ Deno.serve(async (req) => {
       success: true,
       processed,
       updated,
+      skipped,
       errors,
-      message: `Backfill completed: ${updated} subscription statuses populated`
+      message: `Backfill completed: ${updated} new, ${skipped} skipped, ${errors} errors`
     }
 
     console.log('Backfill result:', result)
