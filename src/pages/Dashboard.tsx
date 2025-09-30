@@ -8,7 +8,6 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
 import { ConflictResolution } from "@/components/ConflictResolution";
-import { SyncControls } from "@/components/SyncControls";
 import { SyncSettings } from "@/components/SyncSettings";
 import { SyncLogs } from "@/components/SyncLogs";
 import EnterpriseSyncDashboard from "@/components/EnterpriseSyncDashboard";
@@ -192,10 +191,9 @@ export default function Dashboard() {
 
         {/* Main Content Tabs */}
         <Tabs defaultValue="enterprise" className="space-y-6">
-          <TabsList className="grid w-full grid-cols-5">
+          <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="enterprise">Enterprise Sync</TabsTrigger>
             <TabsTrigger value="conflicts">Conflict Resolution</TabsTrigger>
-            <TabsTrigger value="sync">Legacy Controls</TabsTrigger>
             <TabsTrigger value="settings">Settings</TabsTrigger>
             <TabsTrigger value="logs">Sync Logs</TabsTrigger>
           </TabsList>
@@ -218,26 +216,13 @@ export default function Dashboard() {
             </Card>
           </TabsContent>
 
-          <TabsContent value="sync" className="space-y-6">
-            <Card>
-              <CardHeader>
-                <CardTitle>Synchronization Controls</CardTitle>
-                <CardDescription>
-                  Manage data synchronization between MailerLite and Supabase
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <SyncControls onStatsUpdate={loadDashboardStats} />
-              </CardContent>
-            </Card>
-          </TabsContent>
 
           <TabsContent value="settings" className="space-y-6">
             <Card>
               <CardHeader>
                 <CardTitle>Sync Configuration</CardTitle>
                 <CardDescription>
-                  Configure field mappings and batch processing for large datasets
+                  Configure field mappings and batch processing for large datasets. Note: Settings are not persisted and will reset on page refresh.
                 </CardDescription>
               </CardHeader>
               <CardContent>

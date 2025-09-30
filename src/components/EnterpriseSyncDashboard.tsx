@@ -449,6 +449,48 @@ const EnterpriseSyncDashboard: React.FC = () => {
                 </Button>
               </div>
 
+              {/* Subscription Status Backfill */}
+              <div className="flex items-center justify-between p-4 border-2 border-dashed border-blue-500/30 rounded-lg bg-blue-500/5">
+                <div className="flex items-center gap-3">
+                  <Users className="h-5 w-5 text-blue-500" />
+                  <div>
+                    <h3 className="font-medium">Backfill Subscription Status</h3>
+                    <p className="text-sm text-muted-foreground">Populate missing subscription status for clients with MailerLite IDs</p>
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  onClick={async () => {
+                    try {
+                      setSyncStatus('syncing');
+                      toast({
+                        title: "Backfill Started",
+                        description: "Fetching subscription status from MailerLite...",
+                      });
+                      const { data, error } = await supabase.functions.invoke('backfill-subscription-status');
+                      if (error) throw error;
+                      await fetchSubscriptionStats();
+                      toast({
+                        title: "Backfill Completed",
+                        description: `Updated ${data.updated} subscription statuses (${data.processed} processed, ${data.errors} errors)`,
+                      });
+                    } catch (error: any) {
+                      toast({
+                        title: "Backfill Failed", 
+                        description: error.message || "Check logs for details",
+                        variant: "destructive"
+                      });
+                    } finally {
+                      setSyncStatus('idle');
+                    }
+                  }}
+                  disabled={syncStatus === 'syncing'}
+                >
+                  <Users className="h-4 w-4 mr-2" />
+                  Backfill Subscriptions
+                </Button>
+              </div>
+
               {/* Regular Sync Controls */}
               {(['bidirectional', 'from_mailerlite', 'to_mailerlite'] as const).map((direction) => {
                 const config = getSyncButtonProps(direction);
