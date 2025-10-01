@@ -29,17 +29,29 @@ Deno.serve(async (req) => {
 
     console.log('Starting subscription status backfill...')
 
-    // Get all clients with MailerLite IDs but no subscription status
+    // Get all clients with MailerLite IDs that don't have subscription status yet
     const { data: crosswalkData, error: crosswalkError } = await supabaseClient
       .from('integration_crosswalk')
       .select('email, b_id, a_id')
       .not('b_id', 'is', null)
-
+    
     if (crosswalkError) {
       throw new Error(`Failed to fetch crosswalk: ${crosswalkError.message}`)
     }
 
-    console.log(`Found ${crosswalkData.length} clients with MailerLite IDs`)
+    // Filter out clients that already have subscription status
+    const { data: existingMappings, error: mappingsError } = await supabaseClient
+      .from('client_group_mappings')
+      .select('client_id')
+    
+    if (mappingsError) {
+      throw new Error(`Failed to fetch existing mappings: ${mappingsError.message}`)
+    }
+
+    const existingClientIds = new Set(existingMappings?.map(m => m.client_id) || [])
+    const remainingData = crosswalkData.filter(entry => !existingClientIds.has(entry.a_id))
+
+    console.log(`Found ${remainingData.length} clients needing subscription status (${crosswalkData.length} total with MailerLite IDs)`)
 
     let processed = 0
     let updated = 0
@@ -48,26 +60,14 @@ Deno.serve(async (req) => {
 
     // Process in smaller batches with rate limiting
     const batchSize = 5 // Much smaller to respect MailerLite rate limits
-    for (let i = 0; i < crosswalkData.length; i += batchSize) {
-      const batch = crosswalkData.slice(i, i + batchSize)
+    for (let i = 0; i < remainingData.length; i += batchSize) {
+      const batch = remainingData.slice(i, i + batchSize)
       
-      console.log(`Processing batch ${i / batchSize + 1}/${Math.ceil(crosswalkData.length / batchSize)}`)
+      console.log(`Processing batch ${i / batchSize + 1}/${Math.ceil(remainingData.length / batchSize)}`)
       
       // Process sequentially within batch to avoid rate limits
       for (const entry of batch) {
         try {
-          // Check if subscription status already exists
-          const { data: existing } = await supabaseClient
-            .from('client_group_mappings')
-            .select('*')
-            .eq('client_id', entry.a_id)
-            .maybeSingle()
-
-          if (existing) {
-            skipped++
-            processed++
-            continue // Already has subscription status
-          }
 
           // Fetch subscriber from MailerLite with retry logic
           let retries = 0
@@ -140,7 +140,7 @@ Deno.serve(async (req) => {
       }
 
       // Wait between batches
-      if (i + batchSize < crosswalkData.length) {
+      if (i + batchSize < remainingData.length) {
         await new Promise(resolve => setTimeout(resolve, 1000))
       }
     }
