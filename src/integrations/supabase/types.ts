@@ -586,6 +586,38 @@ export type Database = {
         }
         Relationships: []
       }
+      integration_crosswalk_groups: {
+        Row: {
+          a_group_id: number
+          b_group_id: string | null
+          created_at: string
+          email: string
+          updated_at: string
+        }
+        Insert: {
+          a_group_id: number
+          b_group_id?: string | null
+          created_at?: string
+          email: string
+          updated_at?: string
+        }
+        Update: {
+          a_group_id?: number
+          b_group_id?: string | null
+          created_at?: string
+          email?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "integration_crosswalk_groups_a_group_id_fkey"
+            columns: ["a_group_id"]
+            isOneToOne: false
+            referencedRelation: "mailerlite_groups"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       investments: {
         Row: {
           client_id: string
@@ -661,6 +693,30 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
+      }
+      mailerlite_groups: {
+        Row: {
+          created_at: string
+          id: number
+          ml_group_id: string | null
+          name: string
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          id?: number
+          ml_group_id?: string | null
+          name: string
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          id?: number
+          ml_group_id?: string | null
+          name?: string
+          updated_at?: string
+        }
+        Relationships: []
       }
       partners: {
         Row: {
@@ -942,7 +998,36 @@ export type Database = {
       }
     }
     Views: {
-      [_ in never]: never
+      v_clients_for_ml: {
+        Row: {
+          city: string | null
+          country: string | null
+          email: string | null
+          first_name: string | null
+          groups: string[] | null
+          last_name: string | null
+          phone: string | null
+        }
+        Insert: {
+          city?: never
+          country?: never
+          email?: string | null
+          first_name?: never
+          groups?: never
+          last_name?: never
+          phone?: never
+        }
+        Update: {
+          city?: never
+          country?: never
+          email?: string | null
+          first_name?: never
+          groups?: never
+          last_name?: never
+          phone?: never
+        }
+        Relationships: []
+      }
     }
     Functions: {
       full_client: {
