@@ -146,15 +146,20 @@ async function flatFromBById(b_id: string): Promise<FlatRecord | null> {
       return null;
     }
     
-    const sub = await res.json();
-    const groups = Array.isArray(sub.groups) ? sub.groups.map((g: any) => g.name).sort() : [];
+    const raw = await res.json();
+    // MailerLite API wraps response in { data: {...} }
+    const sub = raw.data ?? raw;
+    
+    const groups = Array.isArray(sub.groups) 
+      ? sub.groups.map((g: any) => g.name ?? g).filter(Boolean).sort() 
+      : [];
     
     return {
-      email: sub.email,
-      first_name: sub.fields?.name ?? sub.name ?? "",
-      last_name: sub.fields?.last_name ?? "",
-      city: sub.fields?.city ?? "",
-      phone: sub.fields?.phone ?? "",
+      email: sub.email ?? "",
+      first_name: sub.fields?.name ?? sub.fields?.first_name ?? sub.name ?? "",
+      last_name: sub.fields?.last_name ?? sub.fields?.lastName ?? "",
+      city: sub.fields?.city ?? sub.fields?.City ?? "",
+      phone: sub.fields?.phone ?? sub.fields?.Phone ?? "",
       country: sub.country ?? sub.location?.country ?? sub.fields?.country ?? sub.fields?.Country ?? "",
       groups
     };
@@ -274,29 +279,56 @@ async function processBtoA(email: string): Promise<any> {
     return { email, skipped: true, reason: "missing-in-A" };
   }
 
+  // Helper: check if value is non-empty
+  const isNonEmpty = (v: any): boolean => {
+    if (v == null || v === "") return false;
+    if (Array.isArray(v)) return v.length > 0;
+    return true;
+  };
+
   // Diff t.o.v. shadow om conflicts te detecteren
   const shadow = await getShadow(email);
   const changedInB = diff(flatB, shadow);
   const changedInA = diff(flatA, shadow);
 
-  // Detect conflicts: velden die in BEIDE zijn gewijzigd sinds shadow
+  // Detect conflicts: 
+  // 1) velden die in BEIDE zijn gewijzigd sinds shadow
+  // 2) velden waar A en B beide non-empty maar verschillend zijn
   const conflicts: string[] = [];
   for (const f of changedInB.fields) {
-    if (changedInA.fields.includes(f)) {
+    const aVal = (flatA as any)[f];
+    const bVal = (flatB as any)[f];
+    
+    const bothChanged = changedInA.fields.includes(f);
+    const bothNonEmptyButDifferent = isNonEmpty(aVal) && isNonEmpty(bVal) && 
+      (Array.isArray(aVal) ? stableStringify(aVal) !== stableStringify(bVal) : aVal !== bVal);
+    
+    if (bothChanged || bothNonEmptyButDifferent) {
       conflicts.push(f);
       // Insert conflict record
       await supabase.from("sync_conflicts").insert({
         email,
         field: f,
-        a_value: (flatA as any)[f],
-        b_value: (flatB as any)[f],
+        a_value: Array.isArray(aVal) ? stableStringify(aVal) : String(aVal ?? ""),
+        b_value: Array.isArray(bVal) ? stableStringify(bVal) : String(bVal ?? ""),
         status: "pending"
       });
     }
   }
 
-  // Update alleen velden die ALLEEN in B zijn gewijzigd (safe updates)
-  const safeFields = changedInB.fields.filter(f => !conflicts.includes(f));
+  // Update alleen velden die safe zijn: ALLEEN in B gewijzigd + niet-leeg → niet-leeg overwrite voorkomen
+  const safeFields = changedInB.fields.filter(f => {
+    if (conflicts.includes(f)) return false;
+    
+    const aVal = (flatA as any)[f];
+    const bVal = (flatB as any)[f];
+    
+    // Prevent empty B from overwriting non-empty A
+    if (isNonEmpty(aVal) && !isNonEmpty(bVal)) return false;
+    
+    return true;
+  });
+  
   if (safeFields.length > 0) {
     const updates: Record<string, string> = {};
     for (const f of ["first_name","last_name","city","phone","country"] as const) {
@@ -344,8 +376,24 @@ async function processBtoA(email: string): Promise<any> {
     });
   }
 
-  // Shadow naar B-stand zetten zodat volgende run idempotent is
-  await putShadow(email, flatB);
+  // Build new shadow: merge base (shadow ?? flatA) + safe updates from B + groups from B
+  const baseSnapshot = shadow ?? flatA;
+  const newShadow: FlatRecord = {
+    email: flatA.email,
+    first_name: baseSnapshot.first_name,
+    last_name: baseSnapshot.last_name,
+    city: baseSnapshot.city,
+    phone: baseSnapshot.phone,
+    country: baseSnapshot.country,
+    groups: flatB.groups // Groups always from B
+  };
+  
+  // Apply safe field updates to shadow
+  for (const f of safeFields) {
+    if (f !== "groups") (newShadow as any)[f] = (flatB as any)[f];
+  }
+  
+  await putShadow(email, newShadow);
 
   return { email, updated: safeFields.length > 0, conflicts: conflicts.length };
 }
