@@ -274,15 +274,33 @@ async function processBtoA(email: string): Promise<any> {
     return { email, skipped: true, reason: "missing-in-A" };
   }
 
-  // Diff t.o.v. shadow (wat we "kennen"); zo vermijden we dubbele updates
+  // Diff t.o.v. shadow om conflicts te detecteren
   const shadow = await getShadow(email);
-  const { changed, fields } = diff(flatB, shadow);
+  const changedInB = diff(flatB, shadow);
+  const changedInA = diff(flatA, shadow);
 
-  // Update alleen gewijzigde velden in clients
-  if (changed) {
+  // Detect conflicts: velden die in BEIDE zijn gewijzigd sinds shadow
+  const conflicts: string[] = [];
+  for (const f of changedInB.fields) {
+    if (changedInA.fields.includes(f)) {
+      conflicts.push(f);
+      // Insert conflict record
+      await supabase.from("sync_conflicts").insert({
+        email,
+        field: f,
+        a_value: (flatA as any)[f],
+        b_value: (flatB as any)[f],
+        status: "pending"
+      });
+    }
+  }
+
+  // Update alleen velden die ALLEEN in B zijn gewijzigd (safe updates)
+  const safeFields = changedInB.fields.filter(f => !conflicts.includes(f));
+  if (safeFields.length > 0) {
     const updates: Record<string, string> = {};
     for (const f of ["first_name","last_name","city","phone","country"] as const) {
-      if (fields.includes(f)) updates[f] = flatB[f] ?? "";
+      if (safeFields.includes(f)) updates[f] = flatB[f] ?? "";
     }
     if (Object.keys(updates).length > 0) {
       const { error } = await supabase.from("clients").update(updates).eq("email", email);
@@ -293,12 +311,26 @@ async function processBtoA(email: string): Promise<any> {
         direction: "B→A",
         action: "update",
         result: "ok",
-        field: fields.join(","),
+        field: safeFields.join(","),
         old_value: null,
         new_value: null,
         dedupe_key: crypto.randomUUID()
       });
     }
+  }
+
+  // Log conflicts
+  if (conflicts.length > 0) {
+    await insertLog({
+      email,
+      direction: "B→A",
+      action: "conflict-detected",
+      result: "skipped",
+      field: conflicts.join(","),
+      old_value: null,
+      new_value: null,
+      dedupe_key: crypto.randomUUID()
+    });
   }
 
   // Groepen: we accepteren B als leidend en schrijven alleen shadow bij
@@ -315,7 +347,7 @@ async function processBtoA(email: string): Promise<any> {
   // Shadow naar B-stand zetten zodat volgende run idempotent is
   await putShadow(email, flatB);
 
-  return { email, changed };
+  return { email, updated: safeFields.length > 0, conflicts: conflicts.length };
 }
 
 async function run(mode: SyncMode, emails?: string[]): Promise<any[]> {
