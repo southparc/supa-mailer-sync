@@ -1,5 +1,8 @@
 project_id = "bmrarrfrhhdsjvokwmgr"
 
+[functions.smart-sync]
+verify_jwt = false
+
 [functions.sync-mailerlite]
 verify_jwt = false
 

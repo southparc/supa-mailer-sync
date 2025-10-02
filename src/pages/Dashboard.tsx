@@ -11,6 +11,7 @@ import { ConflictResolution } from "@/components/ConflictResolution";
 import { SyncSettings } from "@/components/SyncSettings";
 import { SyncLogs } from "@/components/SyncLogs";
 import EnterpriseSyncDashboard from "@/components/EnterpriseSyncDashboard";
+import SmartSyncDashboard from "@/components/SmartSyncDashboard";
 import { LogOut, RefreshCw, AlertTriangle, Users, Database } from "lucide-react";
 
 interface DashboardStats {
@@ -65,9 +66,10 @@ export default function Dashboard() {
 
   const loadDashboardStats = async () => {
     try {
-      // Load stats from available tables only
-      const [clientsResult, conflictsResult] = await Promise.all([
+      // Load stats from available tables
+      const [clientsResult, groupsResult, conflictsResult] = await Promise.all([
         supabase.from('clients').select('id', { count: 'exact' }),
+        supabase.from('mailerlite_groups').select('id', { count: 'exact' }),
         supabase.from('sync_conflicts').select('id', { count: 'exact' }).eq('status', 'pending'),
       ]);
 
@@ -81,7 +83,7 @@ export default function Dashboard() {
 
       setStats({
         totalClients: clientsResult.count || 0,
-        totalGroups: 0, // No more groups table
+        totalGroups: groupsResult.count || 0,
         pendingConflicts: conflictsResult.count || 0,
         lastSyncAt: lastSync?.created_at || null
       });
@@ -190,13 +192,18 @@ export default function Dashboard() {
         </div>
 
         {/* Main Content Tabs */}
-        <Tabs defaultValue="enterprise" className="space-y-6">
-          <TabsList className="grid w-full grid-cols-4">
+        <Tabs defaultValue="smart-sync" className="space-y-6">
+          <TabsList className="grid w-full grid-cols-5">
+            <TabsTrigger value="smart-sync">Smart Sync</TabsTrigger>
             <TabsTrigger value="enterprise">Enterprise Sync</TabsTrigger>
             <TabsTrigger value="conflicts">Conflict Resolution</TabsTrigger>
             <TabsTrigger value="settings">Settings</TabsTrigger>
             <TabsTrigger value="logs">Sync Logs</TabsTrigger>
           </TabsList>
+
+          <TabsContent value="smart-sync" className="space-y-6">
+            <SmartSyncDashboard />
+          </TabsContent>
 
           <TabsContent value="enterprise" className="space-y-6">
             <EnterpriseSyncDashboard />
