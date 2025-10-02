@@ -155,7 +155,7 @@ async function flatFromBById(b_id: string): Promise<FlatRecord | null> {
       last_name: sub.fields?.last_name ?? "",
       city: sub.fields?.city ?? "",
       phone: sub.fields?.phone ?? "",
-      country: sub.fields?.country ?? "",
+      country: sub.country ?? sub.location?.country ?? sub.fields?.country ?? sub.fields?.Country ?? "",
       groups
     };
   } catch (e) {
@@ -274,19 +274,48 @@ async function processBtoA(email: string): Promise<any> {
     return { email, skipped: true, reason: "missing-in-A" };
   }
 
-  // Update shadow with B groups to prevent unnecessary A→B sync
-  if (stableStringify(flatA.groups) !== stableStringify(flatB.groups)) {
-    await putShadow(email, { ...flatA, groups: flatB.groups });
-    await insertLog({
-      email,
-      direction: "B→A",
-      action: "groups-accept",
+  // Diff t.o.v. shadow (wat we "kennen"); zo vermijden we dubbele updates
+  const shadow = await getShadow(email);
+  const { changed, fields } = diff(flatB, shadow);
+
+  // Update alleen gewijzigde velden in clients
+  if (changed) {
+    const updates: Record<string, string> = {};
+    for (const f of ["first_name","last_name","city","phone","country"] as const) {
+      if (fields.includes(f)) updates[f] = flatB[f] ?? "";
+    }
+    if (Object.keys(updates).length > 0) {
+      const { error } = await supabase.from("clients").update(updates).eq("email", email);
+      if (error) throw error;
+
+      await insertLog({
+        email,
+        direction: "B→A",
+        action: "update",
+        result: "ok",
+        field: fields.join(","),
+        old_value: null,
+        new_value: null,
+        dedupe_key: crypto.randomUUID()
+      });
+    }
+  }
+
+  // Groepen: we accepteren B als leidend en schrijven alleen shadow bij
+  if (shadow && JSON.stringify(shadow.groups ?? []) !== JSON.stringify(flatB.groups ?? [])) {
+    await insertLog({ 
+      email, 
+      direction: "B→A", 
+      action: "groups-accept", 
       result: "ok",
       dedupe_key: crypto.randomUUID()
     });
   }
 
-  return { email, done: true };
+  // Shadow naar B-stand zetten zodat volgende run idempotent is
+  await putShadow(email, flatB);
+
+  return { email, changed };
 }
 
 async function run(mode: SyncMode, emails?: string[]): Promise<any[]> {
