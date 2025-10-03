@@ -1,6 +1,6 @@
 // deno-lint-ignore-file no-explicit-any
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 type FlatRecord = {
   email: string;
@@ -29,12 +29,30 @@ const supabase = createClient(SB_URL, SB_KEY, {
   global: { headers: { 'x-client-info': 'smart-sync' } }
 });
 
+// ============ Helpers ============
+
 function stableStringify(o: any): string {
-  if (Array.isArray(o)) {
-    return JSON.stringify([...o].sort());
-  }
+  if (Array.isArray(o)) return JSON.stringify([...o].sort());
   return JSON.stringify(o, Object.keys(o).sort());
 }
+
+function isNonEmpty(v: any): boolean {
+  return v !== null && v !== undefined && String(v).trim() !== "";
+}
+
+function pickNonEmpty<T extends Record<string, any>>(obj: T, keys: (keyof T)[]): Partial<T> {
+  const out: Partial<T> = {};
+  for (const k of keys) {
+    if (isNonEmpty(obj[k])) out[k] = obj[k];
+  }
+  return out;
+}
+
+function jsonCompact(o: any): string {
+  return JSON.stringify(o);
+}
+
+// ============ Database operations ============
 
 async function insertLog(row: {
   email: string;
@@ -108,6 +126,16 @@ async function ensureCrosswalk(email: string): Promise<{ a_id: string | null; b_
   return { a_id: data.a_id ?? null, b_id: data.b_id ?? null };
 }
 
+async function updateCrosswalkB(email: string, b_id: string) {
+  const { error } = await supabase
+    .from("integration_crosswalk")
+    .upsert({ email, b_id, updated_at: new Date().toISOString() }, { onConflict: "email" });
+  
+  if (error) console.error("Crosswalk update error:", error);
+}
+
+// ============ Data fetchers ============
+
 async function flatFromA(email: string): Promise<FlatRecord | null> {
   const { data, error } = await supabase
     .from("v_clients_for_ml")
@@ -146,21 +174,20 @@ async function flatFromBById(b_id: string): Promise<FlatRecord | null> {
       return null;
     }
     
-    const raw = await res.json();
-    // MailerLite API wraps response in { data: {...} }
-    const sub = raw.data ?? raw;
-    
-    const groups = Array.isArray(sub.groups) 
-      ? sub.groups.map((g: any) => g.name ?? g).filter(Boolean).sort() 
-      : [];
-    
+    const sub = await res.json();
+    const groups = Array.isArray(sub.groups) ? sub.groups.map((g: any) => g.name).sort() : [];
+
+    const phone = sub.phone ?? sub.fields?.phone ?? sub.fields?.Phone ?? "";
+    const city = sub.location?.city ?? sub.fields?.city ?? sub.fields?.City ?? "";
+    const country = sub.location?.country ?? sub.country ?? sub.fields?.country ?? sub.fields?.Country ?? "";
+
     return {
       email: sub.email ?? "",
-      first_name: sub.fields?.name ?? sub.fields?.first_name ?? sub.name ?? "",
-      last_name: sub.fields?.last_name ?? sub.fields?.lastName ?? "",
-      city: sub.fields?.city ?? sub.fields?.City ?? "",
-      phone: sub.fields?.phone ?? sub.fields?.Phone ?? "",
-      country: sub.country ?? sub.location?.country ?? sub.fields?.country ?? sub.fields?.Country ?? "",
+      first_name: sub.fields?.name ?? sub.name ?? sub.fields?.first_name ?? "",
+      last_name: sub.fields?.last_name ?? sub.fields?.surname ?? "",
+      city: city ?? "",
+      phone: phone ?? "",
+      country: country ?? "",
       groups
     };
   } catch (e) {
@@ -169,18 +196,21 @@ async function flatFromBById(b_id: string): Promise<FlatRecord | null> {
   }
 }
 
-async function upsertB(flat: FlatRecord, existing_b_id: string | null): Promise<string | null> {
+// ============ MailerLite operations ============
+
+async function upsertBNeverBlank(flat: FlatRecord, existing_b_id: string | null): Promise<string | null> {
+  const fields = pickNonEmpty(flat, ["first_name", "last_name", "city", "phone", "country"]);
   const payload: any = {
     email: flat.email,
     fields: {
-      name: flat.first_name,
-      last_name: flat.last_name,
-      city: flat.city,
-      phone: flat.phone,
-      country: flat.country
+      ...(fields.first_name ? { name: fields.first_name } : {}),
+      ...(fields.last_name ? { last_name: fields.last_name } : {}),
+      ...(fields.city ? { city: fields.city } : {}),
+      ...(fields.phone ? { phone: fields.phone } : {}),
+      ...(fields.country ? { country: fields.country } : {}),
     }
   };
-  
+
   try {
     if (existing_b_id) {
       const res = await fetch(`${ML_BASE}/subscribers/${existing_b_id}`, {
@@ -215,24 +245,80 @@ async function upsertB(flat: FlatRecord, existing_b_id: string | null): Promise<
   }
 }
 
-async function updateCrosswalkB(email: string, b_id: string) {
-  const { error } = await supabase
-    .from("integration_crosswalk")
-    .upsert({ email, b_id, updated_at: new Date().toISOString() }, { onConflict: "email" });
-  
-  if (error) console.error("Crosswalk update error:", error);
+async function setGroupsB(b_id: string, desired: string[]) {
+  try {
+    const res = await fetch(`${ML_BASE}/groups`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${ML_KEY}`, "Content-Type": "application/json" }
+    });
+    if (!res.ok) throw new Error(`mailerlite list groups failed: ${res.status}`);
+    const all = await res.json();
+    const byName = new Map<string, string>();
+    const list = (all.data ?? all) as any[];
+    for (const g of list) byName.set(g.name, g.id);
+
+    const desiredIds = desired.map(n => byName.get(n)).filter(Boolean) as string[];
+
+    const cur = await fetch(`${ML_BASE}/subscribers/${b_id}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${ML_KEY}`, "Content-Type": "application/json" }
+    });
+    const curJ = await cur.json();
+    const curIds = new Set<string>((curJ.groups ?? []).map((g: any) => g.id));
+
+    for (const gid of desiredIds) {
+      if (!curIds.has(gid)) {
+        await fetch(`${ML_BASE}/groups/${gid}/subscribers/${b_id}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${ML_KEY}`, "Content-Type": "application/json" }
+        });
+      }
+    }
+  } catch (e) {
+    console.error("setGroupsB error:", e);
+  }
 }
+
+// ============ Sync processors ============
 
 async function processAtoB(email: string): Promise<any> {
   const flatA = await flatFromA(email);
   if (!flatA) return { email, skipped: true, reason: "not-in-A" };
 
   const shadow = await getShadow(email);
-  const { changed, fields } = diff(flatA, shadow);
+  const { changed } = diff(flatA, shadow);
 
   const { b_id } = await ensureCrosswalk(email);
-  const new_bid = await upsertB(flatA, b_id);
-  
+
+  if (!changed && b_id) {
+    return { email, b_id, changed: false };
+  }
+
+  let mergedForB = flatA;
+  if (b_id) {
+    const currentB = await flatFromBById(b_id);
+    mergedForB = {
+      ...currentB,
+      email: flatA.email,
+      first_name: isNonEmpty(flatA.first_name) ? flatA.first_name : (currentB?.first_name ?? ""),
+      last_name: isNonEmpty(flatA.last_name) ? flatA.last_name : (currentB?.last_name ?? ""),
+      city: isNonEmpty(flatA.city) ? flatA.city : (currentB?.city ?? ""),
+      phone: isNonEmpty(flatA.phone) ? flatA.phone : (currentB?.phone ?? ""),
+      country: isNonEmpty(flatA.country) ? flatA.country : (currentB?.country ?? ""),
+      groups: flatA.groups
+    };
+  } else {
+    mergedForB = {
+      ...flatA,
+      first_name: flatA.first_name?.trim() || "",
+      last_name: flatA.last_name?.trim() || "",
+      city: flatA.city?.trim() || "",
+      phone: flatA.phone?.trim() || "",
+      country: flatA.country?.trim() || "",
+    };
+  }
+
+  const new_bid = await upsertBNeverBlank(mergedForB, b_id);
   if (!new_bid) {
     await insertLog({
       email,
@@ -243,162 +329,109 @@ async function processAtoB(email: string): Promise<any> {
     });
     return { email, error: "mailerlite-upsert-failed" };
   }
-  
+
   if (!b_id || new_bid !== b_id) await updateCrosswalkB(email, new_bid);
 
-  await putShadow(email, flatA);
+  const bNow = await flatFromBById(new_bid);
+  const groupsChanged = JSON.stringify((bNow?.groups ?? []).sort()) !== JSON.stringify((flatA.groups ?? []).sort());
+  if (groupsChanged) await setGroupsB(new_bid, flatA.groups);
+
+  await putShadow(email, { ...mergedForB, groups: flatA.groups });
 
   await insertLog({
     email,
     direction: "A→B",
-    action: changed ? "update" : "noop",
+    action: b_id ? "update" : "create",
     result: "ok",
-    field: changed ? fields.join(",") : null,
+    field: b_id ? "merged-nonblank" : "create-nonblank",
+    old_value: b_id ? jsonCompact(pickNonEmpty(bNow ?? {}, ["first_name", "last_name", "city", "phone", "country"])) : null,
+    new_value: jsonCompact(pickNonEmpty(mergedForB, ["first_name", "last_name", "city", "phone", "country"])),
     dedupe_key: crypto.randomUUID()
   });
 
-  return { email, b_id: new_bid, changed };
+  return { email, b_id: new_bid, changed: true };
 }
 
-async function processBtoA(email: string): Promise<any> {
+async function processBtoA(email: string, repair = false): Promise<any> {
   const { b_id } = await ensureCrosswalk(email);
   if (!b_id) return { email, skipped: true, reason: "no-b-id" };
 
   const flatB = await flatFromBById(b_id);
   if (!flatB) return { email, skipped: true, reason: "missing-in-B" };
 
-  const flatA = await flatFromA(email);
-  if (!flatA) {
-    await supabase.from("sync_conflicts").insert({
-      email,
-      field: "record",
-      a_value: null,
-      b_value: "exists-in-B",
-      status: "pending"
-    });
-    return { email, skipped: true, reason: "missing-in-A" };
-  }
-
-  // Helper: check if value is non-empty
-  const isNonEmpty = (v: any): boolean => {
-    if (v == null || v === "") return false;
-    if (Array.isArray(v)) return v.length > 0;
-    return true;
-  };
-
-  // Diff t.o.v. shadow om conflicts te detecteren
-  const shadow = await getShadow(email);
-  const changedInB = diff(flatB, shadow);
-  const changedInA = diff(flatA, shadow);
-
-  // Detect conflicts: 
-  // 1) velden die in BEIDE zijn gewijzigd sinds shadow
-  // 2) velden waar A en B beide non-empty maar verschillend zijn
-  const conflicts: string[] = [];
-  for (const f of changedInB.fields) {
-    const aVal = (flatA as any)[f];
-    const bVal = (flatB as any)[f];
-    
-    const bothChanged = changedInA.fields.includes(f);
-    const bothNonEmptyButDifferent = isNonEmpty(aVal) && isNonEmpty(bVal) && 
-      (Array.isArray(aVal) ? stableStringify(aVal) !== stableStringify(bVal) : aVal !== bVal);
-    
-    if (bothChanged || bothNonEmptyButDifferent) {
-      conflicts.push(f);
-      // Insert conflict record
-      await supabase.from("sync_conflicts").insert({
-        email,
-        field: f,
-        a_value: Array.isArray(aVal) ? stableStringify(aVal) : String(aVal ?? ""),
-        b_value: Array.isArray(bVal) ? stableStringify(bVal) : String(bVal ?? ""),
-        status: "pending"
-      });
-    }
-  }
-
-  // Update alleen velden die safe zijn: ALLEEN in B gewijzigd + niet-leeg → niet-leeg overwrite voorkomen
-  const safeFields = changedInB.fields.filter(f => {
-    if (conflicts.includes(f)) return false;
-    
-    const aVal = (flatA as any)[f];
-    const bVal = (flatB as any)[f];
-    
-    // Prevent empty B from overwriting non-empty A
-    if (isNonEmpty(aVal) && !isNonEmpty(bVal)) return false;
-    
-    return true;
-  });
+  const { data: aRow, error: aErr } = await supabase
+    .from("clients")
+    .select("first_name,last_name,city,phone,country")
+    .eq("email", email)
+    .maybeSingle();
   
-  if (safeFields.length > 0) {
-    const updates: Record<string, string> = {};
-    for (const f of ["first_name","last_name","city","phone","country"] as const) {
-      if (safeFields.includes(f)) updates[f] = flatB[f] ?? "";
-    }
-    if (Object.keys(updates).length > 0) {
-      const { error } = await supabase.from("clients").update(updates).eq("email", email);
-      if (error) throw error;
+  if (aErr) throw aErr;
+  if (!aRow) return { email, skipped: true, reason: "missing-in-A" };
+  
+  const flatA = await flatFromA(email);
+  const shadow = await getShadow(email);
 
-      await insertLog({
-        email,
-        direction: "B→A",
-        action: "update",
-        result: "ok",
-        field: safeFields.join(","),
-        old_value: null,
-        new_value: null,
-        dedupe_key: crypto.randomUUID()
-      });
+  const changes: Record<string, { old: any; new: any }> = {};
+  const candidate: Partial<Record<keyof FlatRecord, string>> = {};
+
+  const fields: (keyof FlatRecord)[] = ["first_name", "last_name", "city", "phone", "country"];
+
+  if (repair) {
+    for (const f of fields) {
+      const aVal = (aRow as any)[f] ?? "";
+      const bVal = (flatB as any)[f] ?? "";
+      if (!isNonEmpty(aVal) && isNonEmpty(bVal)) {
+        (candidate as any)[f] = bVal;
+        changes[f] = { old: aVal, new: bVal };
+      }
+    }
+  } else {
+    const { fields: changedFields } = diff(flatB, shadow);
+    for (const f of changedFields) {
+      const bVal = (flatB as any)[f];
+      if (isNonEmpty(bVal)) {
+        const aCur = (aRow as any)[f] ?? "";
+        if (aCur !== bVal) {
+          (candidate as any)[f] = bVal;
+          changes[f] = { old: aCur, new: bVal };
+        }
+      }
     }
   }
 
-  // Log conflicts
-  if (conflicts.length > 0) {
+  if (Object.keys(candidate).length > 0) {
+    const { error } = await supabase.from("clients").update(candidate).eq("email", email);
+    if (error) throw error;
+
     await insertLog({
       email,
       direction: "B→A",
-      action: "conflict-detected",
-      result: "skipped",
-      field: conflicts.join(","),
-      old_value: null,
-      new_value: null,
+      action: repair ? "repair-update" : "update",
+      result: "ok",
+      field: Object.keys(candidate).join(","),
+      old_value: jsonCompact(Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, (v as any).old]))),
+      new_value: jsonCompact(Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, (v as any).new]))),
       dedupe_key: crypto.randomUUID()
     });
-  }
-
-  // Groepen: we accepteren B als leidend en schrijven alleen shadow bij
-  if (shadow && JSON.stringify(shadow.groups ?? []) !== JSON.stringify(flatB.groups ?? [])) {
-    await insertLog({ 
-      email, 
-      direction: "B→A", 
-      action: "groups-accept", 
+  } else {
+    await insertLog({
+      email,
+      direction: "B→A",
+      action: repair ? "repair-noop" : "noop",
       result: "ok",
       dedupe_key: crypto.randomUUID()
     });
   }
 
-  // Build new shadow: merge base (shadow ?? flatA) + safe updates from B + groups from B
-  const baseSnapshot = shadow ?? flatA;
-  const newShadow: FlatRecord = {
-    email: flatA.email,
-    first_name: baseSnapshot.first_name,
-    last_name: baseSnapshot.last_name,
-    city: baseSnapshot.city,
-    phone: baseSnapshot.phone,
-    country: baseSnapshot.country,
-    groups: flatB.groups // Groups always from B
-  };
-  
-  // Apply safe field updates to shadow
-  for (const f of safeFields) {
-    if (f !== "groups") (newShadow as any)[f] = (flatB as any)[f];
-  }
-  
-  await putShadow(email, newShadow);
+  const newShadow = { ...(flatA ?? { email }), ...aRow, ...candidate, groups: flatB.groups };
+  await putShadow(email, newShadow as FlatRecord);
 
-  return { email, updated: safeFields.length > 0, conflicts: conflicts.length };
+  return { email, changed: Object.keys(candidate).length > 0, repair };
 }
 
-async function run(mode: SyncMode, emails?: string[]): Promise<any[]> {
+// ============ Run orchestrator ============
+
+async function run(mode: SyncMode, emails?: string[], repair = false): Promise<any[]> {
   let targets = emails && emails.length > 0 ? emails : [];
   
   if (targets.length === 0) {
@@ -423,9 +456,9 @@ async function run(mode: SyncMode, emails?: string[]): Promise<any[]> {
       if (mode === "AtoB") {
         results.push(await processAtoB(email));
       } else if (mode === "BtoA") {
-        results.push(await processBtoA(email));
+        results.push(await processBtoA(email, repair));
       } else {
-        const r1 = await processBtoA(email);
+        const r1 = await processBtoA(email, repair);
         const r2 = await processAtoB(email);
         results.push({ email, r1, r2 });
       }
@@ -440,12 +473,13 @@ async function run(mode: SyncMode, emails?: string[]): Promise<any[]> {
       results.push({ email, error: String(e) });
     }
     
-    // Rate limiting: small delay between emails
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   
   return results;
 }
+
+// ============ HTTP server ============
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -453,7 +487,7 @@ serve(async (req) => {
   }
 
   try {
-    const { mode = "AtoB", emails = [] } = await req.json().catch(() => ({}));
+    const { mode = "AtoB", emails = [], repair = false } = await req.json().catch(() => ({}));
     
     if (!["AtoB", "BtoA", "bidirectional"].includes(mode)) {
       return new Response(
@@ -462,9 +496,9 @@ serve(async (req) => {
       );
     }
 
-    console.log(`Starting smart-sync: mode=${mode}, emails=${emails.length || 'all'}`);
+    console.log(`Starting smart-sync: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}`);
     
-    const out = await run(mode as SyncMode, emails);
+    const out = await run(mode as SyncMode, emails, repair);
     
     console.log(`Completed smart-sync: processed ${out.length} records`);
     

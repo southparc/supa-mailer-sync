@@ -134,7 +134,7 @@ export default function SmartSyncDashboard() {
               </Select>
             </div>
 
-            <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
               <Button
                 onClick={() => runSync(mode)}
                 disabled={loading}
@@ -172,6 +172,41 @@ export default function SmartSyncDashboard() {
                 title="Forceer bidirectioneel"
               >
                 <ArrowLeftRight className="h-4 w-4" />
+              </Button>
+
+              <Button
+                onClick={async () => {
+                  setLoading(true);
+                  setErr(null);
+                  setResp(null);
+                  try {
+                    const { data, error } = await supabase.functions.invoke<SmartSyncResponse>("smart-sync", {
+                      body: { mode: "BtoA", emails, repair: true }
+                    });
+                    if (error || !data?.ok) throw new Error(error?.message || data?.error || "unknown error");
+                    setResp(data);
+                    toast({
+                      title: "Repair voltooid",
+                      description: `${data.count} records hersteld vanuit MailerLite`,
+                    });
+                  } catch (e: any) {
+                    const errorMsg = String(e?.message || e);
+                    setErr(errorMsg);
+                    toast({
+                      title: "Repair gefaald",
+                      description: errorMsg,
+                      variant: "destructive",
+                    });
+                  } finally {
+                    setLoading(false);
+                  }
+                }}
+                disabled={loading}
+                variant="secondary"
+                title="Vul lege Supabase-velden met gegevens uit MailerLite"
+              >
+                {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Repair from MailerLite
               </Button>
             </div>
           </div>
