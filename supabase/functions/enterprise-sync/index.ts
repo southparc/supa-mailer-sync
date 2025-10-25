@@ -592,49 +592,105 @@ async function processClientSync(supabase: any, apiKey: string, client: any, dry
     }
   }
 
-  // If no subscriber found, create one
+  // If no subscriber found, apply runtime guard before creating
   if (!subscriber && !dryRun) {
-    const createPayload = {
-      email,
-      fields: {
-        name: client.first_name || '',
-        last_name: client.last_name || '',
-        phone: client.phone || '',
-        city: client.city || '',
-        country: client.country || '',
-      }
-    }
-
+    // RUNTIME GUARD: Lookup by email before creating to prevent duplicates
     try {
-      const response = await fetch('https://connect.mailerlite.com/api/subscribers', {
-        method: 'POST',
+      const lookupUrl = `https://connect.mailerlite.com/api/subscribers?filter[email]=${encodeURIComponent(normalize(email))}`
+      const lookupResponse = await fetch(lookupUrl, {
+        method: 'GET',
         headers: {
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(createPayload),
       })
 
-      if (response.ok) {
-        const data = await response.json()
-        subscriber = data.data
-        mailerLiteId = subscriber.id
+      if (lookupResponse.ok) {
+        const lookupData = await lookupResponse.json()
+        if (lookupData.data && lookupData.data.length > 0) {
+          // Found existing subscriber - link it instead of creating
+          subscriber = lookupData.data[0]
+          mailerLiteId = subscriber.id
 
-        // Update crosswalk
-        await supabase
-          .from('integration_crosswalk')
-          .upsert({
-            email,
-            a_id: client.id,
-            b_id: mailerLiteId,
-          })
+          // Check if status is protected (unsubscribed/bounced/complained)
+          const protectedStatuses = ['unsubscribed', 'bounced', 'complained', 'junk']
+          if (protectedStatuses.includes(subscriber.status)) {
+            console.log(`⚠️ Email ${email} has protected status: ${subscriber.status} - skipping sync`)
+            
+            // Update client marketing status
+            await supabase
+              .from('clients')
+              .update({ marketing_status: subscriber.status })
+              .eq('email', email)
 
-        await logSyncActivity(supabase, email, 'created', 'SB→ML', 'success', dedupeKey)
-        return { conflicts: 0, updates: 1 }
+            await logSyncActivity(supabase, email, 'skipped', 'SB→ML', `protected-status:${subscriber.status}`, dedupeKey)
+            return { conflicts: 0, updates: 0 }
+          }
+
+          // Update crosswalk with found b_id
+          await supabase
+            .from('integration_crosswalk')
+            .upsert({
+              email,
+              a_id: client.id,
+              b_id: mailerLiteId,
+            })
+
+          await logSyncActivity(supabase, email, 'linked', 'SB→ML', `found-existing:${mailerLiteId}`, dedupeKey)
+          console.log(`✅ Linked existing MailerLite subscriber ${mailerLiteId} for ${email}`)
+          
+          // Continue to sync engine below (don't return here)
+        }
       }
     } catch (error) {
-      console.error('Error creating MailerLite subscriber:', error)
-      return { conflicts: 0, updates: 0 }
+      console.error(`Error during email lookup for ${email}:`, error)
+      // Continue to create if lookup fails
+    }
+
+    // Only create if still no subscriber found after lookup
+    if (!subscriber) {
+      const createPayload = {
+        email,
+        fields: {
+          name: client.first_name || '',
+          last_name: client.last_name || '',
+          phone: client.phone || '',
+          city: client.city || '',
+          country: client.country || '',
+        }
+      }
+
+      try {
+        const response = await fetch('https://connect.mailerlite.com/api/subscribers', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(createPayload),
+        })
+
+        if (response.ok) {
+          const data = await response.json()
+          subscriber = data.data
+          mailerLiteId = subscriber.id
+
+          // Update crosswalk
+          await supabase
+            .from('integration_crosswalk')
+            .upsert({
+              email,
+              a_id: client.id,
+              b_id: mailerLiteId,
+            })
+
+          await logSyncActivity(supabase, email, 'created', 'SB→ML', 'success', dedupeKey)
+          return { conflicts: 0, updates: 1 }
+        }
+      } catch (error) {
+        console.error('Error creating MailerLite subscriber:', error)
+        return { conflicts: 0, updates: 0 }
+      }
     }
   }
 
