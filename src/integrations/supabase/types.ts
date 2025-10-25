@@ -51,6 +51,7 @@ export type Database = {
           phone: string | null
           photo_url: string | null
           updated_at: string
+          VoAdvisor: string | null
         }
         Insert: {
           created_at?: string
@@ -61,6 +62,7 @@ export type Database = {
           phone?: string | null
           photo_url?: string | null
           updated_at?: string
+          VoAdvisor?: string | null
         }
         Update: {
           created_at?: string
@@ -71,6 +73,7 @@ export type Database = {
           phone?: string | null
           photo_url?: string | null
           updated_at?: string
+          VoAdvisor?: string | null
         }
         Relationships: []
       }
@@ -1117,6 +1120,14 @@ export type Database = {
       }
     }
     Functions: {
+      check_duplicate_advisors: {
+        Args: never
+        Returns: {
+          count: number
+          ids: string
+          name: string
+        }[]
+      }
       full_client: {
         Args: { email: string }
         Returns: {

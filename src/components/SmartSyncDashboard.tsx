@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
@@ -7,7 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Loader2, ArrowRight, ArrowLeft, ArrowLeftRight, AlertCircle, Eye } from "lucide-react";
+import { Loader2, ArrowRight, ArrowLeft, ArrowLeftRight, AlertCircle, Eye, AlertTriangle } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 
 type SyncMode = "AtoB" | "BtoA" | "bidirectional" | "full";
@@ -35,6 +35,12 @@ function parseEmails(input: string): string[] {
   ).slice(0, 2000);
 }
 
+interface Duplicate {
+  name: string;
+  count: number;
+  ids: string;
+}
+
 export default function SmartSyncDashboard() {
   const [emailsText, setEmailsText] = useState("");
   const [loading, setLoading] = useState(false);
@@ -42,9 +48,24 @@ export default function SmartSyncDashboard() {
   const [dryRun, setDryRun] = useState(false);
   const [resp, setResp] = useState<SmartSyncResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
   const { toast } = useToast();
 
   const emails = useMemo(() => parseEmails(emailsText), [emailsText]);
+
+  // Check for duplicate advisors on mount
+  useEffect(() => {
+    async function checkDuplicates() {
+      try {
+        const { data, error } = await supabase.rpc('check_duplicate_advisors');
+        if (error) throw error;
+        setDuplicates(data || []);
+      } catch (error: any) {
+        console.error('Error checking duplicates:', error);
+      }
+    }
+    checkDuplicates();
+  }, []);
 
   async function runSync(runMode: SyncMode, isDryRun = false) {
     setLoading(true);
@@ -81,8 +102,21 @@ export default function SmartSyncDashboard() {
     }
   }
 
+  const hasDuplicates = duplicates.length > 0;
+
   return (
     <div className="space-y-6 max-w-5xl mx-auto p-6">
+      {hasDuplicates && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <strong>Duplicate advisors gedetecteerd:</strong> {duplicates.map(d => `${d.name} (${d.count}x, IDs: ${d.ids})`).join(', ')}
+            <br />
+            <span className="text-sm">Sync operaties zijn geblokkeerd totdat duplicates zijn opgelost. Ga naar Advisors Management om dit op te lossen.</span>
+          </AlertDescription>
+        </Alert>
+      )}
+      
       <Card>
         <CardHeader>
           <CardTitle>Smart Sync</CardTitle>
@@ -159,7 +193,7 @@ export default function SmartSyncDashboard() {
           <div className="flex gap-2 flex-wrap">
               <Button
                 onClick={() => runSync(mode, dryRun)}
-                disabled={loading}
+                disabled={loading || hasDuplicates}
                 size="default"
                 variant={dryRun ? "secondary" : "default"}
               >
@@ -170,7 +204,7 @@ export default function SmartSyncDashboard() {
 
               <Button
                 onClick={() => runSync("AtoB", dryRun)}
-                disabled={loading}
+                disabled={loading || hasDuplicates}
                 variant="outline"
                 size="icon"
                 title="Forceer A→B"
@@ -180,7 +214,7 @@ export default function SmartSyncDashboard() {
 
               <Button
                 onClick={() => runSync("BtoA", dryRun)}
-                disabled={loading}
+                disabled={loading || hasDuplicates}
                 variant="outline"
                 size="icon"
                 title="Forceer B→A"
@@ -190,7 +224,7 @@ export default function SmartSyncDashboard() {
 
               <Button
                 onClick={() => runSync("bidirectional", dryRun)}
-                disabled={loading}
+                disabled={loading || hasDuplicates}
                 variant="outline"
                 size="icon"
                 title="Forceer bidirectioneel"
@@ -227,7 +261,7 @@ export default function SmartSyncDashboard() {
                     setLoading(false);
                   }
                 }}
-                disabled={loading}
+                disabled={loading || hasDuplicates}
                 variant="secondary"
                 title="Vul lege Supabase-velden met gegevens uit MailerLite"
               >

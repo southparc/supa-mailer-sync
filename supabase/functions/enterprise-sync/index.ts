@@ -456,19 +456,20 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
         })
     }
 
-    // Link to existing advisor by name
+    // Link to existing advisor with improved matching
     if (subscriber.fields?.advisor) {
-      const { data: advisor } = await supabase
-        .from('advisors')
-        .select('id')
-        .ilike('name', subscriber.fields.advisor)
-        .maybeSingle()
+      const advisor = await findAdvisor(supabase, subscriber.fields.advisor)
       
       if (advisor) {
         await supabase
           .from('clients')
           .update({ advisor_id: advisor.id })
           .eq('id', clientId)
+        
+        await logSyncActivity(supabase, email, 'advisor_match', 'ML→SB', 'success', dedupeKey, 'advisor_id', null, advisor.id.toString())
+      } else {
+        await logSyncActivity(supabase, email, 'advisor_match', 'ML→SB', 'failed', dedupeKey, 'advisor_id', subscriber.fields.advisor, null)
+        console.warn(`Advisor niet gevonden: ${subscriber.fields.advisor}`)
       }
     }
 
@@ -894,6 +895,36 @@ function isEmpty(value: any): boolean {
 function mapMailerLiteStatusToSubscribed(status: string): boolean {
   // MailerLite statuses: active, unsubscribed, bounced, junk, unconfirmed
   return status === 'active'
+}
+
+// ENTERPRISE FEATURE: Improved advisor matching with priority logic
+async function findAdvisor(supabase: any, advisorName: string): Promise<{id: number, name: string} | null> {
+  // Strategy 1: Try exact match on VoAdvisor (most reliable)
+  const { data: byVoAdvisor } = await supabase
+    .from('advisors')
+    .select('id, name')
+    .eq('VoAdvisor', advisorName)
+    .maybeSingle()
+  
+  if (byVoAdvisor) {
+    console.log(`Advisor matched by VoAdvisor: ${advisorName} -> ${byVoAdvisor.name} (id: ${byVoAdvisor.id})`)
+    return byVoAdvisor
+  }
+  
+  // Strategy 2: Fallback to case-insensitive name match
+  const { data: byName } = await supabase
+    .from('advisors')
+    .select('id, name')
+    .ilike('name', advisorName)
+    .maybeSingle()
+  
+  if (byName) {
+    console.log(`Advisor matched by name: ${advisorName} -> ${byName.name} (id: ${byName.id})`)
+    return byName
+  }
+  
+  // No match found
+  return null
 }
 
 // ENTERPRISE FEATURE: Retry logic with exponential backoff

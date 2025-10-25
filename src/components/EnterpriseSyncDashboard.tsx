@@ -30,6 +30,12 @@ interface SyncStats {
   updatesApplied?: number;
 }
 
+interface Duplicate {
+  name: string;
+  count: number;
+  ids: string;
+}
+
 const EnterpriseSyncDashboard: React.FC = () => {
   const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'completed'>('idle');
   const [syncProgress, setSyncProgress] = useState(0);
@@ -46,6 +52,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
     unsubscribed: number;
   }>({ total: 0, subscribed: 0, unsubscribed: 0 });
   const [chunkProgress, setChunkProgress] = useState({ current: 0, total: 0 });
+  const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
   const { toast } = useToast();
 
   // Fetch current client count on mount and after syncs
@@ -96,7 +103,18 @@ const EnterpriseSyncDashboard: React.FC = () => {
   useEffect(() => {
     fetchClientCount();
     fetchSubscriptionStats();
+    checkDuplicates();
   }, []);
+
+  const checkDuplicates = async () => {
+    try {
+      const { data, error } = await supabase.rpc('check_duplicate_advisors');
+      if (error) throw error;
+      setDuplicates(data || []);
+    } catch (error: any) {
+      console.error('Error checking duplicates:', error);
+    }
+  };
 
   // Map UI directions to backend expectations
   const mapDirection = (d: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') =>
@@ -256,8 +274,40 @@ const EnterpriseSyncDashboard: React.FC = () => {
     setStats(prev => ({ ...prev, conflicts: conflictStats.conflicts }));
   };
 
+  const hasDuplicates = duplicates.length > 0;
+
   return (
     <div className="space-y-6">
+      {/* Duplicate Advisors Warning */}
+      {hasDuplicates && (
+        <Card className="border-destructive">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-destructive">
+              <AlertTriangle className="h-5 w-5" />
+              Duplicate Advisors Detected
+            </CardTitle>
+            <CardDescription>
+              Sync operations are blocked until duplicate advisors are resolved.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              {duplicates.map((dup, idx) => (
+                <div key={idx} className="flex items-center justify-between p-3 bg-destructive/10 rounded-lg">
+                  <div>
+                    <p className="font-medium">{dup.name}</p>
+                    <p className="text-sm text-muted-foreground">Found {dup.count} times (IDs: {dup.ids})</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <p className="text-sm text-muted-foreground mt-4">
+              Please go to Advisors Management to resolve these duplicates before running sync operations.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+      
       {/* Sync Status */}
       {syncStatus !== 'idle' && (
         <Card>
@@ -442,7 +492,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
                       setSyncStatus('idle');
                     }
                   }}
-                  disabled={syncStatus === 'syncing'}
+                  disabled={syncStatus === 'syncing' || hasDuplicates}
                 >
                   <Database className="h-4 w-4 mr-2" />
                   Run Backfill
@@ -484,7 +534,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
                       setSyncStatus('idle');
                     }
                   }}
-                  disabled={syncStatus === 'syncing'}
+                  disabled={syncStatus === 'syncing' || hasDuplicates}
                 >
                   <Users className="h-4 w-4 mr-2" />
                   Backfill Subscriptions
@@ -508,7 +558,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
                     <Button
                       variant={config.variant}
                       onClick={() => handleSync(direction)}
-                      disabled={syncStatus === 'syncing'}
+                      disabled={syncStatus === 'syncing' || hasDuplicates}
                     >
                       {syncStatus === 'syncing' ? (
                         <Pause className="h-4 w-4 mr-2" />
