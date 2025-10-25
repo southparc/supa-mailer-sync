@@ -2,6 +2,10 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
+// ============================================================================
+// Types & Constants
+// ============================================================================
+
 type FlatRecord = {
   email: string;
   first_name: string;
@@ -12,7 +16,21 @@ type FlatRecord = {
   groups: string[];
 };
 
-type SyncMode = "AtoB" | "BtoA" | "bidirectional";
+interface MailerLiteSubscriber {
+  id: string;
+  email: string;
+  fields?: {
+    name?: string;
+    last_name?: string;
+    city?: string;
+    country?: string;
+    phone?: string;
+  };
+  status: string;
+  groups?: Array<{ id: string; name: string }>;
+}
+
+type SyncMode = "AtoB" | "BtoA" | "bidirectional" | "full";
 
 const SB_URL = Deno.env.get("SUPABASE_URL")!;
 const SB_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -29,7 +47,9 @@ const supabase = createClient(SB_URL, SB_KEY, {
   global: { headers: { 'x-client-info': 'smart-sync' } }
 });
 
-// ============ Helpers ============
+// ============================================================================
+// Helpers
+// ============================================================================
 
 function stableStringify(o: any): string {
   if (Array.isArray(o)) return JSON.stringify([...o].sort());
@@ -77,7 +97,133 @@ async function alreadyDone(dedupe_key: string): Promise<boolean> {
   return (data ?? []).length > 0;
 }
 
-// ============ Database operations ============
+// ============================================================================
+// New Functions for Full Sync
+// ============================================================================
+
+/**
+ * Fetch ALL MailerLite subscribers including unsubscribed
+ */
+async function getAllMailerLiteSubscribers(): Promise<Map<string, MailerLiteSubscriber>> {
+  const result = new Map<string, MailerLiteSubscriber>();
+  let cursor: string | null = null;
+  let page = 0;
+
+  console.log('📥 Fetching all MailerLite subscribers...');
+
+  do {
+    const url = new URL(`${ML_BASE}/subscribers`);
+    url.searchParams.set('limit', '1000');
+    url.searchParams.set('filter[status]', 'all'); // Include ALL statuses
+    if (cursor) url.searchParams.set('cursor', cursor);
+
+    const res = await retryFetch(url.toString(), {
+      headers: {
+        'Authorization': `Bearer ${ML_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`❌ MailerLite API error: ${res.status} ${err}`);
+      throw new Error(`MailerLite subscribers fetch failed: ${res.status}`);
+    }
+
+    const json = await res.json();
+    const subscribers = json.data || [];
+    
+    for (const sub of subscribers) {
+      const email = sub.email?.toLowerCase();
+      if (email) {
+        result.set(email, sub);
+      }
+    }
+
+    cursor = json.links?.next ? new URL(json.links.next).searchParams.get('cursor') : null;
+    page++;
+    console.log(`  Page ${page}: fetched ${subscribers.length} subscribers (total: ${result.size})`);
+
+  } while (cursor);
+
+  console.log(`✅ Total MailerLite subscribers: ${result.size}`);
+  return result;
+}
+
+/**
+ * Fetch ALL Supabase clients
+ */
+async function getAllSupabaseClients(): Promise<Map<string, { id: string; email: string }>> {
+  const result = new Map<string, { id: string; email: string }>();
+  
+  console.log('📥 Fetching all Supabase clients...');
+  
+  const { data, error } = await supabase
+    .from('clients')
+    .select('id, email');
+
+  if (error) {
+    console.error('❌ Supabase clients fetch error:', error);
+    throw error;
+  }
+
+  for (const client of data || []) {
+    const email = client.email?.toLowerCase();
+    if (email) {
+      result.set(email, client);
+    }
+  }
+
+  console.log(`✅ Total Supabase clients: ${result.size}`);
+  return result;
+}
+
+/**
+ * Create a new client in Supabase from MailerLite data
+ */
+async function createClientFromMailerLite(mlSub: MailerLiteSubscriber): Promise<string | null> {
+  const email = mlSub.email.toLowerCase();
+  
+  console.log(`➕ Creating new client from MailerLite: ${email}`);
+
+  // Extract fields from MailerLite
+  const firstName = mlSub.fields?.name || null;
+  const lastName = mlSub.fields?.last_name || null;
+  const city = mlSub.fields?.city || null;
+  const country = mlSub.fields?.country || null;
+  const phone = mlSub.fields?.phone || null;
+
+  // Insert into clients table
+  const { data, error } = await supabase
+    .from('clients')
+    .insert({
+      email,
+      first_name: firstName,
+      last_name: lastName,
+      city,
+      country,
+      phone,
+    })
+    .select('id')
+    .single();
+
+  if (error) {
+    console.error(`❌ Error creating client ${email}:`, error);
+    return null;
+  }
+
+  const clientId = data.id;
+  console.log(`✅ Created client ${email} with id ${clientId}`);
+
+  // Create or update crosswalk with b_id
+  await updateCrosswalkB(email, mlSub.id);
+
+  return clientId;
+}
+
+// ============================================================================
+// Database operations
+// ============================================================================
 
 async function insertLog(row: {
   email: string;
@@ -159,7 +305,9 @@ async function updateCrosswalkB(email: string, b_id: string) {
   if (error) console.error("Crosswalk update error:", error);
 }
 
-// ============ Data fetchers ============
+// ============================================================================
+// Data fetchers
+// ============================================================================
 
 async function flatFromA(email: string): Promise<FlatRecord | null> {
   const { data, error } = await supabase
@@ -221,7 +369,9 @@ async function flatFromBById(b_id: string): Promise<FlatRecord | null> {
   }
 }
 
-// ============ MailerLite operations ============
+// ============================================================================
+// MailerLite operations
+// ============================================================================
 
 async function upsertBNeverBlank(flat: FlatRecord, existing_b_id: string | null): Promise<string | null> {
   const base = pickNonEmpty(flat, ["first_name", "last_name", "city", "phone", "country"]);
@@ -332,7 +482,9 @@ async function setGroupsBExact(b_id: string, desiredNames: string[]) {
   }
 }
 
-// ============ Sync processors ============
+// ============================================================================
+// Sync processors
+// ============================================================================
 
 async function processAtoB(email: string): Promise<any> {
   const flatA = await flatFromA(email);
@@ -531,9 +683,122 @@ async function processBtoA(email: string, repair = false): Promise<any> {
   return { email, changed: Object.keys(candidate).length > 0, repair };
 }
 
-// ============ Run orchestrator ============
+// ============================================================================
+// Full Sync Orchestration (3-way matching)
+// ============================================================================
+
+async function runFullSync(): Promise<any> {
+  console.log('🔄 Starting FULL bidirectional sync...');
+
+  // 1. Fetch all from both systems
+  const [mlSubscribers, sbClients] = await Promise.all([
+    getAllMailerLiteSubscribers(),
+    getAllSupabaseClients(),
+  ]);
+
+  const mlEmails = new Set(mlSubscribers.keys());
+  const sbEmails = new Set(sbClients.keys());
+
+  // 2. Calculate sets
+  const onlyInML: string[] = [];
+  const onlyInSB: string[] = [];
+  const inBoth: string[] = [];
+
+  for (const email of mlEmails) {
+    if (sbEmails.has(email)) {
+      inBoth.push(email);
+    } else {
+      onlyInML.push(email);
+    }
+  }
+
+  for (const email of sbEmails) {
+    if (!mlEmails.has(email)) {
+      onlyInSB.push(email);
+    }
+  }
+
+  console.log(`\n📊 Sync Overview:`);
+  console.log(`  - Only in MailerLite: ${onlyInML.length}`);
+  console.log(`  - Only in Supabase: ${onlyInSB.length}`);
+  console.log(`  - In Both: ${inBoth.length}\n`);
+
+  const results = {
+    onlyInML: [] as any[],
+    onlyInSB: [] as any[],
+    inBoth: [] as any[],
+    stats: {
+      mlTotal: mlSubscribers.size,
+      sbTotal: sbClients.size,
+      onlyML: onlyInML.length,
+      onlySB: onlyInSB.length,
+      both: inBoth.length,
+    }
+  };
+
+  // 3. Process: Only in MailerLite → Create in Supabase
+  console.log(`\n🔵 Processing ${onlyInML.length} contacts only in MailerLite...`);
+  for (const email of onlyInML) {
+    try {
+      const mlSub = mlSubscribers.get(email)!;
+      const clientId = await createClientFromMailerLite(mlSub);
+      results.onlyInML.push({ 
+        email, 
+        status: clientId ? 'created' : 'failed',
+        clientId 
+      });
+    } catch (err: any) {
+      console.error(`❌ Error creating client for ${email}:`, err.message);
+      results.onlyInML.push({ email, status: 'error', error: err.message });
+    }
+  }
+
+  // 4. Process: Only in Supabase → Create in MailerLite
+  console.log(`\n🟢 Processing ${onlyInSB.length} contacts only in Supabase...`);
+  for (const email of onlyInSB) {
+    try {
+      const outcome = await processAtoB(email);
+      results.onlyInSB.push({ email, status: 'synced', ...outcome });
+    } catch (err: any) {
+      console.error(`❌ Error syncing ${email} to MailerLite:`, err.message);
+      results.onlyInSB.push({ email, status: 'error', error: err.message });
+    }
+  }
+
+  // 5. Process: In Both → Bidirectional sync
+  console.log(`\n🟡 Processing ${inBoth.length} contacts in both systems...`);
+  for (const email of inBoth) {
+    try {
+      const [aResult, bResult] = await Promise.all([
+        processAtoB(email),
+        processBtoA(email, false),
+      ]);
+      results.inBoth.push({ 
+        email, 
+        status: 'synced', 
+        AtoB: aResult, 
+        BtoA: bResult 
+      });
+    } catch (err: any) {
+      console.error(`❌ Error syncing ${email}:`, err.message);
+      results.inBoth.push({ email, status: 'error', error: err.message });
+    }
+  }
+
+  console.log('\n✅ Full sync completed!');
+  return results;
+}
+
+// ============================================================================
+// Run orchestrator (Legacy modes)
+// ============================================================================
 
 async function run(mode: SyncMode, emails?: string[], repair = false): Promise<any[]> {
+  // If mode is 'full', use the new full sync
+  if (mode === 'full') {
+    return await runFullSync();
+  }
+
   let targets = emails && emails.length > 0 ? emails : [];
   
   if (targets.length === 0) {
@@ -581,7 +846,9 @@ async function run(mode: SyncMode, emails?: string[], repair = false): Promise<a
   return results;
 }
 
-// ============ HTTP server ============
+// ============================================================================
+// HTTP server
+// ============================================================================
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -591,21 +858,21 @@ serve(async (req) => {
   try {
     const { mode = "AtoB", emails = [], repair = false } = await req.json().catch(() => ({}));
     
-    if (!["AtoB", "BtoA", "bidirectional"].includes(mode)) {
+    if (!["AtoB", "BtoA", "bidirectional", "full"].includes(mode)) {
       return new Response(
-        JSON.stringify({ ok: false, error: "invalid mode" }),
+        JSON.stringify({ ok: false, error: "invalid mode (use AtoB, BtoA, bidirectional, or full)" }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    console.log(`Starting smart-sync: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}`);
+    console.log(`\n🚀 Smart Sync Request: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}`);
     
     const out = await run(mode as SyncMode, emails, repair);
     
-    console.log(`Completed smart-sync: processed ${out.length} records`);
+    console.log(`\n✅ Completed smart-sync: processed ${Array.isArray(out) ? out.length : 'full sync'} records`);
     
     return new Response(
-      JSON.stringify({ ok: true, mode, count: out.length, out }),
+      JSON.stringify({ ok: true, mode, count: Array.isArray(out) ? out.length : null, out }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (e) {

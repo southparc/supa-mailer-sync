@@ -9,7 +9,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, ArrowRight, ArrowLeft, ArrowLeftRight, AlertCircle } from "lucide-react";
 
-type SyncMode = "AtoB" | "BtoA" | "bidirectional";
+type SyncMode = "AtoB" | "BtoA" | "bidirectional" | "full";
 
 type SmartSyncRow =
   | { email: string; b_id?: string; changed?: boolean; skipped?: boolean; reason?: string; error?: string }
@@ -128,6 +128,12 @@ export default function SmartSyncDashboard() {
                     <div className="flex items-center gap-2">
                       <ArrowLeftRight className="h-4 w-4" />
                       <span>Bidirectioneel</span>
+                    </div>
+                  </SelectItem>
+                  <SelectItem value="full">
+                    <div className="flex items-center gap-2">
+                      <ArrowLeftRight className="h-4 w-4" />
+                      <span>Full Sync (Alle contacten)</span>
                     </div>
                   </SelectItem>
                 </SelectContent>
