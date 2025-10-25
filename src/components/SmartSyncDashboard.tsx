@@ -7,7 +7,8 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Loader2, ArrowRight, ArrowLeft, ArrowLeftRight, AlertCircle } from "lucide-react";
+import { Loader2, ArrowRight, ArrowLeft, ArrowLeftRight, AlertCircle, Eye } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
 
 type SyncMode = "AtoB" | "BtoA" | "bidirectional" | "full";
 
@@ -38,20 +39,21 @@ export default function SmartSyncDashboard() {
   const [emailsText, setEmailsText] = useState("");
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState<SyncMode>("bidirectional");
+  const [dryRun, setDryRun] = useState(false);
   const [resp, setResp] = useState<SmartSyncResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const { toast } = useToast();
 
   const emails = useMemo(() => parseEmails(emailsText), [emailsText]);
 
-  async function runSync(runMode: SyncMode) {
+  async function runSync(runMode: SyncMode, isDryRun = false) {
     setLoading(true);
     setErr(null);
     setResp(null);
     
     try {
       const { data, error } = await supabase.functions.invoke<SmartSyncResponse>("smart-sync", {
-        body: { mode: runMode, emails }
+        body: { mode: runMode, emails, dryRun: isDryRun }
       });
       
       if (error || !data?.ok) {
@@ -61,8 +63,10 @@ export default function SmartSyncDashboard() {
       setResp(data);
       
       toast({
-        title: "Sync voltooid",
-        description: `${data.count} records verwerkt in ${runMode} modus`,
+        title: isDryRun ? "Dry-run voltooid" : "Sync voltooid",
+        description: isDryRun 
+          ? `${data.count} records geanalyseerd (geen wijzigingen doorgevoerd)`
+          : `${data.count} records verwerkt in ${runMode} modus`,
       });
     } catch (e: any) {
       const errorMsg = String(e?.message || e);
@@ -139,19 +143,33 @@ export default function SmartSyncDashboard() {
                 </SelectContent>
               </Select>
             </div>
+            
+            <div className="flex items-center gap-2 pb-1">
+              <Switch 
+                id="dry-run" 
+                checked={dryRun} 
+                onCheckedChange={setDryRun}
+              />
+              <Label htmlFor="dry-run" className="cursor-pointer flex items-center gap-1">
+                <Eye className="h-4 w-4" />
+                Dry-run (alleen preview)
+              </Label>
+            </div>
 
           <div className="flex gap-2 flex-wrap">
               <Button
-                onClick={() => runSync(mode)}
+                onClick={() => runSync(mode, dryRun)}
                 disabled={loading}
                 size="default"
+                variant={dryRun ? "secondary" : "default"}
               >
                 {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                {dryRun && <Eye className="mr-2 h-4 w-4" />}
                 Start {mode}
               </Button>
 
               <Button
-                onClick={() => runSync("AtoB")}
+                onClick={() => runSync("AtoB", dryRun)}
                 disabled={loading}
                 variant="outline"
                 size="icon"
@@ -161,7 +179,7 @@ export default function SmartSyncDashboard() {
               </Button>
 
               <Button
-                onClick={() => runSync("BtoA")}
+                onClick={() => runSync("BtoA", dryRun)}
                 disabled={loading}
                 variant="outline"
                 size="icon"
@@ -171,7 +189,7 @@ export default function SmartSyncDashboard() {
               </Button>
 
               <Button
-                onClick={() => runSync("bidirectional")}
+                onClick={() => runSync("bidirectional", dryRun)}
                 disabled={loading}
                 variant="outline"
                 size="icon"
@@ -187,13 +205,15 @@ export default function SmartSyncDashboard() {
                   setResp(null);
                   try {
                     const { data, error } = await supabase.functions.invoke<SmartSyncResponse>("smart-sync", {
-                      body: { mode: "BtoA", emails, repair: true }
+                      body: { mode: "BtoA", emails, repair: true, dryRun }
                     });
                     if (error || !data?.ok) throw new Error(error?.message || data?.error || "unknown error");
                     setResp(data);
                     toast({
-                      title: "Repair voltooid",
-                      description: `${data.count} records hersteld vanuit MailerLite`,
+                      title: dryRun ? "Repair preview voltooid" : "Repair voltooid",
+                      description: dryRun
+                        ? `${data.count} records zouden hersteld worden`
+                        : `${data.count} records hersteld vanuit MailerLite`,
                     });
                   } catch (e: any) {
                     const errorMsg = String(e?.message || e);
@@ -229,8 +249,10 @@ export default function SmartSyncDashboard() {
       {resp && (
         <Card>
           <CardHeader>
-            <CardTitle>
+            <CardTitle className="flex items-center gap-2">
+              {(resp as any).dryRun && <Eye className="h-5 w-5 text-muted-foreground" />}
               Resultaat: {resp.ok ? "Succesvol" : "Gefaald"} • {resp.mode} • {resp.count} rijen
+              {(resp as any).dryRun && <span className="text-sm font-normal text-muted-foreground">(dry-run)</span>}
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">

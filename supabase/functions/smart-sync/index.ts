@@ -19,6 +19,7 @@ type FlatRecord = {
 interface MailerLiteSubscriber {
   id: string;
   email: string;
+  status: string; // active, unsubscribed, bounced, complained, junk
   fields?: {
     name?: string;
     last_name?: string;
@@ -26,7 +27,6 @@ interface MailerLiteSubscriber {
     country?: string;
     phone?: string;
   };
-  status: string;
   groups?: Array<{ id: string; name: string }>;
 }
 
@@ -46,6 +46,9 @@ const supabase = createClient(SB_URL, SB_KEY, {
   auth: { persistSession: false },
   global: { headers: { 'x-client-info': 'smart-sync' } }
 });
+
+// Managed groups that we're allowed to remove (others stay untouched)
+let MANAGED_GROUPS_CACHE: Set<string> | null = null;
 
 // ============================================================================
 // Helpers
@@ -72,19 +75,69 @@ function jsonCompact(o: any): string {
   return JSON.stringify(o);
 }
 
-// Retry with exponential backoff for 429/5xx
-async function retryFetch(url: string, init: RequestInit, tries = 4): Promise<Response> {
+/**
+ * Phase 1.3: Email normalization (lowercase + trim)
+ */
+function normalizeEmail(email: string): string {
+  return email.toLowerCase().trim();
+}
+
+/**
+ * Phase 1.1: Deterministic idempotency key (SHA256 hash)
+ * Uses timestamp bucket (hourly) to prevent duplicates within same hour
+ */
+async function generateDedupeKey(email: string, action: string, payload: any): Promise<string> {
+  const hourBucket = Math.floor(Date.now() / 3600000); // Round to hour
+  const canonical = stableStringify({ email: normalizeEmail(email), action, hourBucket, payload });
+  
+  const encoder = new TextEncoder();
+  const data = encoder.encode(canonical);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Phase 2.1: Retry with exponential backoff + rate limit tracking
+ */
+async function retryFetch(url: string, init: RequestInit, tries = 4, dryRun = false): Promise<Response> {
+  if (dryRun) {
+    console.log(`[DRY-RUN] Would fetch: ${init.method || 'GET'} ${url}`);
+    return new Response(JSON.stringify({ data: { id: 'dry-run-id' } }), { status: 200 });
+  }
+
   let last: Response | null = null;
   for (let i = 0; i < tries; i++) {
     const res = await fetch(url, init);
+    
+    // Track rate limits
+    const rateLimitRemaining = res.headers.get('X-RateLimit-Remaining');
+    if (rateLimitRemaining) {
+      const remaining = parseInt(rateLimitRemaining, 10);
+      if (remaining < 100) {
+        console.warn(`⚠️ Rate limit low: ${remaining} requests remaining`);
+        // Log to sync_state for monitoring
+        await supabase.from('sync_state').upsert({
+          key: 'mailerlite_rate_limit',
+          value: { remaining, timestamp: new Date().toISOString() },
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'key' });
+      }
+    }
+    
     if (res.status !== 429 && res.status < 500) return res;
+    
     last = res;
-    await new Promise(r => setTimeout(r, 250 * Math.pow(2, i)));
+    const backoff = 250 * Math.pow(2, i);
+    console.log(`  ⏳ Retry ${i + 1}/${tries} after ${backoff}ms (status: ${res.status})`);
+    await new Promise(r => setTimeout(r, backoff));
   }
   return last!;
 }
 
-// Idempotency check
+/**
+ * Idempotency check
+ */
 async function alreadyDone(dedupe_key: string): Promise<boolean> {
   const { data, error } = await supabase
     .from("sync_log")
@@ -97,15 +150,73 @@ async function alreadyDone(dedupe_key: string): Promise<boolean> {
   return (data ?? []).length > 0;
 }
 
+/**
+ * Phase 2.2: Get managed groups whitelist
+ */
+async function getManagedGroups(): Promise<Set<string>> {
+  if (MANAGED_GROUPS_CACHE) return MANAGED_GROUPS_CACHE;
+  
+  const { data, error } = await supabase
+    .from('managed_mailerlite_groups')
+    .select('ml_group_id');
+  
+  if (error) {
+    console.error('Error fetching managed groups:', error);
+    return new Set();
+  }
+  
+  MANAGED_GROUPS_CACHE = new Set((data || []).map(r => r.ml_group_id));
+  console.log(`📋 Loaded ${MANAGED_GROUPS_CACHE.size} managed groups`);
+  return MANAGED_GROUPS_CACHE;
+}
+
 // ============================================================================
-// New Functions for Full Sync
+// Phase 1.2: MailerLite Status Helpers
 // ============================================================================
 
 /**
- * Fetch ALL MailerLite subscribers including unsubscribed
+ * Check if a subscriber should not be re-subscribed
  */
-async function getAllMailerLiteSubscribers(): Promise<Map<string, MailerLiteSubscriber>> {
+function isProtectedStatus(status: string): boolean {
+  return ['unsubscribed', 'bounced', 'complained', 'junk'].includes(status.toLowerCase());
+}
+
+/**
+ * Get current MailerLite subscriber status
+ */
+async function getMailerLiteStatus(b_id: string, dryRun = false): Promise<string | null> {
+  if (dryRun) return 'active';
+  
+  try {
+    const res = await fetch(`${ML_BASE}/subscribers/${b_id}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${ML_KEY}`, "Content-Type": "application/json" }
+    });
+    
+    if (!res.ok) return null;
+    const sub = await res.json();
+    return sub.status || null;
+  } catch (e) {
+    console.error('Error fetching ML status:', e);
+    return null;
+  }
+}
+
+// ============================================================================
+// Phase 1.4: Supabase Pagination (Batched)
+// ============================================================================
+
+/**
+ * Fetch ALL MailerLite subscribers with pagination
+ */
+async function getAllMailerLiteSubscribers(dryRun = false): Promise<Map<string, MailerLiteSubscriber>> {
   const result = new Map<string, MailerLiteSubscriber>();
+  
+  if (dryRun) {
+    console.log('[DRY-RUN] Would fetch all MailerLite subscribers');
+    return result;
+  }
+
   let cursor: string | null = null;
   let page = 0;
 
@@ -122,7 +233,7 @@ async function getAllMailerLiteSubscribers(): Promise<Map<string, MailerLiteSubs
         'Authorization': `Bearer ${ML_KEY}`,
         'Content-Type': 'application/json',
       },
-    });
+    }, 4, dryRun);
 
     if (!res.ok) {
       const err = await res.text();
@@ -134,7 +245,7 @@ async function getAllMailerLiteSubscribers(): Promise<Map<string, MailerLiteSubs
     const subscribers = json.data || [];
     
     for (const sub of subscribers) {
-      const email = sub.email?.toLowerCase();
+      const email = normalizeEmail(sub.email || '');
       if (email) {
         result.set(email, sub);
       }
@@ -151,40 +262,95 @@ async function getAllMailerLiteSubscribers(): Promise<Map<string, MailerLiteSubs
 }
 
 /**
- * Fetch ALL Supabase clients
+ * Phase 1.4: Batched Supabase client fetching with keyset pagination
  */
-async function getAllSupabaseClients(): Promise<Map<string, { id: string; email: string }>> {
-  const result = new Map<string, { id: string; email: string }>();
+async function getAllSupabaseClients(dryRun = false): Promise<Map<string, { id: string; email: string; marketing_status?: string }>> {
+  const result = new Map<string, { id: string; email: string; marketing_status?: string }>();
   
-  console.log('📥 Fetching all Supabase clients...');
-  
-  const { data, error } = await supabase
-    .from('clients')
-    .select('id, email');
-
-  if (error) {
-    console.error('❌ Supabase clients fetch error:', error);
-    throw error;
+  if (dryRun) {
+    console.log('[DRY-RUN] Would fetch all Supabase clients');
+    return result;
   }
+  
+  console.log('📥 Fetching all Supabase clients (batched)...');
+  
+  let lastId = '00000000-0000-0000-0000-000000000000';
+  const batchSize = 1000;
+  let batchNum = 0;
+  
+  while (true) {
+    const { data, error } = await supabase
+      .from('clients')
+      .select('id, email, marketing_status')
+      .gt('id', lastId)
+      .order('id')
+      .limit(batchSize);
 
-  for (const client of data || []) {
-    const email = client.email?.toLowerCase();
-    if (email) {
-      result.set(email, client);
+    if (error) {
+      console.error('❌ Supabase clients fetch error:', error);
+      throw error;
     }
+
+    if (!data || data.length === 0) break;
+
+    for (const client of data) {
+      const email = normalizeEmail(client.email || '');
+      if (email) {
+        result.set(email, { 
+          id: client.id, 
+          email,
+          marketing_status: client.marketing_status || undefined
+        });
+      }
+    }
+
+    lastId = data[data.length - 1].id;
+    batchNum++;
+    console.log(`  Batch ${batchNum}: fetched ${data.length} clients (total: ${result.size})`);
+    
+    if (data.length < batchSize) break;
   }
 
   console.log(`✅ Total Supabase clients: ${result.size}`);
   return result;
 }
 
+// ============================================================================
+// Phase 2.4: Create Client with Duplicate Detection
+// ============================================================================
+
 /**
  * Create a new client in Supabase from MailerLite data
+ * Phase 1.3: Duplicate email detection
+ * Phase 1.2: Store marketing_status
  */
-async function createClientFromMailerLite(mlSub: MailerLiteSubscriber): Promise<string | null> {
-  const email = mlSub.email.toLowerCase();
+async function createClientFromMailerLite(mlSub: MailerLiteSubscriber, dryRun = false): Promise<string | null> {
+  const email = normalizeEmail(mlSub.email);
+  
+  if (dryRun) {
+    console.log(`[DRY-RUN] Would create client: ${email}`);
+    return 'dry-run-client-id';
+  }
   
   console.log(`➕ Creating new client from MailerLite: ${email}`);
+
+  // Phase 2.4: Check if client already exists (conflict detection)
+  const { data: existing, error: checkErr } = await supabase
+    .from('clients')
+    .select('id, email')
+    .eq('email', email)
+    .maybeSingle();
+
+  if (checkErr) {
+    console.error(`❌ Error checking for existing client ${email}:`, checkErr);
+    return null;
+  }
+
+  if (existing) {
+    console.log(`⚠️ Client ${email} already exists (id: ${existing.id}), updating crosswalk instead`);
+    await updateCrosswalkB(email, mlSub.id, dryRun);
+    return existing.id;
+  }
 
   // Extract fields from MailerLite
   const firstName = mlSub.fields?.name || null;
@@ -192,31 +358,46 @@ async function createClientFromMailerLite(mlSub: MailerLiteSubscriber): Promise<
   const city = mlSub.fields?.city || null;
   const country = mlSub.fields?.country || null;
   const phone = mlSub.fields?.phone || null;
+  const marketingStatus = isProtectedStatus(mlSub.status) ? mlSub.status : 'active';
 
-  // Insert into clients table
+  // Phase 3.3: UPSERT to handle duplicates gracefully
   const { data, error } = await supabase
     .from('clients')
-    .insert({
+    .upsert({
       email,
       first_name: firstName,
       last_name: lastName,
       city,
       country,
       phone,
+      marketing_status: marketingStatus,
+    }, { 
+      onConflict: 'email',
+      ignoreDuplicates: false 
     })
     .select('id')
     .single();
 
   if (error) {
-    console.error(`❌ Error creating client ${email}:`, error);
+    console.error(`❌ Error creating/updating client ${email}:`, error);
+    
+    // Log conflict
+    await supabase.from('sync_conflicts').insert({
+      email,
+      field: 'email',
+      a_value: email,
+      b_value: email,
+      status: 'pending'
+    });
+    
     return null;
   }
 
   const clientId = data.id;
-  console.log(`✅ Created client ${email} with id ${clientId}`);
+  console.log(`✅ Created/updated client ${email} with id ${clientId}`);
 
-  // Create or update crosswalk with b_id
-  await updateCrosswalkB(email, mlSub.id);
+  // Update crosswalk with b_id
+  await updateCrosswalkB(email, mlSub.id, dryRun);
 
   return clientId;
 }
@@ -234,6 +415,8 @@ async function insertLog(row: {
   old_value?: string | null;
   new_value?: string | null;
   dedupe_key?: string | null;
+  status_code?: number | null;
+  error_type?: string | null;
 }) {
   const { error } = await supabase.from("sync_log").insert(row);
   if (error) console.error("Log insert error:", error);
@@ -243,7 +426,7 @@ async function getShadow(email: string): Promise<FlatRecord | null> {
   const { data, error } = await supabase
     .from("sync_shadow")
     .select("snapshot")
-    .eq("email", email)
+    .eq("email", normalizeEmail(email))
     .maybeSingle();
   
   if (error) {
@@ -253,10 +436,19 @@ async function getShadow(email: string): Promise<FlatRecord | null> {
   return data?.snapshot as FlatRecord | null;
 }
 
-async function putShadow(email: string, snapshot: FlatRecord) {
+async function putShadow(email: string, snapshot: FlatRecord, dryRun = false) {
+  if (dryRun) {
+    console.log(`[DRY-RUN] Would update shadow for: ${email}`);
+    return;
+  }
+
   const { error } = await supabase
     .from("sync_shadow")
-    .upsert({ email, snapshot, updated_at: new Date().toISOString() }, { onConflict: "email" });
+    .upsert({ 
+      email: normalizeEmail(email), 
+      snapshot, 
+      updated_at: new Date().toISOString() 
+    }, { onConflict: "email" });
   
   if (error) console.error("Shadow upsert error:", error);
 }
@@ -280,7 +472,7 @@ async function ensureCrosswalk(email: string): Promise<{ a_id: string | null; b_
   const { data, error } = await supabase
     .from("integration_crosswalk")
     .select("a_id, b_id")
-    .eq("email", email)
+    .eq("email", normalizeEmail(email))
     .maybeSingle();
   
   if (error) {
@@ -289,7 +481,7 @@ async function ensureCrosswalk(email: string): Promise<{ a_id: string | null; b_
   }
   
   if (!data) {
-    const { error: insErr } = await supabase.from("integration_crosswalk").insert({ email });
+    const { error: insErr } = await supabase.from("integration_crosswalk").insert({ email: normalizeEmail(email) });
     if (insErr) console.error("Crosswalk insert error:", insErr);
     return { a_id: null, b_id: null };
   }
@@ -297,10 +489,19 @@ async function ensureCrosswalk(email: string): Promise<{ a_id: string | null; b_
   return { a_id: data.a_id ?? null, b_id: data.b_id ?? null };
 }
 
-async function updateCrosswalkB(email: string, b_id: string) {
+async function updateCrosswalkB(email: string, b_id: string, dryRun = false) {
+  if (dryRun) {
+    console.log(`[DRY-RUN] Would update crosswalk: ${email} -> ${b_id}`);
+    return;
+  }
+
   const { error } = await supabase
     .from("integration_crosswalk")
-    .upsert({ email, b_id, updated_at: new Date().toISOString() }, { onConflict: "email" });
+    .upsert({ 
+      email: normalizeEmail(email), 
+      b_id, 
+      updated_at: new Date().toISOString() 
+    }, { onConflict: "email" });
   
   if (error) console.error("Crosswalk update error:", error);
 }
@@ -313,7 +514,7 @@ async function flatFromA(email: string): Promise<FlatRecord | null> {
   const { data, error } = await supabase
     .from("v_clients_for_ml")
     .select("*")
-    .eq("email", email)
+    .eq("email", normalizeEmail(email))
     .maybeSingle();
   
   if (error) {
@@ -324,7 +525,7 @@ async function flatFromA(email: string): Promise<FlatRecord | null> {
   if (!data) return null;
   
   return {
-    email: data.email,
+    email: normalizeEmail(data.email),
     first_name: data.first_name ?? "",
     last_name: data.last_name ?? "",
     city: data.city ?? "",
@@ -334,7 +535,9 @@ async function flatFromA(email: string): Promise<FlatRecord | null> {
   };
 }
 
-async function flatFromBById(b_id: string): Promise<FlatRecord | null> {
+async function flatFromBById(b_id: string, dryRun = false): Promise<FlatRecord | null> {
+  if (dryRun) return null;
+
   try {
     const res = await fetch(`${ML_BASE}/subscribers/${b_id}`, {
       method: "GET",
@@ -355,7 +558,7 @@ async function flatFromBById(b_id: string): Promise<FlatRecord | null> {
     const country = sub.location?.country ?? sub.country ?? sub.fields?.country ?? sub.fields?.Country ?? "";
 
     return {
-      email: sub.email ?? "",
+      email: normalizeEmail(sub.email ?? ""),
       first_name: sub.fields?.name ?? sub.name ?? sub.fields?.first_name ?? "",
       last_name: sub.fields?.last_name ?? sub.fields?.surname ?? "",
       city: city ?? "",
@@ -370,10 +573,33 @@ async function flatFromBById(b_id: string): Promise<FlatRecord | null> {
 }
 
 // ============================================================================
-// MailerLite operations
+// Phase 1.2: MailerLite operations with unsubscribed protection
 // ============================================================================
 
-async function upsertBNeverBlank(flat: FlatRecord, existing_b_id: string | null): Promise<string | null> {
+async function upsertBNeverBlank(flat: FlatRecord, existing_b_id: string | null, dryRun = false): Promise<string | null> {
+  // Phase 1.2: Check if subscriber is unsubscribed/bounced
+  if (existing_b_id) {
+    const mlStatus = await getMailerLiteStatus(existing_b_id, dryRun);
+    if (mlStatus && isProtectedStatus(mlStatus)) {
+      console.log(`⚠️ Skipping ML update for ${flat.email} - status: ${mlStatus}`);
+      
+      // Update Supabase marketing_status instead
+      if (!dryRun) {
+        await supabase
+          .from('clients')
+          .update({ marketing_status: mlStatus })
+          .eq('email', normalizeEmail(flat.email));
+      }
+      
+      return existing_b_id; // Return existing ID without updating ML
+    }
+  }
+
+  if (dryRun) {
+    console.log(`[DRY-RUN] Would upsert to MailerLite: ${flat.email}`);
+    return existing_b_id || 'dry-run-b-id';
+  }
+
   const base = pickNonEmpty(flat, ["first_name", "last_name", "city", "phone", "country"]);
   const asMl: Record<string, string> = {
     ...(base.first_name ? { name: base.first_name } : {}),
@@ -438,8 +664,18 @@ async function upsertBNeverBlank(flat: FlatRecord, existing_b_id: string | null)
   }
 }
 
-async function setGroupsBExact(b_id: string, desiredNames: string[]) {
+/**
+ * Phase 2.2: Set groups exactly, but only remove managed groups
+ */
+async function setGroupsBExact(b_id: string, desiredNames: string[], dryRun = false) {
+  if (dryRun) {
+    console.log(`[DRY-RUN] Would sync groups for subscriber ${b_id}: ${desiredNames.join(', ')}`);
+    return;
+  }
+
   try {
+    const managedGroups = await getManagedGroups();
+
     // Fetch all groups
     const listRes = await retryFetch(`${ML_BASE}/groups`, {
       method: "GET",
@@ -468,13 +704,16 @@ async function setGroupsBExact(b_id: string, desiredNames: string[]) {
       }
     }
 
-    // Remove extra groups (A is leading)
+    // Phase 2.2: Remove extra groups ONLY if they're in managed list
     for (const gid of curIds) {
-      if (!desiredIds.has(gid)) {
+      if (!desiredIds.has(gid) && managedGroups.has(gid)) {
+        console.log(`  Removing managed group ${gid} from subscriber ${b_id}`);
         await retryFetch(`${ML_BASE}/groups/${gid}/subscribers/${b_id}`, {
           method: "DELETE",
           headers: { Authorization: `Bearer ${ML_KEY}`, "Content-Type": "application/json" }
         });
+      } else if (!desiredIds.has(gid)) {
+        console.log(`  ⚠️ Keeping unmanaged group ${gid} for subscriber ${b_id}`);
       }
     }
   } catch (e) {
@@ -486,7 +725,8 @@ async function setGroupsBExact(b_id: string, desiredNames: string[]) {
 // Sync processors
 // ============================================================================
 
-async function processAtoB(email: string): Promise<any> {
+async function processAtoB(email: string, dryRun = false): Promise<any> {
+  email = normalizeEmail(email);
   const flatA = await flatFromA(email);
   if (!flatA) return { email, skipped: true, reason: "not-in-A" };
 
@@ -502,7 +742,7 @@ async function processAtoB(email: string): Promise<any> {
 
   let mergedForB = flatA;
   if (b_id) {
-    const currentB = await flatFromBById(b_id);
+    const currentB = await flatFromBById(b_id, dryRun);
     mergedForB = {
       ...currentB,
       email: flatA.email,
@@ -524,54 +764,62 @@ async function processAtoB(email: string): Promise<any> {
     };
   }
 
-  const dedupeKey = crypto.randomUUID();
+  // Phase 1.1: Deterministic dedupe key
+  const dedupeKey = await generateDedupeKey(email, 'AtoB', mergedForB);
   
   // Idempotency check
   if (await alreadyDone(dedupeKey)) {
     return { email, b_id, changed: false };
   }
 
-  const new_bid = await upsertBNeverBlank(mergedForB, b_id);
+  const new_bid = await upsertBNeverBlank(mergedForB, b_id, dryRun);
   if (!new_bid) {
     await insertLog({
       email,
       direction: "A→B",
       action: "error",
       result: "mailerlite-upsert-failed",
-      dedupe_key: dedupeKey
+      dedupe_key: dedupeKey,
+      error_type: 'ml_api_error'
     });
     return { email, error: "mailerlite-upsert-failed" };
   }
 
-  if (!b_id || new_bid !== b_id) await updateCrosswalkB(email, new_bid);
+  if (!b_id || new_bid !== b_id) await updateCrosswalkB(email, new_bid, dryRun);
 
   // Groups exact sync (only if changed)
-  const bNow = await flatFromBById(new_bid);
+  const bNow = await flatFromBById(new_bid, dryRun);
   const groupsChanged = JSON.stringify((bNow?.groups ?? []).sort()) !== JSON.stringify((flatA.groups ?? []).sort());
-  if (groupsChanged) await setGroupsBExact(new_bid, flatA.groups);
+  if (groupsChanged) await setGroupsBExact(new_bid, flatA.groups, dryRun);
 
-  // Shadow = merged with groups from A
-  await putShadow(email, { ...mergedForB, groups: flatA.groups });
+  // Phase 2.3: Shadow update ONLY after successful ML update
+  await putShadow(email, { ...mergedForB, groups: flatA.groups }, dryRun);
 
-  await insertLog({
-    email,
-    direction: "A→B",
-    action: b_id ? "update" : "create",
-    result: "ok",
-    field: b_id ? "merged-nonblank" : "create-nonblank",
-    old_value: b_id ? jsonCompact(pickNonEmpty(bNow ?? {}, ["first_name", "last_name", "city", "phone", "country"])) : null,
-    new_value: jsonCompact(pickNonEmpty(mergedForB, ["first_name", "last_name", "city", "phone", "country"])),
-    dedupe_key: dedupeKey
-  });
+  if (!dryRun) {
+    const oldVal = b_id && bNow ? pickNonEmpty(bNow, ["first_name", "last_name", "city", "phone", "country"] as (keyof FlatRecord)[]) : {};
+    const newVal = pickNonEmpty(mergedForB, ["first_name", "last_name", "city", "phone", "country"] as (keyof FlatRecord)[]);
+    
+    await insertLog({
+      email,
+      direction: "A→B",
+      action: b_id ? "update" : "create",
+      result: "ok",
+      field: b_id ? "merged-nonblank" : "create-nonblank",
+      old_value: b_id ? jsonCompact(oldVal) : null,
+      new_value: jsonCompact(newVal),
+      dedupe_key: dedupeKey
+    });
+  }
 
   return { email, b_id: new_bid, changed: true };
 }
 
-async function processBtoA(email: string, repair = false): Promise<any> {
+async function processBtoA(email: string, repair = false, dryRun = false): Promise<any> {
+  email = normalizeEmail(email);
   const { b_id } = await ensureCrosswalk(email);
   if (!b_id) return { email, skipped: true, reason: "no-b-id" };
 
-  const flatB = await flatFromBById(b_id);
+  const flatB = await flatFromBById(b_id, dryRun);
   if (!flatB) return { email, skipped: true, reason: "missing-in-B" };
 
   const { data: aRow, error: aErr } = await supabase
@@ -602,7 +850,7 @@ async function processBtoA(email: string, repair = false): Promise<any> {
   }
 
   // Log conflicts
-  if (conflictFields.length > 0) {
+  if (conflictFields.length > 0 && !dryRun) {
     await supabase.from("sync_conflicts").insert(
       conflictFields.map(field => ({
         email,
@@ -644,162 +892,221 @@ async function processBtoA(email: string, repair = false): Promise<any> {
   }
 
   if (Object.keys(candidate).length > 0) {
-    const key = crypto.randomUUID();
+    const key = await generateDedupeKey(email, 'BtoA', candidate);
     
     // Idempotency check
     if (!(await alreadyDone(key))) {
-      const { error } = await supabase.from("clients").update(candidate).eq("email", email);
-      if (error) throw error;
+      if (!dryRun) {
+        const { error } = await supabase.from("clients").update(candidate).eq("email", email);
+        if (error) throw error;
 
+        await insertLog({
+          email,
+          direction: "B→A",
+          action: repair ? "repair-update" : "update",
+          result: "ok",
+          field: Object.keys(candidate).join(","),
+          old_value: jsonCompact(Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, (v as any).old]))),
+          new_value: jsonCompact(Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, (v as any).new]))),
+          dedupe_key: key
+        });
+      }
+    }
+  } else {
+    if (!dryRun) {
       await insertLog({
         email,
         direction: "B→A",
-        action: repair ? "repair-update" : "update",
+        action: repair ? "repair-noop" : "noop",
         result: "ok",
-        field: Object.keys(candidate).join(","),
-        old_value: jsonCompact(Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, (v as any).old]))),
-        new_value: jsonCompact(Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, (v as any).new]))),
-        dedupe_key: key
+        dedupe_key: await generateDedupeKey(email, 'BtoA-noop', {})
       });
     }
-  } else {
-    await insertLog({
-      email,
-      direction: "B→A",
-      action: repair ? "repair-noop" : "noop",
-      result: "ok",
-      dedupe_key: crypto.randomUUID()
-    });
   }
 
-  // Shadow rebuild: always from fresh flatFromA + groups from B
+  // Phase 2.3: Shadow rebuild only after successful update
   const aAfter = await flatFromA(email);
   const newShadow: FlatRecord = {
     ...(aAfter ?? { email, first_name: "", last_name: "", city: "", phone: "", country: "", groups: [] }),
     groups: flatB.groups
   };
-  await putShadow(email, newShadow);
+  await putShadow(email, newShadow, dryRun);
 
   return { email, changed: Object.keys(candidate).length > 0, repair };
 }
 
 // ============================================================================
-// Full Sync Orchestration (3-way matching)
+// Phase 3.1 & 3.2: Full Sync with dry-run and enhanced logging
 // ============================================================================
 
-async function runFullSync(): Promise<any> {
-  console.log('🔄 Starting FULL bidirectional sync...');
+async function runFullSync(dryRun = false): Promise<any> {
+  console.log(`🔄 Starting FULL bidirectional sync${dryRun ? ' (DRY-RUN)' : ''}...`);
 
-  // 1. Fetch all from both systems
-  const [mlSubscribers, sbClients] = await Promise.all([
-    getAllMailerLiteSubscribers(),
-    getAllSupabaseClients(),
-  ]);
+  // Create sync run record
+  const runId = dryRun ? null : (await supabase
+    .from('sync_runs')
+    .insert({
+      mode: 'full',
+      dry_run: dryRun,
+      status: 'running'
+    })
+    .select('id')
+    .single()).data?.id;
 
-  const mlEmails = new Set(mlSubscribers.keys());
-  const sbEmails = new Set(sbClients.keys());
+  const startTime = Date.now();
+  
+  try {
+    // 1. Fetch all from both systems
+    const [mlSubscribers, sbClients] = await Promise.all([
+      getAllMailerLiteSubscribers(dryRun),
+      getAllSupabaseClients(dryRun),
+    ]);
 
-  // 2. Calculate sets
-  const onlyInML: string[] = [];
-  const onlyInSB: string[] = [];
-  const inBoth: string[] = [];
+    const mlEmails = new Set(mlSubscribers.keys());
+    const sbEmails = new Set(sbClients.keys());
 
-  for (const email of mlEmails) {
-    if (sbEmails.has(email)) {
-      inBoth.push(email);
-    } else {
-      onlyInML.push(email);
+    // 2. Calculate sets
+    const onlyInML: string[] = [];
+    const onlyInSB: string[] = [];
+    const inBoth: string[] = [];
+
+    for (const email of mlEmails) {
+      if (sbEmails.has(email)) {
+        inBoth.push(email);
+      } else {
+        onlyInML.push(email);
+      }
     }
+
+    for (const email of sbEmails) {
+      if (!mlEmails.has(email)) {
+        onlyInSB.push(email);
+      }
+    }
+
+    console.log(`\n📊 Sync Overview:`);
+    console.log(`  - Only in MailerLite: ${onlyInML.length}`);
+    console.log(`  - Only in Supabase: ${onlyInSB.length}`);
+    console.log(`  - In Both: ${inBoth.length}\n`);
+
+    const results = {
+      onlyInML: [] as any[],
+      onlyInSB: [] as any[],
+      inBoth: [] as any[],
+      stats: {
+        mlTotal: mlSubscribers.size,
+        sbTotal: sbClients.size,
+        onlyML: onlyInML.length,
+        onlySB: onlyInSB.length,
+        both: inBoth.length,
+        created: 0,
+        updated: 0,
+        skipped: 0,
+        errors: 0,
+        conflicts: 0
+      }
+    };
+
+    // 3. Process: Only in MailerLite → Create in Supabase
+    console.log(`\n🔵 Processing ${onlyInML.length} contacts only in MailerLite...`);
+    for (const email of onlyInML) {
+      try {
+        const mlSub = mlSubscribers.get(email)!;
+        const clientId = await createClientFromMailerLite(mlSub, dryRun);
+        results.onlyInML.push({ 
+          email, 
+          status: clientId ? 'created' : 'failed',
+          clientId 
+        });
+        if (clientId) results.stats.created++;
+        else results.stats.errors++;
+      } catch (err: any) {
+        console.error(`❌ Error creating client for ${email}:`, err.message);
+        results.onlyInML.push({ email, status: 'error', error: err.message });
+        results.stats.errors++;
+      }
+    }
+
+    // 4. Process: Only in Supabase → Create in MailerLite
+    console.log(`\n🟢 Processing ${onlyInSB.length} contacts only in Supabase...`);
+    for (const email of onlyInSB) {
+      try {
+        const outcome = await processAtoB(email, dryRun);
+        results.onlyInSB.push({ email, status: 'synced', ...outcome });
+        if (outcome.changed) results.stats.created++;
+        else if (outcome.skipped) results.stats.skipped++;
+      } catch (err: any) {
+        console.error(`❌ Error syncing ${email} to MailerLite:`, err.message);
+        results.onlyInSB.push({ email, status: 'error', error: err.message });
+        results.stats.errors++;
+      }
+    }
+
+    // 5. Process: In Both → Bidirectional sync
+    console.log(`\n🟡 Processing ${inBoth.length} contacts in both systems...`);
+    for (const email of inBoth) {
+      try {
+        const [aResult, bResult] = await Promise.all([
+          processAtoB(email, dryRun),
+          processBtoA(email, false, dryRun),
+        ]);
+        results.inBoth.push({ 
+          email, 
+          status: 'synced', 
+          AtoB: aResult, 
+          BtoA: bResult 
+        });
+        if (aResult.changed || bResult.changed) results.stats.updated++;
+        else results.stats.skipped++;
+      } catch (err: any) {
+        console.error(`❌ Error syncing ${email}:`, err.message);
+        results.inBoth.push({ email, status: 'error', error: err.message });
+        results.stats.errors++;
+      }
+    }
+
+    const duration = Date.now() - startTime;
+    console.log(`\n✅ Full sync completed in ${(duration / 1000).toFixed(2)}s`);
+
+    // Update sync run record
+    if (!dryRun && runId) {
+      await supabase.from('sync_runs').update({
+        completed_at: new Date().toISOString(),
+        status: results.stats.errors > 0 ? 'partial' : 'completed',
+        emails_processed: mlEmails.size + sbEmails.size,
+        records_created: results.stats.created,
+        records_updated: results.stats.updated,
+        records_skipped: results.stats.skipped,
+        errors_count: results.stats.errors,
+        conflicts_detected: results.stats.conflicts,
+        summary: results.stats
+      }).eq('id', runId);
+    }
+
+    return results;
+  } catch (err: any) {
+    if (!dryRun && runId) {
+      await supabase.from('sync_runs').update({
+        completed_at: new Date().toISOString(),
+        status: 'failed',
+        error_details: { message: err.message, stack: err.stack }
+      }).eq('id', runId);
+    }
+    throw err;
   }
-
-  for (const email of sbEmails) {
-    if (!mlEmails.has(email)) {
-      onlyInSB.push(email);
-    }
-  }
-
-  console.log(`\n📊 Sync Overview:`);
-  console.log(`  - Only in MailerLite: ${onlyInML.length}`);
-  console.log(`  - Only in Supabase: ${onlyInSB.length}`);
-  console.log(`  - In Both: ${inBoth.length}\n`);
-
-  const results = {
-    onlyInML: [] as any[],
-    onlyInSB: [] as any[],
-    inBoth: [] as any[],
-    stats: {
-      mlTotal: mlSubscribers.size,
-      sbTotal: sbClients.size,
-      onlyML: onlyInML.length,
-      onlySB: onlyInSB.length,
-      both: inBoth.length,
-    }
-  };
-
-  // 3. Process: Only in MailerLite → Create in Supabase
-  console.log(`\n🔵 Processing ${onlyInML.length} contacts only in MailerLite...`);
-  for (const email of onlyInML) {
-    try {
-      const mlSub = mlSubscribers.get(email)!;
-      const clientId = await createClientFromMailerLite(mlSub);
-      results.onlyInML.push({ 
-        email, 
-        status: clientId ? 'created' : 'failed',
-        clientId 
-      });
-    } catch (err: any) {
-      console.error(`❌ Error creating client for ${email}:`, err.message);
-      results.onlyInML.push({ email, status: 'error', error: err.message });
-    }
-  }
-
-  // 4. Process: Only in Supabase → Create in MailerLite
-  console.log(`\n🟢 Processing ${onlyInSB.length} contacts only in Supabase...`);
-  for (const email of onlyInSB) {
-    try {
-      const outcome = await processAtoB(email);
-      results.onlyInSB.push({ email, status: 'synced', ...outcome });
-    } catch (err: any) {
-      console.error(`❌ Error syncing ${email} to MailerLite:`, err.message);
-      results.onlyInSB.push({ email, status: 'error', error: err.message });
-    }
-  }
-
-  // 5. Process: In Both → Bidirectional sync
-  console.log(`\n🟡 Processing ${inBoth.length} contacts in both systems...`);
-  for (const email of inBoth) {
-    try {
-      const [aResult, bResult] = await Promise.all([
-        processAtoB(email),
-        processBtoA(email, false),
-      ]);
-      results.inBoth.push({ 
-        email, 
-        status: 'synced', 
-        AtoB: aResult, 
-        BtoA: bResult 
-      });
-    } catch (err: any) {
-      console.error(`❌ Error syncing ${email}:`, err.message);
-      results.inBoth.push({ email, status: 'error', error: err.message });
-    }
-  }
-
-  console.log('\n✅ Full sync completed!');
-  return results;
 }
 
 // ============================================================================
-// Run orchestrator (Legacy modes)
+// Run orchestrator
 // ============================================================================
 
-async function run(mode: SyncMode, emails?: string[], repair = false): Promise<any[]> {
+async function run(mode: SyncMode, emails?: string[], repair = false, dryRun = false): Promise<any[]> {
   // If mode is 'full', use the new full sync
   if (mode === 'full') {
-    return await runFullSync();
+    return await runFullSync(dryRun);
   }
 
-  let targets = emails && emails.length > 0 ? emails : [];
+  let targets = emails && emails.length > 0 ? emails.map(normalizeEmail) : [];
   
   if (targets.length === 0) {
     const { data, error } = await supabase
@@ -813,7 +1120,7 @@ async function run(mode: SyncMode, emails?: string[], repair = false): Promise<a
       return [];
     }
     
-    targets = (data ?? []).map(r => r.email).filter(Boolean);
+    targets = (data ?? []).map(r => normalizeEmail(r.email)).filter(Boolean);
   }
 
   const results: any[] = [];
@@ -821,22 +1128,25 @@ async function run(mode: SyncMode, emails?: string[], repair = false): Promise<a
   for (const email of targets) {
     try {
       if (mode === "AtoB") {
-        results.push(await processAtoB(email));
+        results.push(await processAtoB(email, dryRun));
       } else if (mode === "BtoA") {
-        results.push(await processBtoA(email, repair));
+        results.push(await processBtoA(email, repair, dryRun));
       } else {
-        const r1 = await processBtoA(email, repair);
-        const r2 = await processAtoB(email);
+        const r1 = await processBtoA(email, repair, dryRun);
+        const r2 = await processAtoB(email, dryRun);
         results.push({ email, r1, r2 });
       }
     } catch (e) {
-      await insertLog({
-        email,
-        direction: mode === "AtoB" ? "A→B" : "B→A",
-        action: "error",
-        result: String(e),
-        dedupe_key: crypto.randomUUID()
-      });
+      if (!dryRun) {
+        await insertLog({
+          email,
+          direction: mode === "AtoB" ? "A→B" : "B→A",
+          action: "error",
+          result: String(e),
+          dedupe_key: await generateDedupeKey(email, 'error', {}),
+          error_type: 'sync_error'
+        });
+      }
       results.push({ email, error: String(e) });
     }
     
@@ -856,7 +1166,12 @@ serve(async (req) => {
   }
 
   try {
-    const { mode = "AtoB", emails = [], repair = false } = await req.json().catch(() => ({}));
+    const { 
+      mode = "AtoB", 
+      emails = [], 
+      repair = false,
+      dryRun = false // Phase 3.1: Dry-run mode
+    } = await req.json().catch(() => ({}));
     
     if (!["AtoB", "BtoA", "bidirectional", "full"].includes(mode)) {
       return new Response(
@@ -865,14 +1180,20 @@ serve(async (req) => {
       );
     }
 
-    console.log(`\n🚀 Smart Sync Request: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}`);
+    console.log(`\n🚀 Smart Sync Request: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}, dryRun=${dryRun}`);
     
-    const out = await run(mode as SyncMode, emails, repair);
+    const out = await run(mode as SyncMode, emails, repair, dryRun);
     
     console.log(`\n✅ Completed smart-sync: processed ${Array.isArray(out) ? out.length : 'full sync'} records`);
     
     return new Response(
-      JSON.stringify({ ok: true, mode, count: Array.isArray(out) ? out.length : null, out }),
+      JSON.stringify({ 
+        ok: true, 
+        mode, 
+        dryRun,
+        count: Array.isArray(out) ? out.length : null, 
+        out 
+      }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (e) {
