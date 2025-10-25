@@ -73,8 +73,8 @@ Deno.serve(async (req) => {
             continue
           }
 
-            // Lookup in MailerLite by email
-            const lookupUrl = `https://connect.mailerlite.com/api/subscribers?filter[email]=${encodeURIComponent(email.toLowerCase().trim())}`
+            // Lookup in MailerLite by email (using correct API format)
+            const lookupUrl = `https://connect.mailerlite.com/api/subscribers/${encodeURIComponent(email.toLowerCase().trim())}`
             const mlResponse = await fetch(lookupUrl, {
               method: 'GET',
               headers: {
@@ -87,6 +87,10 @@ Deno.serve(async (req) => {
             await sleep(delayMs)
 
             if (!mlResponse.ok) {
+              // Log response body for better debugging
+              const errorBody = await mlResponse.text()
+              console.error(`MailerLite API error ${mlResponse.status} for ${email}:`, errorBody)
+              
               // Handle rate limiting with exponential backoff
               if (mlResponse.status === 429) {
                 console.log(`⚠️ Rate limited for ${email}, waiting 10s...`)
@@ -94,6 +98,14 @@ Deno.serve(async (req) => {
                 result.errors++
                 continue
               }
+              
+              // Handle 404 (subscriber not found in MailerLite)
+              if (mlResponse.status === 404) {
+                console.log(`⚠️ Email ${email} not found in MailerLite (404)`)
+                result.errors++
+                continue
+              }
+              
               console.log(`MailerLite lookup failed for ${email}: ${mlResponse.status}`)
               result.errors++
               continue
