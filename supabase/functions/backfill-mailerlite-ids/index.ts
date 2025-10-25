@@ -73,8 +73,8 @@ Deno.serve(async (req) => {
             continue
           }
 
-            // Lookup in MailerLite by email using filter endpoint (new API format)
-            const lookupUrl = `https://connect.mailerlite.com/api/subscribers?filter[email]=${encodeURIComponent(email.toLowerCase().trim())}`
+            // Lookup in MailerLite by email (direct subscriber endpoint)
+            const lookupUrl = `https://connect.mailerlite.com/api/subscribers/${encodeURIComponent(email.toLowerCase().trim())}`
             const mlResponse = await fetch(lookupUrl, {
               method: 'GET',
               headers: {
@@ -86,30 +86,32 @@ Deno.serve(async (req) => {
             // Rate limit: wait before next request
             await sleep(delayMs)
 
+            // Handle rate limiting
+            if (mlResponse.status === 429) {
+              console.log(`⚠️ Rate limited for ${email}, waiting 10s...`)
+              await sleep(10000)
+              result.errors++
+              continue
+            }
+            
+            // Handle 404 (subscriber not found in MailerLite - this is normal)
+            if (mlResponse.status === 404) {
+              console.log(`⚠️ Email ${email} not found in MailerLite`)
+              continue // Not an error, just not in MailerLite
+            }
+            
+            // Handle other errors
             if (!mlResponse.ok) {
               const errorBody = await mlResponse.text()
               console.error(`MailerLite API error ${mlResponse.status} for ${email}:`, errorBody)
-              
-              // Handle rate limiting with exponential backoff
-              if (mlResponse.status === 429) {
-                console.log(`⚠️ Rate limited for ${email}, waiting 10s...`)
-                await sleep(10000)
-                result.errors++
-                continue
-              }
-              
-              console.log(`MailerLite lookup failed for ${email}: ${mlResponse.status}`)
               result.errors++
               continue
             }
 
             const mlData = await mlResponse.json()
-            
-            // Filter endpoint returns { data: [...] } - empty array if not found
-            if (mlData.data && mlData.data.length > 0) {
-              const subscriber = mlData.data[0]
-              const mailerLiteId = subscriber.id
+            const mailerLiteId = mlData.data?.id
 
+            if (mailerLiteId) {
               // Update crosswalk with found b_id
               const { error: updateError } = await supabase
                 .from('integration_crosswalk')
@@ -123,9 +125,6 @@ Deno.serve(async (req) => {
                 result.recordsUpdated++
                 console.log(`✅ Updated crosswalk ${email} → ML ID ${mailerLiteId}`)
               }
-            } else {
-              // Empty data array means email not in MailerLite
-              console.log(`⚠️ Email ${email} not in MailerLite (empty data array)`)
             }
 
           } catch (error) {
