@@ -35,7 +35,7 @@ Deno.serve(async (req) => {
 
     let offset = 0
     const limit = 100 // Process max 100 records per run (takes ~2 min with rate limiting)
-    const delayMs = 500 // 500ms delay = 2 requests/sec (within MailerLite limits)
+    const delayMs = 1000 // 1000ms delay = 1 request/sec (safely within MailerLite limits)
     
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -73,8 +73,8 @@ Deno.serve(async (req) => {
             continue
           }
 
-            // Lookup in MailerLite by email (using correct API format)
-            const lookupUrl = `https://connect.mailerlite.com/api/subscribers/${encodeURIComponent(email.toLowerCase().trim())}`
+            // Lookup in MailerLite by email using filter endpoint (new API format)
+            const lookupUrl = `https://connect.mailerlite.com/api/subscribers?filter[email]=${encodeURIComponent(email.toLowerCase().trim())}`
             const mlResponse = await fetch(lookupUrl, {
               method: 'GET',
               headers: {
@@ -87,7 +87,6 @@ Deno.serve(async (req) => {
             await sleep(delayMs)
 
             if (!mlResponse.ok) {
-              // Log response body for better debugging
               const errorBody = await mlResponse.text()
               console.error(`MailerLite API error ${mlResponse.status} for ${email}:`, errorBody)
               
@@ -99,13 +98,6 @@ Deno.serve(async (req) => {
                 continue
               }
               
-              // Handle 404 (subscriber not found in MailerLite)
-              if (mlResponse.status === 404) {
-                console.log(`⚠️ Email ${email} not found in MailerLite (404)`)
-                result.errors++
-                continue
-              }
-              
               console.log(`MailerLite lookup failed for ${email}: ${mlResponse.status}`)
               result.errors++
               continue
@@ -113,6 +105,7 @@ Deno.serve(async (req) => {
 
             const mlData = await mlResponse.json()
             
+            // Filter endpoint returns { data: [...] } - empty array if not found
             if (mlData.data && mlData.data.length > 0) {
               const subscriber = mlData.data[0]
               const mailerLiteId = subscriber.id
@@ -131,7 +124,8 @@ Deno.serve(async (req) => {
                 console.log(`✅ Updated crosswalk ${email} → ML ID ${mailerLiteId}`)
               }
             } else {
-              console.log(`⚠️ Email ${email} not found in MailerLite`)
+              // Empty data array means email not in MailerLite
+              console.log(`⚠️ Email ${email} not in MailerLite (empty data array)`)
             }
 
           } catch (error) {
