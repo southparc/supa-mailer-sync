@@ -107,22 +107,65 @@ export default function SmartSyncDashboard() {
     }
     
     try {
-      const { data, error } = await supabase.functions.invoke<SmartSyncResponse>("smart-sync", {
-        body: { mode: runMode, emails: payloadEmails, dryRun: isDryRun }
-      });
-      
-      if (error || !data?.ok) {
-        throw new Error(error?.message || data?.error || "Unknown error");
+      if (!isDryRun && payloadEmails.length > 200) {
+        const batchSize = 200;
+        const chunks: string[][] = [];
+        for (let i = 0; i < payloadEmails.length; i += batchSize) {
+          chunks.push(payloadEmails.slice(i, i + batchSize));
+        }
+
+        let totalCount = 0;
+        let allOut: any[] = [];
+
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const { data, error } = await supabase.functions.invoke<SmartSyncResponse>("smart-sync", {
+            body: { mode: runMode, emails: chunks[idx], dryRun: false }
+          });
+
+          if (error || !data?.ok) {
+            throw new Error(error?.message || data?.error || `Batch ${idx + 1} gefaald`);
+          }
+
+          totalCount += data.count;
+          allOut = allOut.concat(data.out || []);
+
+          toast({
+            title: `Batch ${idx + 1}/${chunks.length} voltooid`,
+            description: `${data.count} records verwerkt`,
+          });
+        }
+
+        const aggregated: SmartSyncResponse = {
+          ok: true,
+          mode: runMode,
+          count: totalCount,
+          out: allOut,
+        };
+
+        setResp(aggregated);
+
+        toast({
+          title: "Sync voltooid",
+          description: `${totalCount} records verwerkt in ${runMode} modus (in batches)`,
+        });
+      } else {
+        const { data, error } = await supabase.functions.invoke<SmartSyncResponse>("smart-sync", {
+          body: { mode: runMode, emails: payloadEmails, dryRun: isDryRun }
+        });
+        
+        if (error || !data?.ok) {
+          throw new Error(error?.message || data?.error || "Unknown error");
+        }
+        
+        setResp(data);
+        
+        toast({
+          title: isDryRun ? "Dry-run voltooid" : "Sync voltooid",
+          description: isDryRun 
+            ? `${data.count} records geanalyseerd (geen wijzigingen doorgevoerd)`
+            : `${data.count} records verwerkt in ${runMode} modus`,
+        });
       }
-      
-      setResp(data);
-      
-      toast({
-        title: isDryRun ? "Dry-run voltooid" : "Sync voltooid",
-        description: isDryRun 
-          ? `${data.count} records geanalyseerd (geen wijzigingen doorgevoerd)`
-          : `${data.count} records verwerkt in ${runMode} modus`,
-      });
     } catch (e: any) {
       const errorMsg = String(e?.message || e);
       const friendly = errorMsg.includes('Failed to send a request to the Edge Function') || errorMsg.includes('Failed to fetch')
