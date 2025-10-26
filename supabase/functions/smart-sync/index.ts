@@ -737,6 +737,17 @@ async function processAtoB(email: string, dryRun = false): Promise<any> {
 
   // True noop: skip if nothing changed and b_id exists
   if (!changed && b_id) {
+    // Verify that the referenced B subscriber actually exists; crosswalk can be stale
+    const existsB = await flatFromBById(b_id, dryRun);
+    if (!existsB) {
+      // Treat as missing in B: recreate and relink b_id
+      const new_bid = await upsertBNeverBlank(flatA, null, dryRun);
+      if (new_bid) {
+        if (!dryRun) await updateCrosswalkB(email, new_bid, false);
+        return { email, b_id: new_bid, changed: true, reason: 'recreated-in-B' };
+      }
+      return { email, skipped: true, reason: 'missing-in-B' };
+    }
     return { email, b_id, changed: false };
   }
 
