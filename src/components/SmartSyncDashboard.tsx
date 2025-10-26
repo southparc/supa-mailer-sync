@@ -24,6 +24,29 @@ type SmartSyncResponse = {
   error?: string;
 };
 
+// Normalize smart-sync output to a flat row shape for UI
+type FlatRow = { email: string; b_id?: string; changed?: boolean; skipped?: boolean; reason?: string; error?: string };
+
+function toFlat(row: any): FlatRow {
+  if (!row) return { email: "-" };
+  if ('changed' in row || 'skipped' in row || 'b_id' in row || 'reason' in row || 'error' in row) {
+    return row as FlatRow;
+  }
+  const r1: any = (row as any).r1 || {};
+  const r2: any = (row as any).r2 || {};
+  const email = (row as any).email || r1.email || r2.email || "-";
+  const error = (row as any).error || r1.error || r2.error;
+  const changed = Boolean(r1.changed || r2.changed);
+  const skipped = Boolean(!changed && (r1.skipped || r2.skipped));
+  const reason = (r1.reason || r2.reason) as string | undefined;
+  const b_id = (r2.b_id || r1.b_id || (row as any).b_id) as string | undefined;
+  return { email, b_id, changed, skipped, reason, error };
+}
+
+function normalizeOut(out: SmartSyncRow[]): FlatRow[] {
+  return (out || []).map((r: any) => toFlat(r));
+}
+
 function parseEmails(input: string): string[] {
   return Array.from(
     new Set(
@@ -135,14 +158,14 @@ export default function SmartSyncDashboard() {
           });
         }
 
-        const aggregated: SmartSyncResponse = {
-          ok: true,
-          mode: runMode,
-          count: totalCount,
-          out: allOut,
-        };
+const aggregated: SmartSyncResponse = {
+  ok: true,
+  mode: runMode,
+  count: totalCount,
+  out: normalizeOut(allOut as any),
+};
 
-        setResp(aggregated);
+setResp(aggregated);
 
         toast({
           title: "Sync voltooid",
@@ -157,7 +180,7 @@ export default function SmartSyncDashboard() {
           throw new Error(error?.message || data?.error || "Unknown error");
         }
         
-        setResp(data);
+setResp({ ...data, out: normalizeOut(data.out) });
         
         toast({
           title: isDryRun ? "Dry-run voltooid" : "Sync voltooid",
@@ -200,7 +223,7 @@ export default function SmartSyncDashboard() {
         body: { mode, emails: list, dryRun: true }
       });
       if (error || !data?.ok) throw new Error(error?.message || data?.error || "Unknown error");
-      setResp(data);
+setResp({ ...data, out: normalizeOut(data.out) });
       toast({
         title: "Quick test preview",
         description: `${data.count} records geanalyseerd (dry-run)`,
@@ -364,7 +387,7 @@ export default function SmartSyncDashboard() {
                       body: { mode: "BtoA", emails, repair: true, dryRun }
                     });
                     if (error || !data?.ok) throw new Error(error?.message || data?.error || "unknown error");
-                    setResp(data);
+                    setResp({ ...data, out: normalizeOut(data.out) });
                     toast({
                       title: dryRun ? "Repair preview voltooid" : "Repair voltooid",
                       description: dryRun
