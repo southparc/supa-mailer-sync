@@ -45,30 +45,13 @@ const EnterpriseSyncDashboard: React.FC = () => {
     recordsProcessed: 0, 
     updatesApplied: 0 
   });
-  const [currentClientCount, setCurrentClientCount] = useState<number>(0);
   const [subscriptionStats, setSubscriptionStats] = useState<{
     total: number;
     subscribed: number;
     unsubscribed: number;
   }>({ total: 0, subscribed: 0, unsubscribed: 0 });
-  const [chunkProgress, setChunkProgress] = useState({ current: 0, total: 0 });
   const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
   const { toast } = useToast();
-
-  // Fetch current client count on mount and after syncs
-  const fetchClientCount = async () => {
-    try {
-      const { count } = await supabase
-        .from('clients')
-        .select('*', { count: 'exact', head: true });
-      
-      if (count !== null) {
-        setCurrentClientCount(count);
-      }
-    } catch (error) {
-      console.error('Error fetching client count:', error);
-    }
-  };
 
   const fetchSubscriptionStats = async () => {
     try {
@@ -101,7 +84,6 @@ const EnterpriseSyncDashboard: React.FC = () => {
   };
 
   useEffect(() => {
-    fetchClientCount();
     fetchSubscriptionStats();
     checkDuplicates();
   }, []);
@@ -124,7 +106,6 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   const stopSync = async () => {
     try {
-      // Clear the sync cursor to stop the import
       await supabase
         .from('sync_state')
         .delete()
@@ -132,52 +113,69 @@ const EnterpriseSyncDashboard: React.FC = () => {
       
       setSyncStatus('idle');
       setSyncProgress(0);
-      setChunkProgress({ current: 0, total: 0 });
       
       toast({
-        title: "Sync Stopped",
-        description: "The sync has been manually stopped.",
+        title: "Sync Gestopt",
+        description: "De synchronisatie is handmatig gestopt.",
       });
     } catch (error) {
       console.error('Failed to stop sync:', error);
       toast({
-        title: "Error",
-        description: "Failed to stop sync. Please try again.",
+        title: "Fout",
+        description: "Kon sync niet stoppen. Probeer opnieuw.",
         variant: "destructive",
       });
     }
   };
 
   const handleSync = async (direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') => {
-    if (syncStatus === 'syncing') return;
+    if (syncStatus === 'syncing') {
+      toast({
+        title: "Sync Already Running",
+        description: "Please wait for the current sync to complete.",
+      });
+      return;
+    }
+    
+    console.log('Starting sync with direction:', direction, 'mapped to:', mapDirection(direction));
     
     try {
       setSyncStatus('syncing');
       setSyncProgress(10);
       
+      toast({
+        title: "Sync Started",
+        description: `Starting ${direction} sync...`,
+      });
+      
+      console.log('Invoking smart-sync function...');
       const { data, error } = await supabase.functions.invoke('smart-sync', {
         body: {
           mode: mapDirection(direction),
-          emails: [], // empty = all clients
+          emails: [],
           repair: false,
           dryRun: false
         }
       });
 
-      if (error) throw error;
+      console.log('Smart-sync response:', { data, error });
+
+      if (error) {
+        console.error('Smart-sync error:', error);
+        throw error;
+      }
 
       setSyncProgress(90);
       
       const result = data || {};
+      console.log('Parsed result:', result);
       
-      // Parse smart-sync response
       const recordCount = result.count || 0;
-      const stats = result.out?.stats || {};
-      const created = stats.created || 0;
-      const updated = stats.updated || 0;
-      const conflicts = stats.conflicts || 0;
+      const syncStats = result.out?.stats || {};
+      const created = syncStats.created || 0;
+      const updated = syncStats.updated || 0;
+      const conflicts = syncStats.conflicts || 0;
       
-      // Update stats
       setStats(prev => ({
         ...prev,
         lastSync: new Date().toISOString(),
@@ -189,31 +187,26 @@ const EnterpriseSyncDashboard: React.FC = () => {
       setSyncStatus('completed');
       setSyncProgress(100);
       
-      // Refresh counts
-      await fetchClientCount();
       await fetchSubscriptionStats();
       
       toast({
         title: "Sync Completed",
-        description: `Processed ${recordCount} records. Created: ${created}, Updated: ${updated}, Conflicts: ${conflicts}`,
+        description: `${recordCount} records. Created: ${created}, Updated: ${updated}, Conflicts: ${conflicts}`,
       });
 
-      // Reset status after delay
       setTimeout(() => {
         setSyncStatus('idle');
         setSyncProgress(0);
-        setChunkProgress({ current: 0, total: 0 });
       }, 3000);
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('Sync failed:', error);
       setSyncStatus('idle');
       setSyncProgress(0);
-      setChunkProgress({ current: 0, total: 0 });
       
       toast({
         title: "Sync Failed",
-        description: "Please check the logs and try again.",
+        description: error.message || "Check console for details.",
         variant: "destructive",
       });
     }
@@ -223,20 +216,20 @@ const EnterpriseSyncDashboard: React.FC = () => {
     const configs = {
       bidirectional: {
         icon: ArrowLeftRight,
-        label: 'Bidirectional Sync',
-        description: '⚠️ Imports ALL MailerLite subscribers (~18k+) and creates client records',
+        label: 'Bidirectionele Sync',
+        description: 'Synchroniseert in beide richtingen tussen Supabase en MailerLite',
         variant: 'default' as const
       },
       from_mailerlite: {
         icon: ArrowRight,
-        label: 'Import from MailerLite',
-        description: '⚠️ Imports ALL subscribers and creates new client records for each',
+        label: 'Importeer van MailerLite',
+        description: 'Haalt data op van MailerLite naar Supabase',
         variant: 'outline' as const
       },
       to_mailerlite: {
         icon: ArrowLeft,
-        label: 'Export to MailerLite',
-        description: 'Export existing client data from Supabase to MailerLite',
+        label: 'Exporteer naar MailerLite',
+        description: 'Stuurt Supabase data naar MailerLite',
         variant: 'outline' as const
       }
     };
@@ -286,102 +279,62 @@ const EnterpriseSyncDashboard: React.FC = () => {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Activity className="h-5 w-5" />
-              Sync in Progress
+              <Activity className="h-5 w-5 animate-pulse" />
+              {syncStatus === 'syncing' ? 'Synchroniseren...' : 'Sync Voltooid!'}
             </CardTitle>
           </CardHeader>
           <CardContent>
             <Progress value={syncProgress} className="mb-2" />
             <p className="text-sm text-muted-foreground">
-              {syncStatus === 'syncing' ? 
-                `Processing chunk ${chunkProgress.current}... ${Math.round(syncProgress)}% complete` : 
-                'Sync completed!'
-              }
+              {Math.round(syncProgress)}% voltooid
             </p>
-            {syncStatus === 'syncing' && (
-              <Button 
-                onClick={stopSync} 
-                variant="outline" 
-                size="sm" 
-                className="mt-2"
-              >
-                Stop Sync
-              </Button>
-            )}
           </CardContent>
         </Card>
       )}
 
       {/* Stats Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-base">Total Clients</CardTitle>
+            <CardTitle className="text-base">Totaal Clients</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex items-center gap-2">
-              <Users className="h-5 w-5 text-blue-600" />
+              <Users className="h-5 w-5 text-primary" />
               <span className="text-2xl font-bold">{subscriptionStats.total.toLocaleString()}</span>
             </div>
             <p className="text-xs text-muted-foreground mt-1">
-              All imported contacts
+              {subscriptionStats.subscribed} geabonneerd, {subscriptionStats.unsubscribed} afgemeld
             </p>
           </CardContent>
         </Card>
         
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-base">Subscribed</CardTitle>
+            <CardTitle className="text-base">Conflicten</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex items-center gap-2">
-              <CheckCircle className="h-5 w-5 text-green-600" />
-              <span className="text-2xl font-bold text-green-600">{subscriptionStats.subscribed.toLocaleString()}</span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">
-              Active subscribers
-            </p>
-          </CardContent>
-        </Card>
-        
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Unsubscribed</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <XCircle className="h-5 w-5 text-red-600" />
-              <span className="text-2xl font-bold text-red-600">{subscriptionStats.unsubscribed.toLocaleString()}</span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">
-              Unsubscribed/bounced
-            </p>
-          </CardContent>
-        </Card>
-        
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Active Conflicts</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="h-5 w-5 text-yellow-600" />
+              <AlertTriangle className="h-5 w-5 text-warning" />
               <span className="text-2xl font-bold">{stats.conflicts}</span>
             </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Actieve conflicten
+            </p>
           </CardContent>
         </Card>
         
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-base">Last Sync</CardTitle>
+            <CardTitle className="text-base">Laatste Sync</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex items-center gap-2">
-              <Clock className="h-5 w-5 text-blue-600" />
+              <Clock className="h-5 w-5 text-primary" />
               <span className="text-sm">
                 {stats.lastSync 
-                  ? new Date(stats.lastSync).toLocaleString()
-                  : 'Never'
+                  ? new Date(stats.lastSync).toLocaleDateString('nl-NL') + ' ' + new Date(stats.lastSync).toLocaleTimeString('nl-NL')
+                  : 'Nog niet gesynchroniseerd'
                 }
               </span>
             </div>
@@ -390,34 +343,25 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-base">Records Processed</CardTitle>
+            <CardTitle className="text-base">Verwerkte Records</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex items-center gap-2">
-              <Database className="h-5 w-5 text-green-600" />
+              <Database className="h-5 w-5 text-primary" />
               <span className="text-2xl font-bold">{stats.recordsProcessed || 0}</span>
             </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Updates Applied</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <Mail className="h-5 w-5 text-purple-600" />
-              <span className="text-2xl font-bold">{stats.updatesApplied || 0}</span>
-            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              {stats.updatesApplied || 0} updates toegepast
+            </p>
           </CardContent>
         </Card>
       </div>
 
       <Tabs defaultValue="sync" className="space-y-4">
         <TabsList>
-          <TabsTrigger value="sync">Sync Control</TabsTrigger>
+          <TabsTrigger value="sync">Synchronisatie</TabsTrigger>
           <TabsTrigger value="conflicts">
-            Conflict Resolution
+            Conflicten
             {stats.conflicts > 0 && (
               <Badge variant="destructive" className="ml-2">
                 {stats.conflicts}
@@ -429,100 +373,21 @@ const EnterpriseSyncDashboard: React.FC = () => {
         <TabsContent value="sync" className="space-y-4">
           <Card>
             <CardHeader>
-              <CardTitle>Enterprise Sync Controls</CardTitle>
+              <CardTitle>Smart Sync</CardTitle>
               <CardDescription>
-                Advanced synchronization with smart conflict detection and field-level merging.
+                Synchroniseer data tussen Supabase en MailerLite met automatische conflict detectie.
               </CardDescription>
             </CardHeader>
-            <CardContent className="space-y-4">
-              {/* Backfill Sync Control */}
-              <div className="flex items-center justify-between p-4 border-2 border-dashed border-primary/30 rounded-lg bg-primary/5">
-                <div className="flex items-center gap-3">
-                  <Database className="h-5 w-5 text-primary" />
-                  <div>
-                    <h3 className="font-medium">Initial Backfill Sync</h3>
-                    <p className="text-sm text-muted-foreground">Build crosswalk mappings and shadow snapshots for all existing records</p>
-                  </div>
-                </div>
-                <Button
-                  variant="outline"
-                  onClick={async () => {
-                    try {
-                      setSyncStatus('syncing');
-                      const { data, error } = await supabase.functions.invoke('backfill-sync');
-                      if (error) throw error;
-                      toast({
-                        title: "Backfill Completed",
-                        description: `Created ${data.crosswalkCreated} crosswalk entries and ${data.shadowsCreated} shadow snapshots`,
-                      });
-                    } catch (error) {
-                      toast({
-                        title: "Backfill Failed", 
-                        description: "Check logs for details",
-                        variant: "destructive"
-                      });
-                    } finally {
-                      setSyncStatus('idle');
-                    }
-                  }}
-                  disabled={syncStatus === 'syncing' || hasDuplicates}
-                >
-                  <Database className="h-4 w-4 mr-2" />
-                  Run Backfill
-                </Button>
-              </div>
-
-              {/* Subscription Status Backfill */}
-              <div className="flex items-center justify-between p-4 border-2 border-dashed border-blue-500/30 rounded-lg bg-blue-500/5">
-                <div className="flex items-center gap-3">
-                  <Users className="h-5 w-5 text-blue-500" />
-                  <div>
-                    <h3 className="font-medium">Backfill Subscription Status</h3>
-                    <p className="text-sm text-muted-foreground">Populate missing subscription status for clients with MailerLite IDs</p>
-                  </div>
-                </div>
-                <Button
-                  variant="outline"
-                  onClick={async () => {
-                    try {
-                      setSyncStatus('syncing');
-                      toast({
-                        title: "Backfill Started",
-                        description: "Fetching subscription status from MailerLite...",
-                      });
-                      const { data, error } = await supabase.functions.invoke('backfill-subscription-status');
-                      if (error) throw error;
-                      await fetchSubscriptionStats();
-                      toast({
-                        title: "Backfill Completed",
-                        description: `Updated ${data.updated} subscription statuses (${data.processed} processed, ${data.errors} errors)`,
-                      });
-                    } catch (error: any) {
-                      toast({
-                        title: "Backfill Failed", 
-                        description: error.message || "Check logs for details",
-                        variant: "destructive"
-                      });
-                    } finally {
-                      setSyncStatus('idle');
-                    }
-                  }}
-                  disabled={syncStatus === 'syncing' || hasDuplicates}
-                >
-                  <Users className="h-4 w-4 mr-2" />
-                  Backfill Subscriptions
-                </Button>
-              </div>
-
-              {/* Regular Sync Controls */}
+            <CardContent className="space-y-3">
+              {/* Sync Controls */}
               {(['bidirectional', 'from_mailerlite', 'to_mailerlite'] as const).map((direction) => {
                 const config = getSyncButtonProps(direction);
                 const IconComponent = config.icon;
                 
                 return (
-                  <div key={direction} className="flex items-center justify-between p-4 border rounded-lg">
+                  <div key={direction} className="flex items-center justify-between p-4 border rounded-lg hover:bg-accent/50 transition-colors">
                     <div className="flex items-center gap-3">
-                      <IconComponent className="h-5 w-5" />
+                      <IconComponent className="h-5 w-5 text-primary" />
                       <div>
                         <h3 className="font-medium">{config.label}</h3>
                         <p className="text-sm text-muted-foreground">{config.description}</p>
@@ -533,12 +398,8 @@ const EnterpriseSyncDashboard: React.FC = () => {
                       onClick={() => handleSync(direction)}
                       disabled={syncStatus === 'syncing' || hasDuplicates}
                     >
-                      {syncStatus === 'syncing' ? (
-                        <Pause className="h-4 w-4 mr-2" />
-                      ) : (
-                        <Play className="h-4 w-4 mr-2" />
-                      )}
-                      Start Sync
+                      <Play className="h-4 w-4 mr-2" />
+                      Start
                     </Button>
                   </div>
                 );
