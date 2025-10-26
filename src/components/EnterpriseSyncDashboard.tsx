@@ -116,11 +116,11 @@ const EnterpriseSyncDashboard: React.FC = () => {
     }
   };
 
-  // Map UI directions to backend expectations
+  // Map UI directions to smart-sync modes
   const mapDirection = (d: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') =>
-    d === 'bidirectional' ? 'both' :
-    d === 'from_mailerlite' ? 'mailerlite-to-supabase' :
-    'supabase-to-mailerlite';
+    d === 'bidirectional' ? 'bidirectional' :
+    d === 'from_mailerlite' ? 'BtoA' :
+    'AtoB';
 
   const stopSync = async () => {
     try {
@@ -153,76 +153,49 @@ const EnterpriseSyncDashboard: React.FC = () => {
     
     try {
       setSyncStatus('syncing');
-      setSyncProgress(0);
-      setChunkProgress({ current: 0, total: 0 });
+      setSyncProgress(10);
       
-      let totalRecordsProcessed = 0;
-      let totalUpdatesApplied = 0;
-      let totalConflictsDetected = 0;
-      let chunkCount = 0;
-      const maxChunks = 20; // Safety limit
-      
-      // Loop until sync is complete or we hit the safety limit
-      while (chunkCount < maxChunks) {
-        chunkCount++;
-        setChunkProgress({ current: chunkCount, total: 0 });
-        
-        const { data, error } = await supabase.functions.invoke('enterprise-sync', {
-          body: {
-            direction: mapDirection(direction),
-            maxRecords: 300,
-            maxDurationMs: 120000,
-            dryRun: false
-          }
-        });
-
-        if (error) throw error;
-
-        const result = data || {};
-        
-        // Accumulate totals
-        totalRecordsProcessed += result.recordsProcessed || 0;
-        totalUpdatesApplied += result.updatesApplied || 0;
-        totalConflictsDetected += result.conflictsDetected || 0;
-        
-        // Update progress - estimate based on chunk count
-        setSyncProgress(Math.min((chunkCount / 10) * 100, 95));
-        
-        // Refresh client count after each chunk
-        await fetchClientCount();
-        await fetchSubscriptionStats();
-        
-        // Show chunk completion toast
-        toast({
-          title: `Chunk ${chunkCount} Completed`,
-          description: `Processed ${result.recordsProcessed || 0} records in this chunk`,
-        });
-        
-        // If sync is done or no records processed, break the loop
-        if (result.done === true || (result.recordsProcessed || 0) === 0) {
-          break;
+      const { data, error } = await supabase.functions.invoke('smart-sync', {
+        body: {
+          mode: mapDirection(direction),
+          emails: [], // empty = all clients
+          repair: false,
+          dryRun: false
         }
-        
-        // Small delay between chunks to prevent overwhelming
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
+      });
+
+      if (error) throw error;
+
+      setSyncProgress(90);
       
-      // Update final stats
+      const result = data || {};
+      
+      // Parse smart-sync response
+      const recordCount = result.count || 0;
+      const stats = result.out?.stats || {};
+      const created = stats.created || 0;
+      const updated = stats.updated || 0;
+      const conflicts = stats.conflicts || 0;
+      
+      // Update stats
       setStats(prev => ({
         ...prev,
         lastSync: new Date().toISOString(),
-        recordsProcessed: prev.recordsProcessed + totalRecordsProcessed,
-        updatesApplied: prev.updatesApplied + totalUpdatesApplied,
-        conflicts: prev.conflicts + totalConflictsDetected
+        recordsProcessed: (prev.recordsProcessed || 0) + recordCount,
+        updatesApplied: (prev.updatesApplied || 0) + created + updated,
+        conflicts: (prev.conflicts || 0) + conflicts
       }));
 
       setSyncStatus('completed');
       setSyncProgress(100);
       
-      // Final completion toast
+      // Refresh counts
+      await fetchClientCount();
+      await fetchSubscriptionStats();
+      
       toast({
         title: "Sync Completed",
-        description: `All chunks processed! Total: ${totalRecordsProcessed} records, ${totalUpdatesApplied} updates, ${totalConflictsDetected} conflicts across ${chunkCount} chunks.`,
+        description: `Processed ${recordCount} records. Created: ${created}, Updated: ${updated}, Conflicts: ${conflicts}`,
       });
 
       // Reset status after delay
