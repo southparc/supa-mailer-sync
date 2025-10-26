@@ -225,7 +225,7 @@ async function getAllMailerLiteSubscribers(dryRun = false): Promise<Map<string, 
   do {
     const url = new URL(`${ML_BASE}/subscribers`);
     url.searchParams.set('limit', '1000');
-    url.searchParams.set('filter[status]', 'all'); // Include ALL statuses
+    // Don't filter by status - this returns all subscribers regardless of status
     if (cursor) url.searchParams.set('cursor', cursor);
 
     const res = await retryFetch(url.toString(), {
