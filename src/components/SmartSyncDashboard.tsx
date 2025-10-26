@@ -89,10 +89,26 @@ export default function SmartSyncDashboard() {
     setLoading(true);
     setErr(null);
     setResp(null);
+
+    // Bepaal veilige payload om timeouts te voorkomen
+    const payloadEmails = emails.length > 0
+      ? emails.slice(0, isDryRun ? Math.min(emails.length, 50) : emails.length)
+      : (isDryRun ? sampleEmails.slice(0, 50) : []);
+
+    // Voor echte sync zonder selectie: afkappen
+    if (!isDryRun && payloadEmails.length === 0) {
+      setLoading(false);
+      toast({
+        title: "Selecteer een set e-mails",
+        description: "Kies eerst e-mails of gebruik 'Quick test (50)' om verbinding te testen.",
+        variant: "destructive",
+      });
+      return;
+    }
     
     try {
       const { data, error } = await supabase.functions.invoke<SmartSyncResponse>("smart-sync", {
-        body: { mode: runMode, emails, dryRun: isDryRun }
+        body: { mode: runMode, emails: payloadEmails, dryRun: isDryRun }
       });
       
       if (error || !data?.ok) {
@@ -109,8 +125,8 @@ export default function SmartSyncDashboard() {
       });
     } catch (e: any) {
       const errorMsg = String(e?.message || e);
-      const friendly = errorMsg.includes('Failed to fetch')
-        ? 'Kon geen verbinding maken met de Edge Function (mogelijk time-out). Probeer Quick test (50) of zet dry-run aan.'
+      const friendly = errorMsg.includes('Failed to send a request to the Edge Function') || errorMsg.includes('Failed to fetch')
+        ? 'Kon geen verbinding maken met de Edge Function (mogelijk time-out). Gebruik "Quick test (50)" of voer een kleinere batch uit.'
         : errorMsg;
       setErr(friendly);
       toast({
