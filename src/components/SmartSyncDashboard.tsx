@@ -45,7 +45,7 @@ export default function SmartSyncDashboard() {
   const [emailsText, setEmailsText] = useState("");
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState<SyncMode>("bidirectional");
-  const [dryRun, setDryRun] = useState(false);
+  const [dryRun, setDryRun] = useState(true); // Standaard aan voor veiligheid
   const [resp, setResp] = useState<SmartSyncResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
@@ -281,15 +281,39 @@ export default function SmartSyncDashboard() {
       )}
 
       {resp && (
-        <Card>
+        <Card className={dryRun ? "border-blue-500" : ""}>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              {(resp as any).dryRun && <Eye className="h-5 w-5 text-muted-foreground" />}
-              Resultaat: {resp.ok ? "Succesvol" : "Gefaald"} • {resp.mode} • {resp.count} rijen
-              {(resp as any).dryRun && <span className="text-sm font-normal text-muted-foreground">(dry-run)</span>}
+              {dryRun && <Eye className="h-5 w-5 text-blue-500" />}
+              {dryRun ? "Preview Resultaat (Dry-Run)" : "Sync Resultaat"}
             </CardTitle>
+            <CardDescription>
+              {dryRun 
+                ? "Dit is een preview - geen wijzigingen zijn doorgevoerd. Schakel dry-run uit om daadwerkelijk te synchroniseren."
+                : `${resp.count} records verwerkt in ${resp.mode} modus`}
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            {/* Summary Stats */}
+            <div className="grid grid-cols-3 gap-4 p-4 bg-muted/50 rounded-lg">
+              <div>
+                <p className="text-sm text-muted-foreground">Totaal</p>
+                <p className="text-2xl font-bold">{resp.count}</p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Zou worden bijgewerkt</p>
+                <p className="text-2xl font-bold text-blue-500">
+                  {resp.out.filter((r: any) => r.changed).length}
+                </p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Overgeslagen</p>
+                <p className="text-2xl font-bold text-muted-foreground">
+                  {resp.out.filter((r: any) => r.skipped).length}
+                </p>
+              </div>
+            </div>
+
             <div className="border rounded-lg overflow-hidden">
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
