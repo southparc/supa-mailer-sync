@@ -48,6 +48,10 @@ const supabase = createClient(SB_URL, SB_KEY, {
 });
 
 // Managed groups that we're allowed to remove (others stay untouched)
+const MANAGED_GROUPS = ['BpvdhEmail', 'BpvdhPhone', 'BpvdhCity'];
+
+// Global rate limit tracking
+const LAST_RATE = { remaining: undefined as number | undefined, retryAfter: undefined as number | undefined };
 let MANAGED_GROUPS_CACHE: Set<string> | null = null;
 
 // ============================================================================
@@ -126,12 +130,15 @@ async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = fa
 
     const res = await fetch(url, init);
 
-    // Track rate limits
+    // Track rate limits globally for batch mode
     const rlRemaining = res.headers.get('X-RateLimit-Remaining');
     const rlReset = res.headers.get('X-RateLimit-Reset');
+    const retryAfter = res.headers.get('Retry-After');
+    
     if (rlRemaining) {
       const remaining = parseInt(rlRemaining, 10);
       if (!Number.isNaN(remaining)) {
+        LAST_RATE.remaining = remaining;
         // store for observability
         await supabase.from('sync_state').upsert({
           key: 'mailerlite_rate_limit',
@@ -141,6 +148,13 @@ async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = fa
         if (remaining <= 1) {
           console.warn(`⚠️ Rate limit low: ${remaining} remaining`);
         }
+      }
+    }
+    
+    if (retryAfter) {
+      const raNum = Number(retryAfter);
+      if (!Number.isNaN(raNum)) {
+        LAST_RATE.retryAfter = raNum;
       }
     }
 
@@ -153,7 +167,6 @@ async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = fa
 
     // Determine wait from headers (Retry-After or rate-limit reset)
     let waitMs = 0;
-    const retryAfter = res.headers.get('Retry-After');
     if (retryAfter) {
       const raNum = Number(retryAfter);
       if (!Number.isNaN(raNum)) waitMs = Math.max(raNum * 1000, MIN_DELAY_MS);
@@ -993,6 +1006,28 @@ async function processBtoA(email: string, repair = false, dryRun = false): Promi
 }
 
 // ============================================================================
+// Batch State Management
+// ============================================================================
+
+async function getFullState() {
+  const { data } = await supabase
+    .from('sync_state')
+    .select('value')
+    .eq('key', 'full_sync_state')
+    .maybeSingle();
+  return data?.value ?? { phase: 'init', idx: 0 };
+}
+
+async function putFullState(value: any) {
+  await supabase
+    .from('sync_state')
+    .upsert(
+      { key: 'full_sync_state', value, updated_at: new Date().toISOString() },
+      { onConflict: 'key' }
+    );
+}
+
+// ============================================================================
 // Phase 3.1 & 3.2: Full Sync with dry-run and enhanced logging
 // ============================================================================
 
@@ -1154,11 +1189,165 @@ async function runFullSync(dryRun = false): Promise<any> {
 }
 
 // ============================================================================
+// Batch Full Sync - Stateful, resumes from where it stopped
+// ============================================================================
+
+async function runFullSyncBatch(opts: {
+  maxItems: number;
+  timeBudgetMs: number;
+  minRemaining: number;
+  dryRun: boolean;
+}): Promise<any> {
+  const t0 = Date.now();
+  let st = await getFullState();
+
+  console.log(`🔄 Batch sync: phase=${st.phase}, idx=${st.idx}, max=${opts.maxItems}, budget=${opts.timeBudgetMs}ms`);
+
+  // Check if we should wait due to rate limit
+  if (st.next_run_at && new Date(st.next_run_at) > new Date()) {
+    const waitMs = new Date(st.next_run_at).getTime() - Date.now();
+    console.log(`⏸️ Rate limit pause active, next run at ${st.next_run_at} (${Math.ceil(waitMs / 1000)}s remaining)`);
+    return { ok: true, paused: 'rate-limit', next_run_at: st.next_run_at };
+  }
+
+  // Phase: init - build email sets once
+  if (st.phase === 'init') {
+    console.log('📊 Initializing: fetching all subscribers and clients...');
+    const [mlMap, sbMap] = await Promise.all([
+      getAllMailerLiteSubscribers(opts.dryRun),
+      getAllSupabaseClients(opts.dryRun),
+    ]);
+
+    const mlEmails = new Set(mlMap.keys());
+    const sbEmails = new Set(sbMap.keys());
+
+    const onlyInML: string[] = [];
+    const onlyInSB: string[] = [];
+    const inBoth: string[] = [];
+
+    for (const e of mlEmails) {
+      if (sbEmails.has(e)) inBoth.push(e);
+      else onlyInML.push(e);
+    }
+    for (const e of sbEmails) {
+      if (!mlEmails.has(e)) onlyInSB.push(e);
+    }
+
+    // Cache the subscriber map for onlyInML phase
+    const mlCache: Record<string, any> = {};
+    for (const [email, sub] of mlMap.entries()) {
+      mlCache[email] = sub;
+    }
+
+    st = {
+      phase: 'onlyInML',
+      idx: 0,
+      onlyInML,
+      onlyInSB,
+      inBoth,
+      mlCache,
+      stats: { created: 0, updated: 0, skipped: 0, errors: 0 }
+    };
+    await putFullState(st);
+    console.log(`✅ Init complete: ML-only=${onlyInML.length}, SB-only=${onlyInSB.length}, Both=${inBoth.length}`);
+  }
+
+  // Process phases
+  const phases: Array<'onlyInML' | 'onlyInSB' | 'inBoth'> = ['onlyInML', 'onlyInSB', 'inBoth'];
+  
+  for (const phase of phases) {
+    if (st.phase !== phase) continue;
+
+    const list: string[] = st[phase] ?? [];
+    let processed = 0;
+
+    console.log(`\n🟢 Processing phase: ${phase} (${list.length - st.idx} remaining)`);
+
+    for (let i = st.idx; i < list.length; i++) {
+      const email = list[i];
+
+      // Stop conditions
+      if (LAST_RATE.remaining !== undefined && LAST_RATE.remaining < opts.minRemaining) {
+        const nextRunMs = LAST_RATE.retryAfter ? LAST_RATE.retryAfter * 1000 : 120_000; // 2 min default
+        st.idx = i;
+        st.next_run_at = new Date(Date.now() + nextRunMs).toISOString();
+        await putFullState(st);
+        console.log(`⏸️ Rate limit hit: remaining=${LAST_RATE.remaining}, pausing until ${st.next_run_at}`);
+        return { ok: true, paused: 'rate-limit', phase, idx: i, next_run_at: st.next_run_at };
+      }
+
+      const elapsed = Date.now() - t0;
+      if (processed >= opts.maxItems || elapsed > opts.timeBudgetMs) {
+        st.idx = i;
+        await putFullState(st);
+        console.log(`⏸️ Batch limit reached: processed=${processed}, elapsed=${elapsed}ms`);
+        return { ok: true, paused: 'batch-limit', phase, idx: i, processed };
+      }
+
+      // Process email based on phase
+      try {
+        if (phase === 'onlyInML') {
+          const mlSub = st.mlCache?.[email];
+          if (mlSub) {
+            await createClientFromMailerLite(mlSub, opts.dryRun);
+            st.stats.created++;
+          }
+        } else if (phase === 'onlyInSB') {
+          const result = await processAtoB(email, opts.dryRun);
+          if (result.changed) st.stats.updated++;
+          else st.stats.skipped++;
+        } else {
+          // inBoth: bidirectional
+          const [aResult, bResult] = await Promise.all([
+            processAtoB(email, opts.dryRun),
+            processBtoA(email, false, opts.dryRun),
+          ]);
+          if (aResult.changed || bResult.changed) st.stats.updated++;
+          else st.stats.skipped++;
+        }
+      } catch (e: any) {
+        console.error(`❌ Error ${phase} ${email}:`, e.message);
+        st.stats.errors++;
+      }
+
+      processed++;
+      
+      // Small throttle between records
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    // Phase completed - move to next
+    console.log(`✅ Phase ${phase} complete`);
+    st.phase = phase === 'onlyInML' ? 'onlyInSB' : phase === 'onlyInSB' ? 'inBoth' : 'done';
+    st.idx = 0;
+    await putFullState(st);
+  }
+
+  // All done
+  console.log(`\n✅ Batch sync complete: ${JSON.stringify(st.stats)}`);
+  return { ok: true, done: true, stats: st.stats };
+}
+
+// ============================================================================
 // Run orchestrator
 // ============================================================================
 
-async function run(mode: SyncMode, emails?: string[], repair = false, dryRun = false): Promise<any[]> {
-  // If mode is 'full', use the new full sync
+async function run(mode: SyncMode, emails?: string[], repair = false, dryRun = false, batch = false, batchOpts?: {
+  maxItems?: number;
+  timeBudgetMs?: number;
+  minRemaining?: number;
+}): Promise<any> {
+  // If mode is 'full' with batch mode, use batch sync
+  if (mode === 'full' && batch) {
+    return await runFullSyncBatch({
+      maxItems: batchOpts?.maxItems ?? 500,
+      timeBudgetMs: batchOpts?.timeBudgetMs ?? 45000,
+      minRemaining: batchOpts?.minRemaining ?? 60,
+      dryRun
+    });
+  }
+  
+  // If mode is 'full' without batch, use regular full sync
   if (mode === 'full') {
     return await runFullSync(dryRun);
   }
@@ -1227,7 +1416,11 @@ serve(async (req) => {
       mode = "AtoB", 
       emails = [], 
       repair = false,
-      dryRun = false // Phase 3.1: Dry-run mode
+      dryRun = false, // Phase 3.1: Dry-run mode
+      batch = false, // Batch mode for large syncs
+      maxItems = 500,
+      timeBudgetMs = 45000,
+      minRemaining = 60
     } = await req.json().catch(() => ({}));
     
     if (!["AtoB", "BtoA", "bidirectional", "full"].includes(mode)) {
@@ -1237,17 +1430,18 @@ serve(async (req) => {
       );
     }
 
-    console.log(`\n🚀 Smart Sync Request: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}, dryRun=${dryRun}`);
+    console.log(`\n🚀 Smart Sync Request: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}, dryRun=${dryRun}, batch=${batch}`);
     
-    const out = await run(mode as SyncMode, emails, repair, dryRun);
+    const out = await run(mode as SyncMode, emails, repair, dryRun, batch, { maxItems, timeBudgetMs, minRemaining });
     
-    console.log(`\n✅ Completed smart-sync: processed ${Array.isArray(out) ? out.length : 'full sync'} records`);
+    console.log(`\n✅ Completed smart-sync: processed ${Array.isArray(out) ? out.length : 'batch/full sync'} records`);
     
     return new Response(
       JSON.stringify({ 
         ok: true, 
         mode, 
         dryRun,
+        batch,
         count: Array.isArray(out) ? out.length : null, 
         out 
       }),

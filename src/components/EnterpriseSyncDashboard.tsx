@@ -37,8 +37,9 @@ interface Duplicate {
 }
 
 const EnterpriseSyncDashboard: React.FC = () => {
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'completed'>('idle');
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'completed' | 'paused'>('idle');
   const [syncProgress, setSyncProgress] = useState(0);
+  const [batchState, setBatchState] = useState<any>(null);
   const [stats, setStats] = useState<SyncStats>({ 
     conflicts: 0, 
     lastSync: undefined, 
@@ -86,6 +87,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
   useEffect(() => {
     fetchSubscriptionStats();
     checkDuplicates();
+    checkBatchState();
   }, []);
 
   const checkDuplicates = async () => {
@@ -95,6 +97,26 @@ const EnterpriseSyncDashboard: React.FC = () => {
       setDuplicates(data || []);
     } catch (error: any) {
       console.error('Error checking duplicates:', error);
+    }
+  };
+
+  const checkBatchState = async () => {
+    try {
+      const { data } = await supabase
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'full_sync_state')
+        .maybeSingle();
+      
+      if (data?.value && typeof data.value === 'object') {
+        const state = data.value as any;
+        setBatchState(state);
+        if (state.phase !== 'done' && state.phase !== 'init') {
+          setSyncStatus('paused');
+        }
+      }
+    } catch (error) {
+      console.error('Failed to check batch state:', error);
     }
   };
 
@@ -154,7 +176,11 @@ const EnterpriseSyncDashboard: React.FC = () => {
           mode: mapDirection(direction),
           emails: [],
           repair: false,
-          dryRun: false
+          dryRun: false,
+          batch: true, // Enable batch mode
+          maxItems: 500,
+          timeBudgetMs: 45000,
+          minRemaining: 60
         }
       });
 
@@ -169,6 +195,52 @@ const EnterpriseSyncDashboard: React.FC = () => {
       
       const result = data || {};
       console.log('Parsed result:', result);
+      
+      // Check if batch was paused
+      if (result.out?.paused) {
+        const pauseReason = result.out.paused === 'rate-limit' ? 'Rate Limit Bereikt' : 'Batch Limiet';
+        const nextRun = result.out.next_run_at ? ` (hervat om ${new Date(result.out.next_run_at).toLocaleTimeString()})` : '';
+        
+        setSyncStatus('idle');
+        setSyncProgress(0);
+        
+        toast({
+          title: `Sync Gepauseerd: ${pauseReason}`,
+          description: `Verwerkt: ${result.out.processed || 0} records. Phase: ${result.out.phase}.${nextRun} Roep sync opnieuw aan om te hervatten.`,
+        });
+        return;
+      }
+      
+      // Check if batch completed
+      if (result.out?.done) {
+        const syncStats = result.out.stats || {};
+        const created = syncStats.created || 0;
+        const updated = syncStats.updated || 0;
+        const errors = syncStats.errors || 0;
+        
+        setStats(prev => ({
+          ...prev,
+          lastSync: new Date().toISOString(),
+          recordsProcessed: (prev.recordsProcessed || 0) + (created + updated),
+          updatesApplied: (prev.updatesApplied || 0) + created + updated,
+        }));
+
+        setSyncStatus('completed');
+        setSyncProgress(100);
+        
+        await fetchSubscriptionStats();
+        
+        toast({
+          title: "Batch Sync Voltooid!",
+          description: `Created: ${created}, Updated: ${updated}, Errors: ${errors}`,
+        });
+
+        setTimeout(() => {
+          setSyncStatus('idle');
+          setSyncProgress(0);
+        }, 3000);
+        return;
+      }
       
       const recordCount = result.count || 0;
       const syncStats = result.out?.stats || {};
