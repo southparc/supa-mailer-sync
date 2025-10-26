@@ -49,13 +49,16 @@ export default function SmartSyncDashboard() {
   const [resp, setResp] = useState<SmartSyncResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
+  const [sampleEmails, setSampleEmails] = useState<string[]>([]);
+  const [sampleLoading, setSampleLoading] = useState(false);
   const { toast } = useToast();
 
   const emails = useMemo(() => parseEmails(emailsText), [emailsText]);
 
   // Check for duplicate advisors on mount
   useEffect(() => {
-    async function checkDuplicates() {
+    async function init() {
+      // 1) Duplicates check
       try {
         const { data, error } = await supabase.rpc('check_duplicate_advisors');
         if (error) throw error;
@@ -63,8 +66,23 @@ export default function SmartSyncDashboard() {
       } catch (error: any) {
         console.error('Error checking duplicates:', error);
       }
+
+      // 2) Load sample emails for quick test
+      try {
+        setSampleLoading(true);
+        const { data } = await supabase
+          .from('clients')
+          .select('email')
+          .not('email', 'is', null)
+          .limit(50);
+        setSampleEmails((data || []).map((r: any) => String(r.email).toLowerCase().trim()).filter(Boolean));
+      } catch (e) {
+        console.warn('Could not load sample emails:', e);
+      } finally {
+        setSampleLoading(false);
+      }
     }
-    checkDuplicates();
+    init();
   }, []);
 
   async function runSync(runMode: SyncMode, isDryRun = false) {
@@ -91,12 +109,47 @@ export default function SmartSyncDashboard() {
       });
     } catch (e: any) {
       const errorMsg = String(e?.message || e);
-      setErr(errorMsg);
+      const friendly = errorMsg.includes('Failed to fetch')
+        ? 'Kon geen verbinding maken met de Edge Function (mogelijk time-out). Probeer Quick test (50) of zet dry-run aan.'
+        : errorMsg;
+      setErr(friendly);
       toast({
         title: "Sync gefaald",
-        description: errorMsg,
+        description: friendly,
         variant: "destructive",
       });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runQuickTest() {
+    const list = emails.length > 0 ? emails : sampleEmails;
+    if (!list.length) {
+      toast({
+        title: "Geen e-mails beschikbaar",
+        description: "Voeg e-mails toe of wacht tot de quick test is geladen.",
+        variant: "destructive",
+      });
+      return;
+    }
+    try {
+      setLoading(true);
+      setErr(null);
+      setResp(null);
+      const { data, error } = await supabase.functions.invoke<SmartSyncResponse>("smart-sync", {
+        body: { mode, emails: list, dryRun: true }
+      });
+      if (error || !data?.ok) throw new Error(error?.message || data?.error || "Unknown error");
+      setResp(data);
+      toast({
+        title: "Quick test preview",
+        description: `${data.count} records geanalyseerd (dry-run)`,
+      });
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      setErr(msg);
+      toast({ title: "Quick test gefaald", description: msg, variant: "destructive" });
     } finally {
       setLoading(false);
     }
@@ -200,6 +253,16 @@ export default function SmartSyncDashboard() {
                 {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                 {dryRun && <Eye className="mr-2 h-4 w-4" />}
                 Start {mode}
+              </Button>
+
+              <Button
+                onClick={runQuickTest}
+                disabled={loading || hasDuplicates || sampleLoading}
+                variant="secondary"
+                title="Snelle preview op 50 records"
+              >
+                <Eye className="mr-2 h-4 w-4" />
+                Quick test (50)
               </Button>
 
               <Button
