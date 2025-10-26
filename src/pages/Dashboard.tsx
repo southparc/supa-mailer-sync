@@ -11,7 +11,6 @@ import { ConflictResolution } from "@/components/ConflictResolution";
 import { SyncSettings } from "@/components/SyncSettings";
 import { SyncLogs } from "@/components/SyncLogs";
 import { AdvisorsManagement } from "@/components/AdvisorsManagement";
-import EnterpriseSyncDashboard from "@/components/EnterpriseSyncDashboard";
 import SmartSyncDashboard from "@/components/SmartSyncDashboard";
 import { LogOut, RefreshCw, AlertTriangle, Users, Database } from "lucide-react";
 
@@ -194,9 +193,8 @@ export default function Dashboard() {
 
         {/* Main Content Tabs */}
         <Tabs defaultValue="smart-sync" className="space-y-6">
-          <TabsList className="grid w-full grid-cols-6">
+          <TabsList className="grid w-full grid-cols-5">
             <TabsTrigger value="smart-sync">Smart Sync</TabsTrigger>
-            <TabsTrigger value="enterprise">Enterprise Sync</TabsTrigger>
             <TabsTrigger value="advisors">Advisors</TabsTrigger>
             <TabsTrigger value="conflicts">Conflict Resolution</TabsTrigger>
             <TabsTrigger value="settings">Settings</TabsTrigger>
@@ -207,9 +205,6 @@ export default function Dashboard() {
             <SmartSyncDashboard />
           </TabsContent>
 
-          <TabsContent value="enterprise" className="space-y-6">
-            <EnterpriseSyncDashboard />
-          </TabsContent>
 
           <TabsContent value="advisors" className="space-y-6">
             <AdvisorsManagement />
