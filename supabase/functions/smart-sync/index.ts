@@ -100,37 +100,83 @@ async function generateDedupeKey(email: string, action: string, payload: any): P
 /**
  * Phase 2.1: Retry with exponential backoff + rate limit tracking
  */
-async function retryFetch(url: string, init: RequestInit, tries = 4, dryRun = false): Promise<Response> {
+async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = false): Promise<Response> {
   if (dryRun) {
     console.log(`[DRY-RUN] Would fetch: ${init.method || 'GET'} ${url}`);
     return new Response(JSON.stringify({ data: { id: 'dry-run-id' } }), { status: 200 });
   }
 
+  // Persist minimal throttling across requests within the same function instance
+  const g: any = globalThis as any;
+  if (typeof g.__ml_nextAllowedAt !== 'number') g.__ml_nextAllowedAt = 0;
+  const MIN_DELAY_MS = 350; // base pacing to avoid bursts
+  const MAX_BACKOFF_MS = 60_000; // cap waits to 60s
+
+  function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
   let last: Response | null = null;
   for (let i = 0; i < tries; i++) {
+    // Global pacing to smooth out requests
+    const now = Date.now();
+    if (now < g.__ml_nextAllowedAt) {
+      const wait = g.__ml_nextAllowedAt - now;
+      console.log(`  ⏸️ Throttling ${wait}ms before request`);
+      await sleep(wait);
+    }
+
     const res = await fetch(url, init);
-    
+
     // Track rate limits
-    const rateLimitRemaining = res.headers.get('X-RateLimit-Remaining');
-    if (rateLimitRemaining) {
-      const remaining = parseInt(rateLimitRemaining, 10);
-      if (remaining < 100) {
-        console.warn(`⚠️ Rate limit low: ${remaining} requests remaining`);
-        // Log to sync_state for monitoring
+    const rlRemaining = res.headers.get('X-RateLimit-Remaining');
+    const rlReset = res.headers.get('X-RateLimit-Reset');
+    if (rlRemaining) {
+      const remaining = parseInt(rlRemaining, 10);
+      if (!Number.isNaN(remaining)) {
+        // store for observability
         await supabase.from('sync_state').upsert({
           key: 'mailerlite_rate_limit',
-          value: { remaining, timestamp: new Date().toISOString() },
+          value: { remaining, reset: rlReset, ts: new Date().toISOString() },
           updated_at: new Date().toISOString()
         }, { onConflict: 'key' });
+        if (remaining <= 1) {
+          console.warn(`⚠️ Rate limit low: ${remaining} remaining`);
+        }
       }
     }
-    
-    if (res.status !== 429 && res.status < 500) return res;
-    
+
+    if (res.status !== 429 && res.status < 500) {
+      // Success or client error (not retryable)
+      // Set a small next allowed window to pace bursts
+      g.__ml_nextAllowedAt = Date.now() + MIN_DELAY_MS;
+      return res;
+    }
+
+    // Determine wait from headers (Retry-After or rate-limit reset)
+    let waitMs = 0;
+    const retryAfter = res.headers.get('Retry-After');
+    if (retryAfter) {
+      const raNum = Number(retryAfter);
+      if (!Number.isNaN(raNum)) waitMs = Math.max(raNum * 1000, MIN_DELAY_MS);
+    }
+    if (!waitMs && rlReset) {
+      const resetEpoch = Number(rlReset);
+      if (!Number.isNaN(resetEpoch)) {
+        // if looks like seconds epoch
+        const resetMs = resetEpoch < 1e12 ? resetEpoch * 1000 : resetEpoch;
+        waitMs = Math.max(resetMs - Date.now(), MIN_DELAY_MS);
+      }
+    }
+    if (!waitMs) {
+      // Exponential backoff with jitter
+      const base = Math.min(MAX_BACKOFF_MS, Math.pow(2, i) * 1000);
+      const jitter = Math.floor(Math.random() * 250);
+      waitMs = Math.max(MIN_DELAY_MS, base + jitter);
+    }
+
     last = res;
-    const backoff = 250 * Math.pow(2, i);
-    console.log(`  ⏳ Retry ${i + 1}/${tries} after ${backoff}ms (status: ${res.status})`);
-    await new Promise(r => setTimeout(r, backoff));
+    console.log(`  ⏳ Retry ${i + 1}/${tries} after ${waitMs}ms (status: ${res.status})`);
+    g.__ml_nextAllowedAt = Date.now() + waitMs;
+    await sleep(waitMs);
   }
   return last!;
 }
@@ -233,7 +279,7 @@ async function getAllMailerLiteSubscribers(dryRun = false): Promise<Map<string, 
         'Authorization': `Bearer ${ML_KEY}`,
         'Content-Type': 'application/json',
       },
-    }, 4, dryRun);
+    }, 8, dryRun);
 
     if (!res.ok) {
       const err = await res.text();
