@@ -1,6 +1,6 @@
 // deno-lint-ignore-file no-explicit-any
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // ============================================================================
 // Types & Constants
@@ -71,12 +71,62 @@ class TokenBucket {
   lastRefill: number;
   tokensPerMs: number;
   maxTokens: number;
+  supabaseClient: SupabaseClient;
   
-  constructor(maxTokens: number, windowMs: number) {
+  constructor(maxTokens: number, windowMs: number, supabaseClient: SupabaseClient) {
     this.maxTokens = maxTokens;
     this.tokens = maxTokens;
     this.lastRefill = Date.now();
     this.tokensPerMs = maxTokens / windowMs;
+    this.supabaseClient = supabaseClient;
+  }
+  
+  // Load state from database
+  async restore(): Promise<void> {
+    try {
+      const { data, error } = await this.supabaseClient
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'token_bucket_state')
+        .maybeSingle();
+      
+      if (error) {
+        console.error('Failed to restore token bucket state:', error);
+        return;
+      }
+      
+      if (data?.value) {
+        const state = data.value as any;
+        this.tokens = state.tokens || this.maxTokens;
+        this.lastRefill = state.lastRefill || Date.now();
+        console.log(`🪣 Restored token bucket: ${Math.floor(this.tokens)} tokens available`);
+      }
+    } catch (err) {
+      console.error('Error restoring token bucket:', err);
+    }
+  }
+  
+  // Save state to database
+  async save(): Promise<void> {
+    try {
+      const { error } = await this.supabaseClient
+        .from('sync_state')
+        .upsert({
+          key: 'token_bucket_state',
+          value: {
+            tokens: this.tokens,
+            lastRefill: this.lastRefill,
+            timestamp: new Date().toISOString()
+          },
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'key' });
+      
+      if (error) {
+        console.error('Failed to save token bucket state:', error);
+      }
+    } catch (err) {
+      console.error('Error saving token bucket:', err);
+    }
   }
   
   async acquire(): Promise<void> {
@@ -96,10 +146,16 @@ class TokenBucket {
       console.log(`🪣 Token bucket empty, waiting ${waitMs}ms...`);
       await new Promise(r => setTimeout(r, waitMs));
       this.tokens = 1;
+      this.lastRefill = Date.now();
     }
     
     // Consume one token
     this.tokens -= 1;
+    
+    // Save state after consuming token (every 10th request to reduce DB writes)
+    if (Math.floor(this.tokens) % 10 === 0) {
+      await this.save();
+    }
   }
   
   getAvailable(): number {
@@ -117,8 +173,8 @@ class TokenBucket {
   }
 }
 
-// Global rate limiter instance
-const mlRateLimiter = new TokenBucket(MAILERLITE_RATE_LIMIT, RATE_WINDOW_MS);
+// Rate limiter with persistent state (created after supabase client)
+const mlRateLimiter = new TokenBucket(MAILERLITE_RATE_LIMIT, RATE_WINDOW_MS, supabase);
 
 // Legacy rate tracking for backward compatibility
 const LAST_RATE = { remaining: undefined as number | undefined, retryAfter: undefined as number | undefined };
@@ -1735,6 +1791,12 @@ serve(async (req) => {
     }
 
     console.log(`\n🚀 Smart Sync Request: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}, dryRun=${dryRun}, batch=${batch}`);
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Restore Rate Limiter State
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    await mlRateLimiter.restore();
     
     // ─────────────────────────────────────────────────────────────────────────────
     // Resource Protection Checks
