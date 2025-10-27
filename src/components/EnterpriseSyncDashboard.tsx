@@ -22,6 +22,7 @@ import {
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import EnterpriseConflictResolution from './EnterpriseConflictResolution';
+import { RateLimitStatus } from './RateLimitStatus';
 
 interface SyncStats {
   conflicts: number;
@@ -428,6 +429,9 @@ const EnterpriseSyncDashboard: React.FC = () => {
           </CardContent>
         </Card>
       </div>
+
+      {/* Rate Limit Monitoring */}
+      <RateLimitStatus />
 
       <Tabs defaultValue="sync" className="space-y-4">
         <TabsList>
