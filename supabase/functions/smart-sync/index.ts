@@ -47,6 +47,9 @@ const MAX_CONCURRENT_SYNCS = 1;
 const MIN_DB_CONNECTIONS_AVAILABLE = 5;
 const CIRCUIT_BREAKER_THRESHOLD = 3;
 const COOLDOWN_PERIOD_MS = 60000; // 1 minute cooldown after errors
+const MAX_DAILY_SYNC_RECORDS = 5000; // Max records to process per 24h period
+const LOG_RETENTION_DAYS = 7; // Keep logs for 7 days only
+const SHADOW_CLEANUP_DAYS = 30; // Clean up old shadow states after 30 days
 
 const supabase = createClient(SB_URL, SB_KEY, { 
   auth: { persistSession: false },
@@ -145,6 +148,70 @@ async function checkRecentErrors(): Promise<{ shouldRun: boolean; message: strin
     console.error('⚠️ Error check failed:', err);
     return { shouldRun: true, message: 'Could not verify error rate' };
   }
+}
+
+/**
+ * Clean up old sync logs to prevent database bloat
+ */
+async function cleanupOldLogs(): Promise<void> {
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - LOG_RETENTION_DAYS);
+  
+  const { error } = await supabase
+    .from('sync_log')
+    .delete()
+    .lt('created_at', cutoffDate.toISOString());
+  
+  if (error) {
+    console.warn(`⚠️ Failed to cleanup old logs: ${error.message}`);
+  } else {
+    console.log(`✅ Cleaned up sync logs older than ${LOG_RETENTION_DAYS} days`);
+  }
+}
+
+/**
+ * Clean up old shadow states to prevent database bloat
+ */
+async function cleanupOldShadows(): Promise<void> {
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - SHADOW_CLEANUP_DAYS);
+  
+  const { error } = await supabase
+    .from('sync_shadow')
+    .delete()
+    .lt('updated_at', cutoffDate.toISOString());
+  
+  if (error) {
+    console.warn(`⚠️ Failed to cleanup old shadows: ${error.message}`);
+  } else {
+    console.log(`✅ Cleaned up shadow states older than ${SHADOW_CLEANUP_DAYS} days`);
+  }
+}
+
+/**
+ * Check how many records have been synced in the last 24 hours
+ */
+async function checkDailyQuota(): Promise<{ processed: number; remaining: number; allowed: boolean }> {
+  const oneDayAgo = new Date();
+  oneDayAgo.setHours(oneDayAgo.getHours() - 24);
+  
+  const { count, error } = await supabase
+    .from('sync_log')
+    .select('*', { count: 'exact', head: true })
+    .gte('created_at', oneDayAgo.toISOString());
+  
+  if (error) {
+    console.warn(`⚠️ Failed to check daily quota: ${error.message}`);
+    return { processed: 0, remaining: MAX_DAILY_SYNC_RECORDS, allowed: true };
+  }
+  
+  const processed = count || 0;
+  const remaining = Math.max(0, MAX_DAILY_SYNC_RECORDS - processed);
+  const allowed = remaining > 0;
+  
+  console.log(`📊 Daily quota: ${processed}/${MAX_DAILY_SYNC_RECORDS} records processed (${remaining} remaining)`);
+  
+  return { processed, remaining, allowed };
 }
 
 // ============================================================================
@@ -1374,7 +1441,7 @@ async function runFullSyncBatch(opts: {
     for (let i = st.idx; i < list.length; i++) {
       const email = list[i];
 
-      // Stop conditions
+      // Stop condition 1: Rate limit
       if (LAST_RATE.remaining !== undefined && LAST_RATE.remaining < adaptiveMinRemaining) {
         const nextRunMs = LAST_RATE.retryAfter ? LAST_RATE.retryAfter * 1000 : 120_000; // 2 min default
         st.idx = i;
@@ -1384,6 +1451,25 @@ async function runFullSyncBatch(opts: {
         return { ok: true, paused: 'rate-limit', phase, idx: i, next_run_at: st.next_run_at };
       }
 
+      // Stop condition 2: Daily quota check (every 10 records to avoid too many DB queries)
+      if (processed > 0 && processed % 10 === 0) {
+        const quota = await checkDailyQuota();
+        if (!quota.allowed || quota.remaining < 100) {
+          st.idx = i;
+          await putFullState(st);
+          console.log(`⏸️ Daily quota exhausted: ${quota.processed}/${MAX_DAILY_SYNC_RECORDS} - pausing sync`);
+          return { 
+            ok: true, 
+            paused: 'quota-exhausted', 
+            phase, 
+            idx: i, 
+            quota,
+            message: 'Daily sync quota reached. Will resume automatically tomorrow.'
+          };
+        }
+      }
+
+      // Stop condition 3: Batch limits (time/items)
       const elapsed = Date.now() - t0;
       if (processed >= adaptiveMaxItems || elapsed > adaptiveTimeBudget) {
         st.idx = i;
@@ -1590,6 +1676,26 @@ serve(async (req) => {
       );
     }
     console.log('✅ Error rate within acceptable limits');
+    
+    // 4. Check daily quota
+    const quota = await checkDailyQuota();
+    if (!quota.allowed) {
+      console.error(`❌ Daily quota exceeded: ${quota.processed}/${MAX_DAILY_SYNC_RECORDS} records processed in last 24h`);
+      return new Response(
+        JSON.stringify({
+          status: 'quota_exceeded',
+          message: `Daily sync quota exceeded: ${quota.processed}/${MAX_DAILY_SYNC_RECORDS} records. Quota resets in ${24 - new Date().getHours()} hours.`,
+          quota,
+          timestamp: new Date().toISOString(),
+        }),
+        { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    console.log(`✅ Daily quota OK: ${quota.remaining} records remaining`);
+    
+    // 5. Cleanup old data before starting
+    await cleanupOldLogs();
+    await cleanupOldShadows();
     
     console.log('🛡️ All resource checks passed, proceeding with sync\n');
     
