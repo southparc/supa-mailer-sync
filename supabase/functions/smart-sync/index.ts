@@ -59,7 +59,68 @@ const supabase = createClient(SB_URL, SB_KEY, {
 // Managed groups that we're allowed to remove (others stay untouched)
 const MANAGED_GROUPS = ['BpvdhEmail', 'BpvdhPhone', 'BpvdhCity'];
 
-// Global rate limit tracking
+// ============================================================================
+// Token Bucket Rate Limiter for MailerLite API (120 req/min)
+// ============================================================================
+
+const MAILERLITE_RATE_LIMIT = 120; // requests per minute
+const RATE_WINDOW_MS = 60000; // 1 minute
+
+class TokenBucket {
+  tokens: number;
+  lastRefill: number;
+  tokensPerMs: number;
+  maxTokens: number;
+  
+  constructor(maxTokens: number, windowMs: number) {
+    this.maxTokens = maxTokens;
+    this.tokens = maxTokens;
+    this.lastRefill = Date.now();
+    this.tokensPerMs = maxTokens / windowMs;
+  }
+  
+  async acquire(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastRefill;
+    
+    // Refill tokens based on time elapsed
+    this.tokens = Math.min(
+      this.maxTokens,
+      this.tokens + (elapsed * this.tokensPerMs)
+    );
+    this.lastRefill = now;
+    
+    // If no tokens available, wait
+    if (this.tokens < 1) {
+      const waitMs = Math.ceil((1 - this.tokens) / this.tokensPerMs);
+      console.log(`🪣 Token bucket empty, waiting ${waitMs}ms...`);
+      await new Promise(r => setTimeout(r, waitMs));
+      this.tokens = 1;
+    }
+    
+    // Consume one token
+    this.tokens -= 1;
+  }
+  
+  getAvailable(): number {
+    const now = Date.now();
+    const elapsed = now - this.lastRefill;
+    return Math.min(
+      this.maxTokens,
+      this.tokens + (elapsed * this.tokensPerMs)
+    );
+  }
+  
+  getUtilization(): number {
+    const available = this.getAvailable();
+    return ((this.maxTokens - available) / this.maxTokens) * 100;
+  }
+}
+
+// Global rate limiter instance
+const mlRateLimiter = new TokenBucket(MAILERLITE_RATE_LIMIT, RATE_WINDOW_MS);
+
+// Legacy rate tracking for backward compatibility
 const LAST_RATE = { remaining: undefined as number | undefined, retryAfter: undefined as number | undefined };
 let MANAGED_GROUPS_CACHE: Set<string> | null = null;
 
@@ -262,7 +323,7 @@ async function generateDedupeKey(email: string, action: string, payload: any): P
 }
 
 /**
- * Phase 2.1: Retry with exponential backoff + rate limit tracking
+ * Phase 2.1: Retry with exponential backoff + proactive rate limiting via token bucket
  */
 async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = false): Promise<Response> {
   if (dryRun) {
@@ -270,27 +331,18 @@ async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = fa
     return new Response(JSON.stringify({ data: { id: 'dry-run-id' } }), { status: 200 });
   }
 
-  // Persist minimal throttling across requests within the same function instance
-  const g: any = globalThis as any;
-  if (typeof g.__ml_nextAllowedAt !== 'number') g.__ml_nextAllowedAt = 0;
-  const MIN_DELAY_MS = 350; // base pacing to avoid bursts
   const MAX_BACKOFF_MS = 60_000; // cap waits to 60s
 
   function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
   let last: Response | null = null;
   for (let i = 0; i < tries; i++) {
-    // Global pacing to smooth out requests
-    const now = Date.now();
-    if (now < g.__ml_nextAllowedAt) {
-      const wait = g.__ml_nextAllowedAt - now;
-      console.log(`  ⏸️ Throttling ${wait}ms before request`);
-      await sleep(wait);
-    }
+    // ⭐ PROACTIVE RATE LIMITING: Acquire token before making request
+    await mlRateLimiter.acquire();
 
     const res = await fetch(url, init);
 
-    // Track rate limits globally for batch mode
+    // Track rate limits for observability
     const rlRemaining = res.headers.get('X-RateLimit-Remaining');
     const rlReset = res.headers.get('X-RateLimit-Reset');
     const retryAfter = res.headers.get('Retry-After');
@@ -299,15 +351,6 @@ async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = fa
       const remaining = parseInt(rlRemaining, 10);
       if (!Number.isNaN(remaining)) {
         LAST_RATE.remaining = remaining;
-        // store for observability
-        await supabase.from('sync_state').upsert({
-          key: 'mailerlite_rate_limit',
-          value: { remaining, reset: rlReset, ts: new Date().toISOString() },
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'key' });
-        if (remaining <= 1) {
-          console.warn(`⚠️ Rate limit low: ${remaining} remaining`);
-        }
       }
     }
     
@@ -317,11 +360,24 @@ async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = fa
         LAST_RATE.retryAfter = raNum;
       }
     }
+    
+    // Update rate limit status for monitoring (fire-and-forget)
+    const tokensAvailable = mlRateLimiter.getAvailable();
+    const utilization = mlRateLimiter.getUtilization();
+    supabase.from('sync_state').upsert({
+      key: 'mailerlite_rate_limit_status',
+      value: { 
+        tokensAvailable: Math.floor(tokensAvailable),
+        utilizationPercent: utilization.toFixed(1),
+        requestsInLastMinute: MAILERLITE_RATE_LIMIT - Math.floor(tokensAvailable),
+        headerRemaining: rlRemaining ? parseInt(rlRemaining, 10) : null,
+        timestamp: new Date().toISOString()
+      },
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'key' }).then(() => {/* success */}, () => {/* ignore errors */});
 
     if (res.status !== 429 && res.status < 500) {
       // Success or client error (not retryable)
-      // Set a small next allowed window to pace bursts
-      g.__ml_nextAllowedAt = Date.now() + MIN_DELAY_MS;
       return res;
     }
 
@@ -329,29 +385,57 @@ async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = fa
     let waitMs = 0;
     if (retryAfter) {
       const raNum = Number(retryAfter);
-      if (!Number.isNaN(raNum)) waitMs = Math.max(raNum * 1000, MIN_DELAY_MS);
+      if (!Number.isNaN(raNum)) waitMs = Math.max(raNum * 1000, 1000);
     }
     if (!waitMs && rlReset) {
       const resetEpoch = Number(rlReset);
       if (!Number.isNaN(resetEpoch)) {
         // if looks like seconds epoch
         const resetMs = resetEpoch < 1e12 ? resetEpoch * 1000 : resetEpoch;
-        waitMs = Math.max(resetMs - Date.now(), MIN_DELAY_MS);
+        waitMs = Math.max(resetMs - Date.now(), 1000);
       }
     }
     if (!waitMs) {
       // Exponential backoff with jitter
       const base = Math.min(MAX_BACKOFF_MS, Math.pow(2, i) * 1000);
       const jitter = Math.floor(Math.random() * 250);
-      waitMs = Math.max(MIN_DELAY_MS, base + jitter);
+      waitMs = Math.max(1000, base + jitter);
     }
 
     last = res;
     console.log(`  ⏳ Retry ${i + 1}/${tries} after ${waitMs}ms (status: ${res.status})`);
-    g.__ml_nextAllowedAt = Date.now() + waitMs;
     await sleep(waitMs);
   }
   return last!;
+}
+
+/**
+ * Calculate optimal batch size based on available rate limit tokens
+ */
+function calculateOptimalBatchSize(operation: 'AtoB' | 'BtoA'): number {
+  const availableTokens = mlRateLimiter.getAvailable();
+  
+  if (operation === 'AtoB') {
+    // A→B: 1-2 API calls per email (update subscriber + maybe groups)
+    // Leave 30% buffer for retries and other calls
+    return Math.max(5, Math.floor(availableTokens * 0.7 / 2));
+  } else {
+    // B→A: 1 API call per email (fetch subscriber)
+    // Leave 30% buffer
+    return Math.max(5, Math.floor(availableTokens * 0.7));
+  }
+}
+
+/**
+ * Get adaptive batch multiplier based on database health and rate limit usage
+ */
+function getAdaptiveBatchMultiplier(dbHealthy: boolean): number {
+  const utilization = mlRateLimiter.getUtilization();
+  
+  if (!dbHealthy) return 0.3; // Slow down if DB struggling
+  if (utilization > 80) return 0.5; // Conservative when heavily utilized
+  if (utilization > 50) return 0.8; // Balanced mode
+  return 1.0; // Full speed ahead
 }
 
 /**
@@ -1367,12 +1451,18 @@ async function runFullSyncBatch(opts: {
     throw new Error(`Database health check failed: ${healthCheck.message}`);
   }
   
-  // Adaptive batch sizing for safety (reduce resource usage)
-  const adaptiveMaxItems = Math.min(opts.maxItems, 200); // Cap at 200 items per batch
-  const adaptiveTimeBudget = Math.min(opts.timeBudgetMs, 45000); // Cap at 45s
-  const adaptiveMinRemaining = Math.max(opts.minRemaining, 15000); // At least 15s buffer
+  // Get adaptive batch multiplier based on DB health
+  const batchMultiplier = getAdaptiveBatchMultiplier(healthCheck.healthy);
   
-  console.log(`🔧 Adaptive limits: maxItems=${adaptiveMaxItems}/${opts.maxItems}, timeBudget=${adaptiveTimeBudget}ms, minRemaining=${adaptiveMinRemaining}ms`);
+  // Adaptive batch sizing for safety (reduce resource usage)
+  const adaptiveMaxItems = Math.max(5, Math.floor(Math.min(opts.maxItems, 200) * batchMultiplier));
+  const adaptiveTimeBudget = Math.min(opts.timeBudgetMs, 45000); // Cap at 45s
+  
+  const tokensAvailable = mlRateLimiter.getAvailable();
+  const utilization = mlRateLimiter.getUtilization();
+  
+  console.log(`🔧 Adaptive limits: maxItems=${adaptiveMaxItems}/${opts.maxItems} (multiplier: ${batchMultiplier.toFixed(2)}), timeBudget=${adaptiveTimeBudget}ms`);
+  console.log(`🪣 Rate limit status: ${Math.floor(tokensAvailable)}/${MAILERLITE_RATE_LIMIT} tokens available (${utilization.toFixed(1)}% utilized)`);
   
   let st = await getFullState();
 
@@ -1435,20 +1525,36 @@ async function runFullSyncBatch(opts: {
 
     const list: string[] = st[phase] ?? [];
     let processed = 0;
-
+    
+    // Calculate optimal batch size for this phase based on operation type
+    const operationType = phase === 'onlyInSB' ? 'AtoB' : 'BtoA';
+    const optimalBatchSize = calculateOptimalBatchSize(operationType);
+    const finalBatchSize = Math.min(adaptiveMaxItems, optimalBatchSize);
+    
     console.log(`\n🟢 Processing phase: ${phase} (${list.length - st.idx} remaining)`);
+    console.log(`📊 Rate limit budget: ${Math.floor(mlRateLimiter.getAvailable())} tokens, processing up to ${finalBatchSize} items`);
 
     for (let i = st.idx; i < list.length; i++) {
       const email = list[i];
 
-      // Stop condition 1: Rate limit
-      if (LAST_RATE.remaining !== undefined && LAST_RATE.remaining < adaptiveMinRemaining) {
-        const nextRunMs = LAST_RATE.retryAfter ? LAST_RATE.retryAfter * 1000 : 120_000; // 2 min default
+      // Stop condition 1: Proactive rate limit pause (BEFORE hitting limit)
+      const tokensLeft = mlRateLimiter.getAvailable();
+      if (tokensLeft < 10) {
+        // Proactively pause before hitting rate limit
+        const nextRunMs = 60000; // Resume in 1 minute when tokens refill
         st.idx = i;
         st.next_run_at = new Date(Date.now() + nextRunMs).toISOString();
         await putFullState(st);
-        console.log(`⏸️ Rate limit hit: remaining=${LAST_RATE.remaining}, pausing until ${st.next_run_at}`);
-        return { ok: true, paused: 'rate-limit', phase, idx: i, next_run_at: st.next_run_at };
+        console.log(`⏸️ Rate limit budget low (${Math.floor(tokensLeft)} tokens), pausing until ${st.next_run_at}`);
+        return { 
+          ok: true, 
+          paused: 'rate-limit-proactive', 
+          phase, 
+          idx: i, 
+          next_run_at: st.next_run_at,
+          tokensRemaining: Math.floor(tokensLeft),
+          processed
+        };
       }
 
       // Stop condition 2: Daily quota check (every 10 records to avoid too many DB queries)
@@ -1469,12 +1575,12 @@ async function runFullSyncBatch(opts: {
         }
       }
 
-      // Stop condition 3: Batch limits (time/items)
+      // Stop condition 3: Batch limits (time/items/rate budget)
       const elapsed = Date.now() - t0;
-      if (processed >= adaptiveMaxItems || elapsed > adaptiveTimeBudget) {
+      if (processed >= finalBatchSize || elapsed > adaptiveTimeBudget) {
         st.idx = i;
         await putFullState(st);
-        console.log(`⏸️ Batch limit reached: processed=${processed}, elapsed=${elapsed}ms`);
+        console.log(`⏸️ Batch limit reached: processed=${processed}/${finalBatchSize}, elapsed=${elapsed}ms, tokens left: ${Math.floor(mlRateLimiter.getAvailable())}`);
         return { ok: true, paused: 'batch-limit', phase, idx: i, processed };
       }
 
@@ -1506,8 +1612,12 @@ async function runFullSyncBatch(opts: {
 
       processed++;
       
-      // Small throttle between records
-      await new Promise(r => setTimeout(r, 50));
+      // Log rate limit status every 10 records
+      if (processed % 10 === 0) {
+        const currentTokens = mlRateLimiter.getAvailable();
+        const currentUtil = mlRateLimiter.getUtilization();
+        console.log(`  📊 Progress: ${processed} items | Tokens: ${Math.floor(currentTokens)}/${MAILERLITE_RATE_LIMIT} (${currentUtil.toFixed(1)}% used)`);
+      }
     }
 
     // Phase completed - move to next
