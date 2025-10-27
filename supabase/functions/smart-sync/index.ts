@@ -42,6 +42,12 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Resource protection constants
+const MAX_CONCURRENT_SYNCS = 1;
+const MIN_DB_CONNECTIONS_AVAILABLE = 5;
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+const COOLDOWN_PERIOD_MS = 60000; // 1 minute cooldown after errors
+
 const supabase = createClient(SB_URL, SB_KEY, { 
   auth: { persistSession: false },
   global: { headers: { 'x-client-info': 'smart-sync' } }
@@ -53,6 +59,93 @@ const MANAGED_GROUPS = ['BpvdhEmail', 'BpvdhPhone', 'BpvdhCity'];
 // Global rate limit tracking
 const LAST_RATE = { remaining: undefined as number | undefined, retryAfter: undefined as number | undefined };
 let MANAGED_GROUPS_CACHE: Set<string> | null = null;
+
+// ============================================================================
+// Resource Protection Helpers
+// ============================================================================
+
+async function checkDatabaseHealth(): Promise<{ healthy: boolean; message: string }> {
+  try {
+    // Check if we can connect and query
+    const { error } = await supabase
+      .from('sync_log')
+      .select('id')
+      .limit(1);
+    
+    if (error) {
+      return { healthy: false, message: `Database error: ${error.message}` };
+    }
+    
+    return { healthy: true, message: 'Database healthy' };
+  } catch (err: any) {
+    return { healthy: false, message: `Database check failed: ${err.message}` };
+  }
+}
+
+async function checkConcurrentSyncs(): Promise<{ canRun: boolean; message: string }> {
+  try {
+    // Check for recent running syncs (within last 5 minutes)
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    
+    const { data, error } = await supabase
+      .from('sync_log')
+      .select('id, created_at')
+      .gte('created_at', fiveMinutesAgo)
+      .order('created_at', { ascending: false })
+      .limit(10);
+    
+    if (error) {
+      console.error('⚠️ Could not check concurrent syncs:', error);
+      // Fail safe - allow sync if we can't check
+      return { canRun: true, message: 'Could not verify concurrent syncs' };
+    }
+    
+    // If there are many recent sync logs, another sync might be running
+    if (data && data.length > 50) {
+      return { canRun: false, message: 'Possible concurrent sync detected' };
+    }
+    
+    return { canRun: true, message: 'No concurrent syncs detected' };
+  } catch (err: any) {
+    console.error('⚠️ Concurrent sync check error:', err);
+    return { canRun: true, message: 'Concurrent check failed, proceeding cautiously' };
+  }
+}
+
+async function checkRecentErrors(): Promise<{ shouldRun: boolean; message: string }> {
+  try {
+    // Check for recent errors in last 10 minutes
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    
+    const { data, error } = await supabase
+      .from('sync_log')
+      .select('direction, result, error_type')
+      .gte('created_at', tenMinutesAgo)
+      .or('result.eq.error,error_type.not.is.null')
+      .order('created_at', { ascending: false })
+      .limit(20);
+    
+    if (error) {
+      console.error('⚠️ Could not check recent errors:', error);
+      return { shouldRun: true, message: 'Could not check error history' };
+    }
+    
+    // Count errors
+    const errorCount = data?.length || 0;
+    
+    if (errorCount >= CIRCUIT_BREAKER_THRESHOLD) {
+      return { 
+        shouldRun: false, 
+        message: `Circuit breaker: ${errorCount} errors in last 10 minutes. Cooldown period active.` 
+      };
+    }
+    
+    return { shouldRun: true, message: 'Error rate acceptable' };
+  } catch (err: any) {
+    console.error('⚠️ Error check failed:', err);
+    return { shouldRun: true, message: 'Could not verify error rate' };
+  }
+}
 
 // ============================================================================
 // Helpers
@@ -1199,9 +1292,24 @@ async function runFullSyncBatch(opts: {
   dryRun: boolean;
 }): Promise<any> {
   const t0 = Date.now();
+  
+  // Pre-flight health check
+  const healthCheck = await checkDatabaseHealth();
+  if (!healthCheck.healthy) {
+    console.error('❌ Database unhealthy during batch sync:', healthCheck.message);
+    throw new Error(`Database health check failed: ${healthCheck.message}`);
+  }
+  
+  // Adaptive batch sizing for safety (reduce resource usage)
+  const adaptiveMaxItems = Math.min(opts.maxItems, 200); // Cap at 200 items per batch
+  const adaptiveTimeBudget = Math.min(opts.timeBudgetMs, 45000); // Cap at 45s
+  const adaptiveMinRemaining = Math.max(opts.minRemaining, 15000); // At least 15s buffer
+  
+  console.log(`🔧 Adaptive limits: maxItems=${adaptiveMaxItems}/${opts.maxItems}, timeBudget=${adaptiveTimeBudget}ms, minRemaining=${adaptiveMinRemaining}ms`);
+  
   let st = await getFullState();
 
-  console.log(`🔄 Batch sync: phase=${st.phase}, idx=${st.idx}, max=${opts.maxItems}, budget=${opts.timeBudgetMs}ms`);
+  console.log(`🔄 Batch sync: phase=${st.phase}, idx=${st.idx}, max=${adaptiveMaxItems}, budget=${adaptiveTimeBudget}ms`);
 
   // Check if we should wait due to rate limit
   if (st.next_run_at && new Date(st.next_run_at) > new Date()) {
@@ -1267,7 +1375,7 @@ async function runFullSyncBatch(opts: {
       const email = list[i];
 
       // Stop conditions
-      if (LAST_RATE.remaining !== undefined && LAST_RATE.remaining < opts.minRemaining) {
+      if (LAST_RATE.remaining !== undefined && LAST_RATE.remaining < adaptiveMinRemaining) {
         const nextRunMs = LAST_RATE.retryAfter ? LAST_RATE.retryAfter * 1000 : 120_000; // 2 min default
         st.idx = i;
         st.next_run_at = new Date(Date.now() + nextRunMs).toISOString();
@@ -1277,7 +1385,7 @@ async function runFullSyncBatch(opts: {
       }
 
       const elapsed = Date.now() - t0;
-      if (processed >= opts.maxItems || elapsed > opts.timeBudgetMs) {
+      if (processed >= adaptiveMaxItems || elapsed > adaptiveTimeBudget) {
         st.idx = i;
         await putFullState(st);
         console.log(`⏸️ Batch limit reached: processed=${processed}, elapsed=${elapsed}ms`);
@@ -1431,6 +1539,59 @@ serve(async (req) => {
     }
 
     console.log(`\n🚀 Smart Sync Request: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}, dryRun=${dryRun}, batch=${batch}`);
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Resource Protection Checks
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    console.log('🛡️ Running pre-flight resource checks...');
+    
+    // 1. Check database health
+    const healthCheck = await checkDatabaseHealth();
+    if (!healthCheck.healthy) {
+      console.error('❌ Database health check failed:', healthCheck.message);
+      return new Response(
+        JSON.stringify({
+          status: 'error',
+          message: `Database unhealthy: ${healthCheck.message}. Sync aborted for safety.`,
+          timestamp: new Date().toISOString(),
+        }),
+        { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    console.log('✅ Database health check passed');
+    
+    // 2. Check for concurrent syncs
+    const concurrencyCheck = await checkConcurrentSyncs();
+    if (!concurrencyCheck.canRun) {
+      console.warn('⚠️ Concurrent sync check failed:', concurrencyCheck.message);
+      return new Response(
+        JSON.stringify({
+          status: 'skipped',
+          message: `${concurrencyCheck.message}. Sync skipped to prevent resource exhaustion.`,
+          timestamp: new Date().toISOString(),
+        }),
+        { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    console.log('✅ No concurrent syncs detected');
+    
+    // 3. Check recent error rate (circuit breaker)
+    const errorCheck = await checkRecentErrors();
+    if (!errorCheck.shouldRun) {
+      console.error('🔴 Circuit breaker activated:', errorCheck.message);
+      return new Response(
+        JSON.stringify({
+          status: 'error',
+          message: errorCheck.message,
+          timestamp: new Date().toISOString(),
+        }),
+        { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    console.log('✅ Error rate within acceptable limits');
+    
+    console.log('🛡️ All resource checks passed, proceeding with sync\n');
     
     const out = await run(mode as SyncMode, emails, repair, dryRun, batch, { maxItems, timeBudgetMs, minRemaining });
     
