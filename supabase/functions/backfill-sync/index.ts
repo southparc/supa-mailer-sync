@@ -159,7 +159,7 @@ async function processBackfillChunk(supabase: any, mailerLiteApiKey: string, pro
       progress.crosswalkCreated += clientsResult.crosswalkCreated
       progress.totalProcessed += clientsResult.totalProcessed
       progress.errors += clientsResult.errors
-      progress.clientOffset += RECORDS_PER_CHUNK
+      progress.clientOffset += clientsResult.totalProcessed // Only increment by actual records processed
       progress.lastUpdatedAt = new Date().toISOString()
       
       // Check if phase 1 is complete
@@ -200,7 +200,7 @@ async function processBackfillChunk(supabase: any, mailerLiteApiKey: string, pro
       
       progress.shadowsCreated += shadowResult.shadowsCreated
       progress.errors += shadowResult.errors
-      progress.shadowOffset += RECORDS_PER_CHUNK
+      progress.shadowOffset += shadowResult.recordsProcessed // Only increment by actual records processed
       progress.lastUpdatedAt = new Date().toISOString()
       
       // Check if phase 3 is complete
@@ -524,7 +524,7 @@ async function buildSubscriberCrosswalkChunk(supabase: any, apiKey: string, curs
   }
 }
 
-async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: number, limit: number): Promise<{shadowsCreated: number, errors: number, hasMore: boolean}> {
+async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: number, limit: number): Promise<{shadowsCreated: number, errors: number, recordsProcessed: number, hasMore: boolean}> {
   let shadowsCreated = 0
   let errors = 0
 
@@ -538,7 +538,7 @@ async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: 
 
     if (error) throw error
     if (!crosswalks || crosswalks.length === 0) {
-      return { shadowsCreated, errors, hasMore: false }
+      return { shadowsCreated, errors, recordsProcessed: 0, hasMore: false }
     }
 
     console.log(`📦 Creating shadow batch: ${offset + 1}-${offset + crosswalks.length}`)
@@ -605,10 +605,10 @@ async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: 
       }
     }
 
-    return { shadowsCreated, errors, hasMore: crosswalks.length === limit }
+    return { shadowsCreated, errors, recordsProcessed: crosswalks.length, hasMore: crosswalks.length === limit }
   } catch (error) {
     console.error('Error in shadow creation chunk:', error)
-    return { shadowsCreated, errors: errors + 1, hasMore: false }
+    return { shadowsCreated, errors: errors + 1, recordsProcessed: 0, hasMore: false }
   }
 }
 
