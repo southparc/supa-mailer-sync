@@ -26,6 +26,8 @@ export default function Dashboard() {
   const [user, setUser] = useState(null);
   const [session, setSession] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [checkingAdmin, setCheckingAdmin] = useState(true);
   const [stats, setStats] = useState<DashboardStats>({
     totalClients: 0,
     totalGroups: 0,
@@ -64,6 +66,39 @@ export default function Dashboard() {
       loadDashboardStats();
     }
   }, [user]);
+
+  useEffect(() => {
+    const checkAdminStatus = async () => {
+      if (!session?.user) {
+        setCheckingAdmin(false);
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from('user_roles')
+        .select('role')
+        .eq('user_id', session.user.id)
+        .eq('role', 'admin')
+        .maybeSingle();
+
+      if (error || !data) {
+        setIsAdmin(false);
+        toast({
+          title: "Access Denied",
+          description: "You don't have permission to access this dashboard.",
+          variant: "destructive",
+        });
+        navigate("/auth");
+      } else {
+        setIsAdmin(true);
+      }
+      setCheckingAdmin(false);
+    };
+
+    if (session?.user) {
+      checkAdminStatus();
+    }
+  }, [session, navigate, toast]);
 
   const loadDashboardStats = async () => {
     try {
@@ -110,18 +145,20 @@ export default function Dashboard() {
     }
   };
 
-  if (loading) {
+  if (loading || checkingAdmin) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
         <div className="text-center">
-          <RefreshCw className="h-8 w-8 animate-spin mx-auto mb-4" />
-          <p>Loading dashboard...</p>
+          <RefreshCw className="h-8 w-8 animate-spin mx-auto mb-4 text-primary" />
+          <p className="text-muted-foreground">
+            {loading ? "Loading dashboard..." : "Verifying permissions..."}
+          </p>
         </div>
       </div>
     );
   }
 
-  if (!user) {
+  if (!user || !isAdmin) {
     return null; // Will redirect to auth
   }
 
