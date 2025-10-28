@@ -260,7 +260,7 @@ Deno.serve(async (req) => {
       throw new Error('MailerLite API key not configured')
     }
 
-    // Check if backfill is already running
+    // Check if backfill is already running (with stale-run recovery)
     const { data: existingProgress } = await supabase
       .from('sync_state')
       .select('value')
@@ -269,7 +269,10 @@ Deno.serve(async (req) => {
 
     if (existingProgress?.value) {
       const progress = existingProgress.value as BackfillProgress;
-      if (progress.status === 'running') {
+      const lastUpdateMs = progress.lastUpdatedAt ? (Date.now() - new Date(progress.lastUpdatedAt).getTime()) : Number.MAX_SAFE_INTEGER;
+      const isStale = progress.status === 'running' && lastUpdateMs > 3 * 60 * 1000; // >3 minutes
+
+      if (progress.status === 'running' && !isStale) {
         return new Response(
           JSON.stringify({ 
             error: 'Backfill already running',
@@ -280,6 +283,17 @@ Deno.serve(async (req) => {
             status: 409
           }
         );
+      }
+
+      if (isStale) {
+        console.warn('Stale backfill detected. Auto-restarting...', { lastUpdatedAt: progress.lastUpdatedAt });
+        // Mark previous run as failed (stale) so a new run can start
+        await saveProgress(supabase, {
+          ...progress,
+          phase: 'Stale - restarting',
+          status: 'failed',
+          lastUpdatedAt: new Date().toISOString(),
+        });
       }
     }
 
