@@ -1,5 +1,10 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
+// Declare EdgeRuntime for Deno Deploy
+declare const EdgeRuntime: {
+  waitUntil(promise: Promise<any>): void;
+} | undefined;
+
 // CORS headers for browser requests
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
