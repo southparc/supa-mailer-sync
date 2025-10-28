@@ -31,6 +31,14 @@ interface SyncStats {
   updatesApplied?: number;
 }
 
+interface SyncPercentage {
+  percentage: number;
+  totalMailerLite: number;
+  totalSupabase: number;
+  matched: number;
+  lastCalculated?: string;
+}
+
 interface Duplicate {
   name: string;
   count: number;
@@ -52,6 +60,12 @@ const EnterpriseSyncDashboard: React.FC = () => {
     subscribed: number;
     unsubscribed: number;
   }>({ total: 0, subscribed: 0, unsubscribed: 0 });
+  const [syncPercentage, setSyncPercentage] = useState<SyncPercentage>({
+    percentage: 0,
+    totalMailerLite: 0,
+    totalSupabase: 0,
+    matched: 0
+  });
   const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
   const { toast } = useToast();
 
@@ -86,10 +100,67 @@ const EnterpriseSyncDashboard: React.FC = () => {
   };
 
   useEffect(() => {
+    loadSyncStats();
     fetchSubscriptionStats();
     checkDuplicates();
     checkBatchState();
   }, []);
+
+  const loadSyncStats = async () => {
+    try {
+      // Load last sync timestamp from sync_log
+      const { data: logData } = await supabase
+        .from('sync_log')
+        .select('created_at')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      
+      // Load persistent statistics from sync_state
+      const { data: statsData } = await supabase
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'sync_statistics')
+        .maybeSingle();
+      
+      // Load sync percentage from sync_state
+      const { data: percentageData } = await supabase
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'sync_percentage_status')
+        .maybeSingle();
+      
+      if (logData?.created_at) {
+        setStats(prev => ({
+          ...prev,
+          lastSync: logData.created_at
+        }));
+      }
+      
+      if (statsData?.value && typeof statsData.value === 'object') {
+        const persistedStats = statsData.value as any;
+        setStats(prev => ({
+          ...prev,
+          recordsProcessed: persistedStats.recordsProcessed || 0,
+          updatesApplied: persistedStats.updatesApplied || 0,
+          conflicts: persistedStats.conflicts || prev.conflicts
+        }));
+      }
+      
+      if (percentageData?.value && typeof percentageData.value === 'object') {
+        const percentData = percentageData.value as any;
+        setSyncPercentage({
+          percentage: percentData.percentage || 0,
+          totalMailerLite: percentData.totalMailerLite || 0,
+          totalSupabase: percentData.totalSupabase || 0,
+          matched: percentData.matched || 0,
+          lastCalculated: percentData.lastCalculated
+        });
+      }
+    } catch (error) {
+      console.error('Failed to load sync stats:', error);
+    }
+  };
 
   const checkDuplicates = async () => {
     try {
@@ -261,6 +332,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
       setSyncProgress(100);
       
       await fetchSubscriptionStats();
+      await loadSyncStats(); // Reload stats including sync percentage
       
       toast({
         title: "Sync Completed",
@@ -366,7 +438,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
       )}
 
       {/* Stats Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-base">Totaal Clients</CardTitle>
@@ -379,6 +451,35 @@ const EnterpriseSyncDashboard: React.FC = () => {
             <p className="text-xs text-muted-foreground mt-1">
               {subscriptionStats.subscribed} geabonneerd, {subscriptionStats.unsubscribed} afgemeld
             </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base">Sync Status</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-2xl font-bold">
+                  {syncPercentage.percentage.toFixed(1)}%
+                </span>
+                {syncPercentage.percentage >= 95 ? (
+                  <CheckCircle className="h-5 w-5 text-green-500" />
+                ) : syncPercentage.percentage >= 80 ? (
+                  <AlertTriangle className="h-5 w-5 text-orange-500" />
+                ) : (
+                  <XCircle className="h-5 w-5 text-red-500" />
+                )}
+              </div>
+              <Progress 
+                value={syncPercentage.percentage} 
+                className="h-2"
+              />
+              <p className="text-xs text-muted-foreground">
+                {syncPercentage.matched} van {Math.max(syncPercentage.totalMailerLite, syncPercentage.totalSupabase)} records in sync
+              </p>
+            </div>
           </CardContent>
         </Card>
         

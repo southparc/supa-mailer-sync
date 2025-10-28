@@ -327,6 +327,122 @@ async function updateLastSyncTimestamp(): Promise<void> {
 }
 
 /**
+ * Save cumulative sync statistics to sync_state
+ */
+async function saveSyncStatistics(stats: { created: number; updated: number; skipped: number; errors: number; conflicts?: number }): Promise<void> {
+  try {
+    // Load existing stats
+    const { data: existing } = await supabase
+      .from('sync_state')
+      .select('value')
+      .eq('key', 'sync_statistics')
+      .maybeSingle();
+    
+    const existingStats = (existing?.value as any) || { recordsProcessed: 0, updatesApplied: 0, conflicts: 0 };
+    
+    // Increment cumulative stats
+    const updatedStats = {
+      recordsProcessed: (existingStats.recordsProcessed || 0) + (stats.created + stats.updated),
+      updatesApplied: (existingStats.updatesApplied || 0) + (stats.created + stats.updated),
+      conflicts: (existingStats.conflicts || 0) + (stats.conflicts || 0),
+      lastUpdated: new Date().toISOString()
+    };
+    
+    const { error } = await supabase
+      .from('sync_state')
+      .upsert({ 
+        key: 'sync_statistics', 
+        value: updatedStats, 
+        updated_at: new Date().toISOString() 
+      }, { onConflict: 'key' });
+    
+    if (error) {
+      console.error('Failed to save sync statistics:', error);
+    } else {
+      console.log(`✅ Saved sync statistics: ${JSON.stringify(updatedStats)}`);
+    }
+  } catch (error) {
+    console.error('Error saving sync statistics:', error);
+  }
+}
+
+/**
+ * Calculate and save sync percentage between MailerLite and Supabase
+ */
+async function calculateAndSaveSyncPercentage(): Promise<void> {
+  try {
+    console.log('📊 Calculating sync percentage...');
+    
+    // Get total MailerLite subscribers
+    const mlResponse = await retryFetch(`${ML_BASE}/subscribers?limit=1`, {
+      method: 'GET',
+      headers: { 
+        'Authorization': `Bearer ${ML_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (!mlResponse.ok) {
+      console.error('Failed to fetch MailerLite count');
+      return;
+    }
+    
+    const mlData = await mlResponse.json();
+    const totalMailerLite = mlData.meta?.total || 0;
+    
+    // Get total Supabase clients
+    const { count: totalSupabase, error: sbError } = await supabase
+      .from('clients')
+      .select('*', { count: 'exact', head: true });
+    
+    if (sbError) {
+      console.error('Failed to fetch Supabase count:', sbError);
+      return;
+    }
+    
+    // Get matched emails from crosswalk
+    const { count: matchedCount, error: matchError } = await supabase
+      .from('integration_crosswalk')
+      .select('*', { count: 'exact', head: true })
+      .not('a_id', 'is', null)
+      .not('b_id', 'is', null);
+    
+    if (matchError) {
+      console.error('Failed to fetch matched count:', matchError);
+      return;
+    }
+    
+    const matched = matchedCount || 0;
+    const total = Math.max(totalMailerLite, totalSupabase || 0);
+    const percentage = total > 0 ? (matched / total) * 100 : 0;
+    
+    const syncPercentageStatus = {
+      percentage,
+      totalMailerLite,
+      totalSupabase: totalSupabase || 0,
+      matched,
+      lastCalculated: new Date().toISOString()
+    };
+    
+    const { error } = await supabase
+      .from('sync_state')
+      .upsert({ 
+        key: 'sync_percentage_status', 
+        value: syncPercentageStatus, 
+        updated_at: new Date().toISOString() 
+      }, { onConflict: 'key' });
+    
+    if (error) {
+      console.error('Failed to save sync percentage:', error);
+    } else {
+      console.log(`✅ Sync percentage: ${percentage.toFixed(1)}% (${matched}/${total} records in sync)`);
+    }
+  } catch (error) {
+    console.error('Error calculating sync percentage:', error);
+  }
+}
+
+/**
  * Determine if incremental sync should be used
  * - Use incremental if last sync was less than 24 hours ago
  * - Otherwise do full sync
@@ -1631,7 +1747,7 @@ async function runFullSyncBatch(opts: {
     
     // Check if incremental sync is possible
     const lastSyncData = await getLastSyncTimestamp();
-    const incrementalFrom = shouldUseIncrementalSync(lastSyncData) ? lastSyncData.timestamp : undefined;
+    const incrementalFrom = shouldUseIncrementalSync(lastSyncData) && lastSyncData.timestamp ? lastSyncData.timestamp : undefined;
     
     const [mlMap, sbMap] = await Promise.all([
       getAllMailerLiteSubscribers(opts.dryRun, incrementalFrom),
@@ -1784,6 +1900,12 @@ async function runFullSyncBatch(opts: {
 
   // All done - update last sync timestamp
   await updateLastSyncTimestamp();
+  
+  // Calculate and save sync percentage
+  await calculateAndSaveSyncPercentage();
+  
+  // Save persistent statistics
+  await saveSyncStatistics(st.stats);
   
   console.log(`\n✅ Batch sync complete: ${JSON.stringify(st.stats)}`);
   return { ok: true, done: true, stats: st.stats };
