@@ -484,16 +484,45 @@ const EnterpriseSyncDashboard: React.FC = () => {
     setBackfillProgress({ phase: 'Starting...', processed: 0, total: totalClients });
 
     try {
-      toast({
-        title: "Backfill Started",
-        description: "This will take 20-40 minutes. Progress will update automatically.",
-      });
-
       const { data, error } = await supabase.functions.invoke('backfill-sync', {
         body: {}
       });
 
-      if (error) throw error;
+      // Handle 409 - backfill already running (not an error)
+      if (error) {
+        // Check if it's the "already running" 409 response
+        const errorStr = error.message || '';
+        if (errorStr.includes('non-2xx')) {
+          // Try to fetch current progress
+          const { data: progressData } = await supabase
+            .from('sync_state')
+            .select('value')
+            .eq('key', 'backfill_progress')
+            .maybeSingle();
+
+          if (progressData?.value) {
+            const progress = progressData.value as any;
+            if (progress.status === 'running') {
+              toast({
+                title: "Backfill Already Running",
+                description: "Monitoring the existing backfill process...",
+              });
+              // Continue to start polling below (don't throw)
+            } else {
+              throw error;
+            }
+          } else {
+            throw error;
+          }
+        } else {
+          throw error;
+        }
+      } else {
+        toast({
+          title: "Backfill Started",
+          description: "This will take 20-40 minutes. Progress will update automatically.",
+        });
+      }
 
       // Start polling for progress
       const progressInterval = setInterval(async () => {
