@@ -280,8 +280,33 @@ Deno.serve(async (req) => {
     if (existingProgress?.value) {
       progress = existingProgress.value as BackfillProgress
       
-      // If completed, start fresh
-      if (progress.status === 'completed') {
+      // Check for stale runs (no update in >5 minutes)
+      const lastUpdateMs = progress.lastUpdatedAt 
+        ? (Date.now() - new Date(progress.lastUpdatedAt).getTime()) 
+        : Number.MAX_SAFE_INTEGER;
+      const isStale = progress.status === 'running' && lastUpdateMs > 5 * 60 * 1000;
+
+      if (isStale) {
+        console.warn('Stale backfill detected (no update in 5+ minutes). Restarting...', {
+          lastUpdatedAt: progress.lastUpdatedAt,
+          minutesAgo: Math.floor(lastUpdateMs / 60000)
+        });
+        
+        // Start fresh from beginning
+        progress = {
+          phase: 'Phase 1: Building client crosswalk',
+          totalProcessed: 0,
+          crosswalkCreated: 0,
+          shadowsCreated: 0,
+          errors: 0,
+          startedAt: new Date().toISOString(),
+          lastUpdatedAt: new Date().toISOString(),
+          status: 'running',
+          clientOffset: 0,
+          subscriberCursor: null,
+          shadowOffset: 0
+        };
+      } else if (progress.status === 'completed') {
         console.log('Previous backfill completed, starting fresh')
         progress = {
           phase: 'Phase 1: Building client crosswalk',
