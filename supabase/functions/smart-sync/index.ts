@@ -1999,12 +1999,21 @@ serve(async (req) => {
       mode = "AtoB", 
       emails = [], 
       repair = false,
-      dryRun = false, // Phase 3.1: Dry-run mode
-      batch = false, // Batch mode for large syncs
+      dryRun = false,
+      batch = false,
       maxItems = 500,
       timeBudgetMs = 45000,
-      minRemaining = 60
+      minRemaining = 60,
+      ping = false // Healthcheck mode
     } = await req.json().catch(() => ({}));
+    
+    // Healthcheck endpoint
+    if (ping) {
+      return new Response(
+        JSON.stringify({ ok: true, service: 'smart-sync', version: '2.0', timestamp: new Date().toISOString() }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
     
     if (!["AtoB", "BtoA", "bidirectional", "full"].includes(mode)) {
       return new Response(
@@ -2096,6 +2105,25 @@ serve(async (req) => {
     
     const out = await run(mode as SyncMode, emails, repair, dryRun, batch, { maxItems, timeBudgetMs, minRemaining });
     
+    // Always persist state after any run (batch or non-batch)
+    if (!dryRun) {
+      await updateLastSyncTimestamp();
+      
+      // For non-batch runs, calculate stats from output
+      if (Array.isArray(out)) {
+        const stats = {
+          created: 0,
+          updated: out.length,
+          skipped: 0,
+          errors: 0,
+          conflicts: 0
+        };
+        await saveSyncStatistics(stats);
+        await calculateAndSaveSyncPercentage();
+      }
+      // For batch runs, stats are already saved inside runFullSyncBatch
+    }
+    
     console.log(`\n✅ Completed smart-sync: processed ${Array.isArray(out) ? out.length : 'batch/full sync'} records`);
     
     return new Response(
@@ -2112,7 +2140,7 @@ serve(async (req) => {
   } catch (e) {
     console.error("Smart-sync error:", e);
     return new Response(
-      JSON.stringify({ ok: false, error: String(e) }),
+      JSON.stringify({ ok: false, error: String(e), message: e instanceof Error ? e.message : String(e) }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }

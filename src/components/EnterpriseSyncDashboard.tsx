@@ -104,16 +104,37 @@ const EnterpriseSyncDashboard: React.FC = () => {
     fetchSubscriptionStats();
     checkDuplicates();
     checkBatchState();
+    
+    // Set up real-time subscription to sync_state
+    const channel = supabase
+      .channel('sync_state_updates')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'sync_state',
+          filter: 'key=in.(last_successful_sync,sync_statistics,sync_percentage_status)'
+        },
+        () => {
+          console.log('Sync state updated, reloading stats...');
+          loadSyncStats();
+        }
+      )
+      .subscribe();
+    
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
   const loadSyncStats = async () => {
     try {
-      // Load last sync timestamp from sync_log
-      const { data: logData } = await supabase
-        .from('sync_log')
-        .select('created_at')
-        .order('created_at', { ascending: false })
-        .limit(1)
+      // Load last sync timestamp from sync_state (primary source)
+      const { data: lastSyncData } = await supabase
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'last_successful_sync')
         .maybeSingle();
       
       // Load persistent statistics from sync_state
@@ -130,10 +151,11 @@ const EnterpriseSyncDashboard: React.FC = () => {
         .eq('key', 'sync_percentage_status')
         .maybeSingle();
       
-      if (logData?.created_at) {
+      if (lastSyncData?.value && typeof lastSyncData.value === 'object') {
+        const syncData = lastSyncData.value as any;
         setStats(prev => ({
           ...prev,
-          lastSync: logData.created_at
+          lastSync: syncData.timestamp || syncData.lastSync
         }));
       }
       
@@ -222,6 +244,30 @@ const EnterpriseSyncDashboard: React.FC = () => {
     }
   };
 
+  const checkConnection = async () => {
+    try {
+      const { data, error } = await supabase.functions.invoke('smart-sync', {
+        body: { ping: true }
+      });
+      
+      if (error) throw error;
+      
+      toast({
+        title: "Verbinding OK",
+        description: `Edge function bereikbaar (v${data?.version || 'unknown'})`,
+      });
+      return true;
+    } catch (error: any) {
+      console.error('Connection check failed:', error);
+      toast({
+        title: "Edge Function Onbereikbaar",
+        description: "Kan smart-sync functie niet bereiken. Check console logs.",
+        variant: "destructive",
+      });
+      return false;
+    }
+  };
+
   const handleSync = async (direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') => {
     if (syncStatus === 'syncing') {
       toast({
@@ -249,7 +295,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
           emails: [],
           repair: false,
           dryRun: false,
-          batch: true, // Enable batch mode
+          batch: true,
           maxItems: 500,
           timeBudgetMs: 45000,
           minRemaining: 60
@@ -260,6 +306,19 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
       if (error) {
         console.error('Smart-sync error:', error);
+        
+        // Check if it's a FunctionsFetchError (unreachable)
+        if (error.message?.includes('FunctionsFetchError') || error.message?.includes('Failed to fetch')) {
+          toast({
+            title: "Edge Function Onbereikbaar",
+            description: "Kan smart-sync niet aanroepen. Check netwerk/CORS.",
+            variant: "destructive",
+          });
+          setSyncStatus('idle');
+          setSyncProgress(0);
+          return;
+        }
+        
         throw error;
       }
 
@@ -436,6 +495,20 @@ const EnterpriseSyncDashboard: React.FC = () => {
           </CardContent>
         </Card>
       )}
+
+      {/* Connection Check */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Verbinding</CardTitle>
+          <CardDescription>Test de edge function bereikbaarheid</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Button onClick={checkConnection} variant="outline" size="sm">
+            <Activity className="mr-2 h-4 w-4" />
+            Test Verbinding
+          </Button>
+        </CardContent>
+      </Card>
 
       {/* Stats Overview */}
       <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
