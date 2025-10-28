@@ -130,6 +130,9 @@ interface BackfillProgress {
   startedAt: string
   lastUpdatedAt: string
   status: 'running' | 'completed' | 'failed'
+  clientOffset: number
+  subscriberCursor: string | null
+  shadowOffset: number
 }
 
 // Helper to save progress
@@ -143,80 +146,85 @@ async function saveProgress(supabase: any, progress: BackfillProgress): Promise<
     }, { onConflict: 'key' });
 }
 
-// Main background task
-async function runBackfillTask(supabase: any, mailerLiteApiKey: string, userId: string): Promise<void> {
-  const progress: BackfillProgress = {
-    phase: 'Starting',
-    totalProcessed: 0,
-    crosswalkCreated: 0,
-    shadowsCreated: 0,
-    errors: 0,
-    startedAt: new Date().toISOString(),
-    lastUpdatedAt: new Date().toISOString(),
-    status: 'running'
-  };
-
-  // Start heartbeat to show function is alive
-  const heartbeatInterval = setInterval(async () => {
-    if (progress.status === 'running') {
-      progress.lastUpdatedAt = new Date().toISOString();
-      await saveProgress(supabase, progress).catch(err => 
-        console.error('Heartbeat save error:', err)
-      );
-    }
-  }, 30000); // Every 30 seconds
-
+// Process one chunk of the backfill (to avoid CPU timeout)
+async function processBackfillChunk(supabase: any, mailerLiteApiKey: string, progress: BackfillProgress): Promise<{ completed: boolean, progress: BackfillProgress }> {
+  const RECORDS_PER_CHUNK = 100; // Process 100 records per function call
+  
   try {
-    await saveProgress(supabase, progress);
-
     // PHASE 1: Build crosswalk from existing clients
-    console.log('Phase 1: Building crosswalk from Supabase clients...')
-    progress.phase = 'Phase 1: Building client crosswalk';
-    await saveProgress(supabase, progress);
-    
-    const clientsResult = await buildClientCrosswalk(supabase, mailerLiteApiKey, progress)
-    progress.crosswalkCreated += clientsResult.crosswalkCreated
-    progress.totalProcessed += clientsResult.totalProcessed
-    progress.errors += clientsResult.errors
-    await saveProgress(supabase, progress);
+    if (progress.phase === 'Phase 1: Building client crosswalk') {
+      console.log(`Phase 1: Processing from offset ${progress.clientOffset}`)
+      const clientsResult = await buildClientCrosswalkChunk(supabase, mailerLiteApiKey, progress.clientOffset, RECORDS_PER_CHUNK)
+      
+      progress.crosswalkCreated += clientsResult.crosswalkCreated
+      progress.totalProcessed += clientsResult.totalProcessed
+      progress.errors += clientsResult.errors
+      progress.clientOffset += RECORDS_PER_CHUNK
+      progress.lastUpdatedAt = new Date().toISOString()
+      
+      // Check if phase 1 is complete
+      if (clientsResult.hasMore === false) {
+        console.log('Phase 1 complete, moving to Phase 2')
+        progress.phase = 'Phase 2: Building subscriber crosswalk'
+      }
+      
+      await saveProgress(supabase, progress)
+      return { completed: false, progress }
+    }
 
     // PHASE 2: Build crosswalk from MailerLite subscribers
-    console.log('Phase 2: Building crosswalk from MailerLite subscribers...')
-    progress.phase = 'Phase 2: Building subscriber crosswalk';
-    await saveProgress(supabase, progress);
+    if (progress.phase === 'Phase 2: Building subscriber crosswalk') {
+      console.log(`Phase 2: Processing from cursor ${progress.subscriberCursor || 'start'}`)
+      const subscribersResult = await buildSubscriberCrosswalkChunk(supabase, mailerLiteApiKey, progress.subscriberCursor, RECORDS_PER_CHUNK)
+      
+      progress.crosswalkCreated += subscribersResult.crosswalkCreated
+      progress.totalProcessed += subscribersResult.totalProcessed
+      progress.errors += subscribersResult.errors
+      progress.subscriberCursor = subscribersResult.nextCursor
+      progress.lastUpdatedAt = new Date().toISOString()
+      
+      // Check if phase 2 is complete
+      if (subscribersResult.hasMore === false) {
+        console.log('Phase 2 complete, moving to Phase 3')
+        progress.phase = 'Phase 3: Creating shadow snapshots'
+      }
+      
+      await saveProgress(supabase, progress)
+      return { completed: false, progress }
+    }
+
+    // PHASE 3: Create shadow snapshots
+    if (progress.phase === 'Phase 3: Creating shadow snapshots') {
+      console.log(`Phase 3: Processing from offset ${progress.shadowOffset}`)
+      const shadowResult = await createInitialShadowsChunk(supabase, mailerLiteApiKey, progress.shadowOffset, RECORDS_PER_CHUNK)
+      
+      progress.shadowsCreated += shadowResult.shadowsCreated
+      progress.errors += shadowResult.errors
+      progress.shadowOffset += RECORDS_PER_CHUNK
+      progress.lastUpdatedAt = new Date().toISOString()
+      
+      // Check if phase 3 is complete
+      if (shadowResult.hasMore === false) {
+        console.log('Phase 3 complete - backfill finished!')
+        progress.phase = 'Completed'
+        progress.status = 'completed'
+        await saveProgress(supabase, progress)
+        return { completed: true, progress }
+      }
+      
+      await saveProgress(supabase, progress)
+      return { completed: false, progress }
+    }
+
+    // Should not reach here
+    throw new Error(`Unknown phase: ${progress.phase}`)
     
-    const subscribersResult = await buildSubscriberCrosswalk(supabase, mailerLiteApiKey, progress)
-    progress.crosswalkCreated += subscribersResult.crosswalkCreated
-    progress.totalProcessed += subscribersResult.totalProcessed
-    progress.errors += subscribersResult.errors
-    await saveProgress(supabase, progress);
-
-    // PHASE 3: Create shadow snapshots for all mapped records
-    console.log('Phase 3: Creating initial shadow snapshots...')
-    progress.phase = 'Phase 3: Creating shadow snapshots';
-    await saveProgress(supabase, progress);
-    
-    const shadowResult = await createInitialShadows(supabase, mailerLiteApiKey, progress)
-    progress.shadowsCreated = shadowResult.shadowsCreated
-    progress.errors += shadowResult.errors
-
-    // Mark as completed
-    progress.phase = 'Completed';
-    progress.status = 'completed';
-    progress.lastUpdatedAt = new Date().toISOString();
-    await saveProgress(supabase, progress);
-
-    console.log('=== BACKFILL COMPLETED ===', progress)
   } catch (error) {
-    console.error('Backfill task error:', error);
-    progress.phase = 'Failed';
-    progress.status = 'failed';
-    progress.errors += 1;
-    progress.lastUpdatedAt = new Date().toISOString();
-    await saveProgress(supabase, progress);
-  } finally {
-    // Stop heartbeat
-    clearInterval(heartbeatInterval);
+    console.error('Chunk processing error:', error)
+    progress.errors += 1
+    progress.lastUpdatedAt = new Date().toISOString()
+    await saveProgress(supabase, progress)
+    throw error
   }
 }
 
@@ -260,68 +268,85 @@ Deno.serve(async (req) => {
       throw new Error('MailerLite API key not configured')
     }
 
-    // Check if backfill is already running (with stale-run recovery)
+    // Get or initialize progress
     const { data: existingProgress } = await supabase
       .from('sync_state')
       .select('value')
       .eq('key', 'backfill_progress')
       .maybeSingle();
 
+    let progress: BackfillProgress
+
     if (existingProgress?.value) {
-      const progress = existingProgress.value as BackfillProgress;
-      const lastUpdateMs = progress.lastUpdatedAt ? (Date.now() - new Date(progress.lastUpdatedAt).getTime()) : Number.MAX_SAFE_INTEGER;
-      const isStale = progress.status === 'running' && lastUpdateMs > 3 * 60 * 1000; // >3 minutes
-
-      if (progress.status === 'running' && !isStale) {
-        return new Response(
-          JSON.stringify({ 
-            error: 'Backfill already running',
-            progress 
-          }),
-          {
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-            status: 409
-          }
-        );
-      }
-
-      if (isStale) {
-        console.warn('Stale backfill detected. Auto-restarting...', { lastUpdatedAt: progress.lastUpdatedAt });
-        // Mark previous run as failed (stale) so a new run can start
-        await saveProgress(supabase, {
-          ...progress,
-          phase: 'Stale - restarting',
-          status: 'failed',
+      progress = existingProgress.value as BackfillProgress
+      
+      // If completed, start fresh
+      if (progress.status === 'completed') {
+        console.log('Previous backfill completed, starting fresh')
+        progress = {
+          phase: 'Phase 1: Building client crosswalk',
+          totalProcessed: 0,
+          crosswalkCreated: 0,
+          shadowsCreated: 0,
+          errors: 0,
+          startedAt: new Date().toISOString(),
           lastUpdatedAt: new Date().toISOString(),
-        });
+          status: 'running',
+          clientOffset: 0,
+          subscriberCursor: null,
+          shadowOffset: 0
+        }
+      } else if (progress.status === 'running') {
+        console.log('Resuming existing backfill from:', progress.phase)
+      } else {
+        console.log('Previous backfill failed, restarting from last checkpoint')
+        progress.status = 'running'
+        progress.lastUpdatedAt = new Date().toISOString()
+      }
+    } else {
+      console.log('Starting new backfill')
+      progress = {
+        phase: 'Phase 1: Building client crosswalk',
+        totalProcessed: 0,
+        crosswalkCreated: 0,
+        shadowsCreated: 0,
+        errors: 0,
+        startedAt: new Date().toISOString(),
+        lastUpdatedAt: new Date().toISOString(),
+        status: 'running',
+        clientOffset: 0,
+        subscriberCursor: null,
+        shadowOffset: 0
       }
     }
 
-    // Start background task and register with runtime
-    const taskPromise = runBackfillTask(supabase, mailerLiteApiKey, userId);
+    // Process one chunk
+    const result = await processBackfillChunk(supabase, mailerLiteApiKey, progress)
     
-    // Tell Deno Deploy to keep the function alive until this completes
-    if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
-      EdgeRuntime.waitUntil(taskPromise);
-      console.log('✅ Background task registered with EdgeRuntime.waitUntil');
+    if (result.completed) {
+      return new Response(
+        JSON.stringify({ 
+          message: 'Backfill completed successfully!',
+          progress: result.progress
+        }),
+        {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 200
+        }
+      )
     } else {
-      // Fallback: just start it (best effort on local dev)
-      taskPromise.catch(err => console.error('Background task error:', err));
-      console.log('⚠️ EdgeRuntime.waitUntil not available, running best-effort');
+      return new Response(
+        JSON.stringify({ 
+          message: 'Chunk processed, call again to continue',
+          progress: result.progress,
+          continueBackfill: true
+        }),
+        {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 200
+        }
+      )
     }
-    
-    // Return immediate response
-    return new Response(
-      JSON.stringify({ 
-        message: 'Backfill started in background',
-        estimatedDuration: '20-40 minutes',
-        checkProgressAt: '/rest/v1/sync_state?key=eq.backfill_progress'
-      }),
-      {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        status: 202
-      }
-    )
 
   } catch (error) {
     console.error('Backfill initialization error:', error)
@@ -336,308 +361,230 @@ Deno.serve(async (req) => {
   }
 });
 
-// Log when function is being shut down
-addEventListener('beforeunload', () => {
-  console.log('⚠️ Function shutting down - background task may be interrupted');
-});
-
-async function buildClientCrosswalk(supabase: any, apiKey: string, progress: BackfillProgress): Promise<{crosswalkCreated: number, totalProcessed: number, errors: number}> {
+async function buildClientCrosswalkChunk(supabase: any, apiKey: string, offset: number, limit: number): Promise<{crosswalkCreated: number, totalProcessed: number, errors: number, hasMore: boolean}> {
   let crosswalkCreated = 0
   let totalProcessed = 0
   let errors = 0
-  let offset = 0
-  const batchSize = 20 // Reduced for rate limiting
 
-  while (true) {
-    try {
-      // Fetch clients batch
-      const { data: clients, error } = await supabase
-        .from('clients')
-        .select('id, email')
-        .range(offset, offset + batchSize - 1)
-        .order('email')
+  try {
+    const { data: clients, error } = await supabase
+      .from('clients')
+      .select('id, email')
+      .range(offset, offset + limit - 1)
+      .order('email')
 
-      if (error) throw error
-      if (!clients || clients.length === 0) break
-
-      console.log(`📦 Processing client batch: ${offset + 1}-${offset + clients.length}, rate limit tokens: ${Math.floor(rateLimiter.getAvailable())}`)
-
-      // Process each client with rate limiting
-      for (const client of clients) {
-        try {
-          const email = client.email.toLowerCase()
-          totalProcessed++
-
-          // Check if crosswalk already exists
-          const { data: existing } = await supabase
-            .from('integration_crosswalk')
-            .select('id')
-            .eq('email', email)
-            .single()
-
-          if (existing) continue // Skip if already exists
-
-          // Rate limited API call
-          await rateLimiter.acquire();
-          const subscriber = await findMailerLiteSubscriber(apiKey, email)
-          
-          // Create crosswalk entry
-          const { error: insertError } = await supabase
-            .from('integration_crosswalk')
-            .insert({
-              email,
-              a_id: client.id,
-              b_id: subscriber?.id || null
-            })
-
-          if (insertError) {
-            console.error(`Error creating crosswalk for ${email}:`, insertError)
-            errors++
-          } else {
-            crosswalkCreated++
-            if (crosswalkCreated % 10 === 0) {
-              console.log(`✅ Created ${crosswalkCreated} crosswalk entries`)
-            }
-          }
-
-        } catch (error) {
-          console.error(`Error processing client ${client.email}:`, error)
-          errors++
-        }
-      }
-
-      offset += batchSize
-      
-      // Update progress every batch
-      progress.totalProcessed = totalProcessed;
-      progress.crosswalkCreated = crosswalkCreated;
-      progress.errors = errors;
-      progress.lastUpdatedAt = new Date().toISOString();
-      await saveProgress(supabase, progress);
-
-      // Small delay between batches
-      await new Promise(resolve => setTimeout(resolve, 500))
-    } catch (error) {
-      console.error('Error in client batch processing:', error)
-      errors++
-      break
+    if (error) throw error
+    if (!clients || clients.length === 0) {
+      return { crosswalkCreated, totalProcessed, errors, hasMore: false }
     }
-  }
 
-  return { crosswalkCreated, totalProcessed, errors }
+    console.log(`📦 Processing client batch: ${offset + 1}-${offset + clients.length}`)
+
+    for (const client of clients) {
+      try {
+        const email = client.email.toLowerCase()
+        totalProcessed++
+
+        const { data: existing } = await supabase
+          .from('integration_crosswalk')
+          .select('id')
+          .eq('email', email)
+          .maybeSingle()
+
+        if (existing) continue
+
+        await rateLimiter.acquire()
+        const subscriber = await findMailerLiteSubscriber(apiKey, email)
+        
+        const { error: insertError } = await supabase
+          .from('integration_crosswalk')
+          .insert({
+            email,
+            a_id: client.id,
+            b_id: subscriber?.id || null
+          })
+
+        if (insertError) {
+          console.error(`Error creating crosswalk for ${email}:`, insertError)
+          errors++
+        } else {
+          crosswalkCreated++
+        }
+      } catch (error) {
+        console.error(`Error processing client ${client.email}:`, error)
+        errors++
+      }
+    }
+
+    return { crosswalkCreated, totalProcessed, errors, hasMore: clients.length === limit }
+  } catch (error) {
+    console.error('Error in client chunk processing:', error)
+    return { crosswalkCreated, totalProcessed, errors: errors + 1, hasMore: false }
+  }
 }
 
-async function buildSubscriberCrosswalk(supabase: any, apiKey: string, progress: BackfillProgress): Promise<{crosswalkCreated: number, totalProcessed: number, errors: number}> {
+async function buildSubscriberCrosswalkChunk(supabase: any, apiKey: string, cursor: string | null, limit: number): Promise<{crosswalkCreated: number, totalProcessed: number, errors: number, nextCursor: string | null, hasMore: boolean}> {
   let crosswalkCreated = 0
   let totalProcessed = 0
   let errors = 0
-  let cursor: string | null = null
 
-  while (true) {
-    try {
-      // Rate limited API call
-      await rateLimiter.acquire();
-      
-      // Fetch MailerLite subscribers
-      let url = `https://connect.mailerlite.com/api/subscribers?limit=50` // Reduced batch size
-      if (cursor) {
-        url += `&cursor=${cursor}`
-      }
-
-      console.log(`📦 Fetching subscriber batch, rate limit tokens: ${Math.floor(rateLimiter.getAvailable())}`)
-
-      const response = await fetch(url, {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-      })
-
-      if (!response.ok) throw new Error(`MailerLite API error: ${response.status}`)
-
-      const data = await response.json()
-      if (!data.data || data.data.length === 0) break
-
-      // Process each subscriber
-      for (const subscriber of data.data) {
-        try {
-          const email = subscriber.email.toLowerCase()
-          totalProcessed++
-
-          // Check if crosswalk already exists
-          const { data: existing } = await supabase
-            .from('integration_crosswalk')
-            .select('id, a_id')
-            .eq('email', email)
-            .single()
-
-          if (existing?.a_id) continue // Skip if client ID already mapped
-
-          // Find client by email
-          const { data: client } = await supabase
-            .from('clients')
-            .select('id')
-            .eq('email', email)
-            .single()
-
-          // Upsert crosswalk entry
-          const { error: upsertError } = await supabase
-            .from('integration_crosswalk')
-            .upsert({
-              email,
-              a_id: client?.id || null,
-              b_id: subscriber.id
-            })
-
-          if (upsertError) {
-            console.error(`Error upserting crosswalk for ${email}:`, upsertError)
-            errors++
-          } else {
-            crosswalkCreated++
-            if (crosswalkCreated % 10 === 0) {
-              console.log(`✅ Upserted ${crosswalkCreated} crosswalk entries from subscribers`)
-            }
-          }
-
-        } catch (error) {
-          console.error(`Error processing subscriber ${subscriber.email}:`, error)
-          errors++
-        }
-      }
-
-      // Update progress
-      progress.totalProcessed += totalProcessed;
-      progress.crosswalkCreated += crosswalkCreated;
-      progress.errors = errors;
-      progress.lastUpdatedAt = new Date().toISOString();
-      await saveProgress(supabase, progress);
-
-      cursor = data.meta?.next_cursor || null
-      if (!cursor) break
-
-      // Delay between batches
-      await new Promise(resolve => setTimeout(resolve, 500))
-
-    } catch (error) {
-      console.error('Error in subscriber batch processing:', error)
-      errors++
-      break
+  try {
+    await rateLimiter.acquire()
+    
+    let url = `https://connect.mailerlite.com/api/subscribers?limit=${limit}`
+    if (cursor) {
+      url += `&cursor=${cursor}`
     }
-  }
 
-  return { crosswalkCreated, totalProcessed, errors }
+    console.log(`📦 Fetching subscriber batch`)
+
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+    })
+
+    if (!response.ok) throw new Error(`MailerLite API error: ${response.status}`)
+
+    const data = await response.json()
+    if (!data.data || data.data.length === 0) {
+      return { crosswalkCreated, totalProcessed, errors, nextCursor: null, hasMore: false }
+    }
+
+    for (const subscriber of data.data) {
+      try {
+        const email = subscriber.email.toLowerCase()
+        totalProcessed++
+
+        const { data: existing } = await supabase
+          .from('integration_crosswalk')
+          .select('id, a_id')
+          .eq('email', email)
+          .maybeSingle()
+
+        if (existing?.a_id) continue
+
+        const { data: client } = await supabase
+          .from('clients')
+          .select('id')
+          .eq('email', email)
+          .maybeSingle()
+
+        const { error: upsertError } = await supabase
+          .from('integration_crosswalk')
+          .upsert({
+            email,
+            a_id: client?.id || null,
+            b_id: subscriber.id
+          })
+
+        if (upsertError) {
+          console.error(`Error upserting crosswalk for ${email}:`, upsertError)
+          errors++
+        } else {
+          crosswalkCreated++
+        }
+      } catch (error) {
+        console.error(`Error processing subscriber ${subscriber.email}:`, error)
+        errors++
+      }
+    }
+
+    const nextCursor = data.meta?.next_cursor || null
+    return { crosswalkCreated, totalProcessed, errors, nextCursor, hasMore: !!nextCursor }
+  } catch (error) {
+    console.error('Error in subscriber chunk processing:', error)
+    return { crosswalkCreated, totalProcessed, errors: errors + 1, nextCursor: null, hasMore: false }
+  }
 }
 
-async function createInitialShadows(supabase: any, apiKey: string, progress: BackfillProgress): Promise<{shadowsCreated: number, errors: number}> {
+async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: number, limit: number): Promise<{shadowsCreated: number, errors: number, hasMore: boolean}> {
   let shadowsCreated = 0
   let errors = 0
-  let offset = 0
-  const batchSize = 20 // Reduced for rate limiting
 
-  while (true) {
-    try {
-      // Get all crosswalk entries with both IDs
-      const { data: crosswalks, error } = await supabase
-        .from('integration_crosswalk')
-        .select('email, a_id, b_id')
-        .not('a_id', 'is', null)
-        .not('b_id', 'is', null)
-        .range(offset, offset + batchSize - 1)
+  try {
+    const { data: crosswalks, error } = await supabase
+      .from('integration_crosswalk')
+      .select('email, a_id, b_id')
+      .not('a_id', 'is', null)
+      .not('b_id', 'is', null)
+      .range(offset, offset + limit - 1)
 
-      if (error) throw error
-      if (!crosswalks || crosswalks.length === 0) break
-
-      console.log(`📦 Creating shadow batch: ${offset + 1}-${offset + crosswalks.length}, rate limit tokens: ${Math.floor(rateLimiter.getAvailable())}`)
-
-      // Process each crosswalk entry
-      for (const crosswalk of crosswalks) {
-        try {
-          const email = crosswalk.email
-
-          // Check if shadow already exists
-          const { data: existingShadow } = await supabase
-            .from('sync_shadow')
-            .select('id')
-            .eq('email', email)
-            .single()
-
-          if (existingShadow) continue // Skip if shadow already exists
-
-          // Get client data
-          const { data: client } = await supabase
-            .from('clients')
-            .select('first_name, last_name, phone, city, country')
-            .eq('id', crosswalk.a_id)
-            .single()
-
-          // Rate limited API call
-          await rateLimiter.acquire();
-          const subscriber = await getMailerLiteSubscriber(apiKey, crosswalk.b_id)
-
-          if (!client || !subscriber) {
-            console.warn(`Missing data for shadow creation: ${email}`)
-            continue
-          }
-
-          // Create shadow snapshot
-          const snapshot = {
-            aData: {
-              first_name: client.first_name,
-              last_name: client.last_name,
-              phone: client.phone,
-              city: client.city,
-              country: client.country,
-            },
-            bData: {
-              first_name: subscriber.fields?.name || '',
-              last_name: subscriber.fields?.last_name || '',
-              phone: subscriber.fields?.phone || '',
-              city: subscriber.fields?.city || '',
-              country: subscriber.fields?.country || '',
-            }
-          }
-
-          const { error: insertError } = await supabase
-            .from('sync_shadow')
-            .insert({
-              email,
-              snapshot
-            })
-
-          if (insertError) {
-            console.error(`Error creating shadow for ${email}:`, insertError)
-            errors++
-          } else {
-            shadowsCreated++
-            if (shadowsCreated % 10 === 0) {
-              console.log(`✅ Created ${shadowsCreated} shadows`)
-            }
-          }
-
-        } catch (error) {
-          console.error(`Error processing crosswalk ${crosswalk.email}:`, error)
-          errors++
-        }
-      }
-
-      offset += batchSize
-      
-      // Update progress
-      progress.shadowsCreated = shadowsCreated;
-      progress.errors = errors;
-      progress.lastUpdatedAt = new Date().toISOString();
-      await saveProgress(supabase, progress);
-
-      // Delay between batches
-      await new Promise(resolve => setTimeout(resolve, 500))
-    } catch (error) {
-      console.error('Error in shadow creation batch:', error)
-      errors++
-      break
+    if (error) throw error
+    if (!crosswalks || crosswalks.length === 0) {
+      return { shadowsCreated, errors, hasMore: false }
     }
-  }
 
-  return { shadowsCreated, errors }
+    console.log(`📦 Creating shadow batch: ${offset + 1}-${offset + crosswalks.length}`)
+
+    for (const crosswalk of crosswalks) {
+      try {
+        const email = crosswalk.email
+
+        const { data: existingShadow } = await supabase
+          .from('sync_shadow')
+          .select('id')
+          .eq('email', email)
+          .maybeSingle()
+
+        if (existingShadow) continue
+
+        const { data: client } = await supabase
+          .from('clients')
+          .select('first_name, last_name, phone, city, country')
+          .eq('id', crosswalk.a_id)
+          .maybeSingle()
+
+        await rateLimiter.acquire()
+        const subscriber = await getMailerLiteSubscriber(apiKey, crosswalk.b_id)
+
+        if (!client || !subscriber) {
+          console.warn(`Missing data for shadow creation: ${email}`)
+          continue
+        }
+
+        const snapshot = {
+          aData: {
+            first_name: client.first_name,
+            last_name: client.last_name,
+            phone: client.phone,
+            city: client.city,
+            country: client.country,
+          },
+          bData: {
+            first_name: subscriber.fields?.name || '',
+            last_name: subscriber.fields?.last_name || '',
+            phone: subscriber.fields?.phone || '',
+            city: subscriber.fields?.city || '',
+            country: subscriber.fields?.country || '',
+          }
+        }
+
+        const { error: insertError } = await supabase
+          .from('sync_shadow')
+          .insert({
+            email,
+            snapshot
+          })
+
+        if (insertError) {
+          console.error(`Error creating shadow for ${email}:`, insertError)
+          errors++
+        } else {
+          shadowsCreated++
+        }
+      } catch (error) {
+        console.error(`Error processing crosswalk ${crosswalk.email}:`, error)
+        errors++
+      }
+    }
+
+    return { shadowsCreated, errors, hasMore: crosswalks.length === limit }
+  } catch (error) {
+    console.error('Error in shadow creation chunk:', error)
+    return { shadowsCreated, errors: errors + 1, hasMore: false }
+  }
 }
 
 async function findMailerLiteSubscriber(apiKey: string, email: string): Promise<any | null> {
