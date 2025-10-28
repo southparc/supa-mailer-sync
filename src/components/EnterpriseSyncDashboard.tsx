@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Progress } from "@/components/ui/progress";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { 
   ArrowLeftRight, 
   ArrowRight, 
@@ -17,7 +18,8 @@ import {
   Clock,
   Users,
   CheckCircle,
-  XCircle
+  XCircle,
+  RefreshCw
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
@@ -67,6 +69,11 @@ const EnterpriseSyncDashboard: React.FC = () => {
     matched: 0
   });
   const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
+  const [backfillStatus, setBackfillStatus] = useState<'idle' | 'running' | 'completed'>('idle');
+  const [backfillProgress, setBackfillProgress] = useState({ phase: '', processed: 0, total: 0 });
+  const [showBackfillDialog, setShowBackfillDialog] = useState(false);
+  const [shadowCount, setShadowCount] = useState(0);
+  const [totalClients, setTotalClients] = useState(0);
   const { toast } = useToast();
 
   const fetchSubscriptionStats = async () => {
@@ -104,6 +111,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
     fetchSubscriptionStats();
     checkDuplicates();
     checkBatchState();
+    checkShadowCounts();
     
     // Set up real-time subscription to sync_state
     const channel = supabase
@@ -456,10 +464,156 @@ const EnterpriseSyncDashboard: React.FC = () => {
     setStats(prev => ({ ...prev, conflicts: conflictStats.conflicts }));
   };
 
+  const checkShadowCounts = async () => {
+    try {
+      const [clientsResult, shadowsResult] = await Promise.all([
+        supabase.from('clients').select('*', { count: 'exact', head: true }),
+        supabase.from('sync_shadow').select('*', { count: 'exact', head: true })
+      ]);
+      
+      setTotalClients(clientsResult.count || 0);
+      setShadowCount(shadowsResult.count || 0);
+    } catch (error) {
+      console.error('Failed to check shadow counts:', error);
+    }
+  };
+
+  const handleBackfill = async () => {
+    setShowBackfillDialog(false);
+    setBackfillStatus('running');
+    setBackfillProgress({ phase: 'Starting...', processed: 0, total: totalClients });
+
+    try {
+      toast({
+        title: "Backfill Started",
+        description: "This will take 15-30 minutes. Please keep this page open.",
+      });
+
+      const { data, error } = await supabase.functions.invoke('backfill-sync', {
+        body: {}
+      });
+
+      if (error) throw error;
+
+      setBackfillStatus('completed');
+      setBackfillProgress({ 
+        phase: 'Completed', 
+        processed: data?.summary?.shadowsCreated || 0, 
+        total: totalClients 
+      });
+
+      await checkShadowCounts();
+
+      toast({
+        title: "Backfill Completed!",
+        description: `Created ${data?.summary?.shadowsCreated || 0} shadow snapshots. Your sync is now fully operational.`,
+      });
+
+      setTimeout(() => {
+        setBackfillStatus('idle');
+      }, 5000);
+
+    } catch (error: any) {
+      console.error('Backfill failed:', error);
+      setBackfillStatus('idle');
+      
+      toast({
+        title: "Backfill Failed",
+        description: error.message || "Check console and edge function logs for details.",
+        variant: "destructive",
+      });
+    }
+  };
+
   const hasDuplicates = duplicates.length > 0;
+  const needsBackfill = totalClients > 0 && shadowCount < totalClients * 0.5;
 
   return (
     <div className="space-y-6">
+      {/* Backfill Warning & Controls */}
+      {needsBackfill && backfillStatus === 'idle' && (
+        <Card className="border-warning bg-warning/5">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-warning">
+              <Database className="h-5 w-5" />
+              Initial Sync Setup Required
+            </CardTitle>
+            <CardDescription>
+              Only {shadowCount.toLocaleString()} of {totalClients.toLocaleString()} clients have shadow snapshots. 
+              Run the backfill process to enable full synchronization.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="bg-background p-4 rounded-lg space-y-2">
+              <h4 className="font-medium">What does backfill do?</h4>
+              <ul className="text-sm text-muted-foreground space-y-1 list-disc list-inside">
+                <li>Creates shadow snapshots for all {totalClients.toLocaleString()} clients</li>
+                <li>Links Supabase records with MailerLite subscribers</li>
+                <li>Enables the sync engine to detect and process changes</li>
+                <li>One-time operation (15-30 minutes for {totalClients.toLocaleString()} records)</li>
+              </ul>
+            </div>
+            <Button 
+              onClick={() => setShowBackfillDialog(true)}
+              variant="default"
+              className="w-full"
+            >
+              <RefreshCw className="h-4 w-4 mr-2" />
+              Run Initial Backfill
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Backfill Progress */}
+      {backfillStatus === 'running' && (
+        <Card className="border-primary">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <RefreshCw className="h-5 w-5 animate-spin" />
+              Backfill in Progress
+            </CardTitle>
+            <CardDescription>
+              {backfillProgress.phase} - This may take 15-30 minutes. Please keep this page open.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Progress 
+              value={(backfillProgress.processed / backfillProgress.total) * 100} 
+              className="mb-2" 
+            />
+            <p className="text-sm text-muted-foreground">
+              {backfillProgress.processed.toLocaleString()} / {backfillProgress.total.toLocaleString()} records
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Backfill Confirmation Dialog */}
+      <AlertDialog open={showBackfillDialog} onOpenChange={setShowBackfillDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Start Initial Backfill?</AlertDialogTitle>
+            <AlertDialogDescription className="space-y-2">
+              <p>This process will:</p>
+              <ul className="list-disc list-inside space-y-1 text-sm">
+                <li>Create shadow snapshots for ~{totalClients.toLocaleString()} client records</li>
+                <li>Take approximately 15-30 minutes to complete</li>
+                <li>Consume significant API rate limits during execution</li>
+                <li>Should only be run once (it's idempotent but resource-intensive)</li>
+              </ul>
+              <p className="font-medium mt-4">Please keep this page open during the process.</p>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleBackfill}>
+              Start Backfill
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* Duplicate Advisors Warning */}
       {hasDuplicates && (
         <Card className="border-destructive">
@@ -658,7 +812,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
                     <Button
                       variant={config.variant}
                       onClick={() => handleSync(direction)}
-                      disabled={syncStatus === 'syncing' || hasDuplicates}
+                      disabled={syncStatus === 'syncing' || hasDuplicates || backfillStatus === 'running'}
                     >
                       <Play className="h-4 w-4 mr-2" />
                       Start
