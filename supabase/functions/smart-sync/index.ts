@@ -268,6 +268,90 @@ async function checkRecentErrors(): Promise<{ shouldRun: boolean; message: strin
 }
 
 /**
+ * Get last successful sync timestamp for incremental sync
+ */
+async function getLastSyncTimestamp(): Promise<{ timestamp: string | null; syncedAt: string | null }> {
+  try {
+    const { data, error } = await supabase
+      .from('sync_state')
+      .select('value')
+      .eq('key', 'last_successful_sync')
+      .maybeSingle();
+    
+    if (error) {
+      console.error('Failed to get last sync timestamp:', error);
+      return { timestamp: null, syncedAt: null };
+    }
+    
+    if (data?.value) {
+      const state = data.value as any;
+      return {
+        timestamp: state.timestamp || null,
+        syncedAt: state.syncedAt || null
+      };
+    }
+    
+    return { timestamp: null, syncedAt: null };
+  } catch (err) {
+    console.error('Error getting last sync timestamp:', err);
+    return { timestamp: null, syncedAt: null };
+  }
+}
+
+/**
+ * Update last successful sync timestamp
+ */
+async function updateLastSyncTimestamp(): Promise<void> {
+  try {
+    const now = new Date().toISOString();
+    
+    const { error } = await supabase
+      .from('sync_state')
+      .upsert({
+        key: 'last_successful_sync',
+        value: {
+          timestamp: now,
+          syncedAt: now
+        },
+        updated_at: now
+      }, { onConflict: 'key' });
+    
+    if (error) {
+      console.error('Failed to update last sync timestamp:', error);
+    } else {
+      console.log(`✅ Updated last sync timestamp: ${now}`);
+    }
+  } catch (err) {
+    console.error('Error updating last sync timestamp:', err);
+  }
+}
+
+/**
+ * Determine if incremental sync should be used
+ * - Use incremental if last sync was less than 24 hours ago
+ * - Otherwise do full sync
+ */
+function shouldUseIncrementalSync(lastSync: { timestamp: string | null; syncedAt: string | null }): boolean {
+  if (!lastSync.timestamp || !lastSync.syncedAt) {
+    console.log('🔄 No previous sync found - performing full sync');
+    return false;
+  }
+  
+  const lastSyncTime = new Date(lastSync.syncedAt).getTime();
+  const now = Date.now();
+  const hoursSinceLastSync = (now - lastSyncTime) / (1000 * 60 * 60);
+  
+  // Force full sync every 24 hours
+  if (hoursSinceLastSync >= 24) {
+    console.log(`🔄 Last sync was ${hoursSinceLastSync.toFixed(1)} hours ago - performing full sync`);
+    return false;
+  }
+  
+  console.log(`⚡ Last sync was ${hoursSinceLastSync.toFixed(1)} hours ago - using incremental sync`);
+  return true;
+}
+
+/**
  * Clean up old sync logs to prevent database bloat
  */
 async function cleanupOldLogs(): Promise<void> {
@@ -568,7 +652,7 @@ async function getMailerLiteStatus(b_id: string, dryRun = false): Promise<string
 /**
  * Fetch ALL MailerLite subscribers with pagination
  */
-async function getAllMailerLiteSubscribers(dryRun = false): Promise<Map<string, MailerLiteSubscriber>> {
+async function getAllMailerLiteSubscribers(dryRun = false, incrementalFrom?: string): Promise<Map<string, MailerLiteSubscriber>> {
   const result = new Map<string, MailerLiteSubscriber>();
   
   if (dryRun) {
@@ -579,13 +663,22 @@ async function getAllMailerLiteSubscribers(dryRun = false): Promise<Map<string, 
   let cursor: string | null = null;
   let page = 0;
 
-  console.log('📥 Fetching all MailerLite subscribers...');
+  if (incrementalFrom) {
+    console.log(`📥 Fetching MailerLite subscribers updated since ${incrementalFrom}...`);
+  } else {
+    console.log('📥 Fetching all MailerLite subscribers...');
+  }
 
   do {
     const url = new URL(`${ML_BASE}/subscribers`);
     url.searchParams.set('limit', '1000');
     // Don't filter by status - this returns all subscribers regardless of status
     if (cursor) url.searchParams.set('cursor', cursor);
+    
+    // Incremental sync: only fetch records updated after timestamp
+    if (incrementalFrom) {
+      url.searchParams.set('filter[updated_at][from]', incrementalFrom);
+    }
 
     const res = await retryFetch(url.toString(), {
       headers: {
@@ -1348,9 +1441,10 @@ async function runFullSync(dryRun = false): Promise<any> {
   const startTime = Date.now();
   
   try {
-    // 1. Fetch all from both systems
+  // 1. Fetch all from both systems
+    // For runFullSync, always do full sync (no incremental)
     const [mlSubscribers, sbClients] = await Promise.all([
-      getAllMailerLiteSubscribers(dryRun),
+      getAllMailerLiteSubscribers(dryRun, undefined),
       getAllSupabaseClients(dryRun),
     ]);
 
@@ -1534,8 +1628,13 @@ async function runFullSyncBatch(opts: {
   // Phase: init - build email sets once
   if (st.phase === 'init') {
     console.log('📊 Initializing: fetching all subscribers and clients...');
+    
+    // Check if incremental sync is possible
+    const lastSyncData = await getLastSyncTimestamp();
+    const incrementalFrom = shouldUseIncrementalSync(lastSyncData) ? lastSyncData.timestamp : undefined;
+    
     const [mlMap, sbMap] = await Promise.all([
-      getAllMailerLiteSubscribers(opts.dryRun),
+      getAllMailerLiteSubscribers(opts.dryRun, incrementalFrom),
       getAllSupabaseClients(opts.dryRun),
     ]);
 
@@ -1683,7 +1782,9 @@ async function runFullSyncBatch(opts: {
     await putFullState(st);
   }
 
-  // All done
+  // All done - update last sync timestamp
+  await updateLastSyncTimestamp();
+  
   console.log(`\n✅ Batch sync complete: ${JSON.stringify(st.stats)}`);
   return { ok: true, done: true, stats: st.stats };
 }
