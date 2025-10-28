@@ -151,6 +151,16 @@ async function runBackfillTask(supabase: any, mailerLiteApiKey: string, userId: 
     status: 'running'
   };
 
+  // Start heartbeat to show function is alive
+  const heartbeatInterval = setInterval(async () => {
+    if (progress.status === 'running') {
+      progress.lastUpdatedAt = new Date().toISOString();
+      await saveProgress(supabase, progress).catch(err => 
+        console.error('Heartbeat save error:', err)
+      );
+    }
+  }, 30000); // Every 30 seconds
+
   try {
     await saveProgress(supabase, progress);
 
@@ -199,6 +209,9 @@ async function runBackfillTask(supabase: any, mailerLiteApiKey: string, userId: 
     progress.errors += 1;
     progress.lastUpdatedAt = new Date().toISOString();
     await saveProgress(supabase, progress);
+  } finally {
+    // Stop heartbeat
+    clearInterval(heartbeatInterval);
   }
 }
 
@@ -265,8 +278,18 @@ Deno.serve(async (req) => {
       }
     }
 
-    // Start background task (Deno Deploy supports this pattern)
+    // Start background task and register with runtime
     const taskPromise = runBackfillTask(supabase, mailerLiteApiKey, userId);
+    
+    // Tell Deno Deploy to keep the function alive until this completes
+    if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
+      EdgeRuntime.waitUntil(taskPromise);
+      console.log('✅ Background task registered with EdgeRuntime.waitUntil');
+    } else {
+      // Fallback: just start it (best effort on local dev)
+      taskPromise.catch(err => console.error('Background task error:', err));
+      console.log('⚠️ EdgeRuntime.waitUntil not available, running best-effort');
+    }
     
     // Return immediate response
     return new Response(
@@ -292,6 +315,11 @@ Deno.serve(async (req) => {
       }
     )
   }
+});
+
+// Log when function is being shut down
+addEventListener('beforeunload', () => {
+  console.log('⚠️ Function shutting down - background task may be interrupted');
 });
 
 async function buildClientCrosswalk(supabase: any, apiKey: string, progress: BackfillProgress): Promise<{crosswalkCreated: number, totalProcessed: number, errors: number}> {
