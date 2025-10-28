@@ -399,11 +399,14 @@ async function buildClientCrosswalkChunk(supabase: any, apiKey: string, offset: 
       .order('email')
 
     if (error) throw error
+    
+    // If no clients returned, phase is complete
     if (!clients || clients.length === 0) {
+      console.log(`Phase 1 complete - no more clients at offset ${offset}`)
       return { crosswalkCreated, totalProcessed, errors, hasMore: false }
     }
 
-    console.log(`📦 Processing client batch: ${offset + 1}-${offset + clients.length}`)
+    console.log(`📦 Processing client batch: ${offset + 1}-${offset + clients.length} (total so far: ${offset + clients.length})`)
 
     for (const client of clients) {
       try {

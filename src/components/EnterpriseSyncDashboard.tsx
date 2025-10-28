@@ -502,9 +502,13 @@ const EnterpriseSyncDashboard: React.FC = () => {
         // Update progress from response
         if (data?.progress) {
           const progress = data.progress;
+          // Use crosswalkCreated in phases 1-2, shadowsCreated in phase 3
+          const displayCount = progress.phase?.includes('Phase 3') 
+            ? (progress.shadowsCreated || 0)
+            : (progress.crosswalkCreated || 0);
           setBackfillProgress({
             phase: progress.phase || 'Processing',
-            processed: progress.totalProcessed || 0,
+            processed: displayCount,
             total: totalClients
           });
 
