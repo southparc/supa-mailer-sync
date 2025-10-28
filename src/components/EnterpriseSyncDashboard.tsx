@@ -307,6 +307,18 @@ const EnterpriseSyncDashboard: React.FC = () => {
       if (error) {
         console.error('Smart-sync error:', error);
         
+        // Handle authentication/authorization errors
+        if (error.message?.includes('401') || error.message?.includes('403') || 
+            error.message?.includes('Authorization') || error.message?.includes('Admin privileges')) {
+          toast({
+            title: "Authentication Error",
+            description: "Session expired or insufficient permissions. Please refresh the page.",
+            variant: "destructive",
+          });
+          setSyncStatus('idle');
+          return;
+        }
+        
         // Check if it's a FunctionsFetchError (unreachable)
         if (error.message?.includes('FunctionsFetchError') || error.message?.includes('Failed to fetch')) {
           toast({

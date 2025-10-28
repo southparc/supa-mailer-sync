@@ -6,6 +6,52 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
+// Admin verification helper
+async function verifyAdmin(req: Request, supabase: any): Promise<{ userId: string | null, error: Response | null }> {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) {
+    return {
+      userId: null,
+      error: new Response(
+        JSON.stringify({ error: 'Missing Authorization header' }),
+        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    };
+  }
+
+  const token = authHeader.replace('Bearer ', '');
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+  
+  if (authError || !user) {
+    return {
+      userId: null,
+      error: new Response(
+        JSON.stringify({ error: 'Invalid or expired token' }),
+        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    };
+  }
+
+  const { data: roleData, error: roleError } = await supabase
+    .from('user_roles')
+    .select('role')
+    .eq('user_id', user.id)
+    .eq('role', 'admin')
+    .maybeSingle();
+
+  if (roleError || !roleData) {
+    return {
+      userId: null,
+      error: new Response(
+        JSON.stringify({ error: 'Access denied. Admin privileges required.' }),
+        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    };
+  }
+
+  return { userId: user.id, error: null };
+}
+
 interface BackfillResult {
   recordsUpdated: number
   errors: number
@@ -26,6 +72,15 @@ Deno.serve(async (req) => {
       Deno.env.get('SUPABASE_URL') ?? '',
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     )
+
+    // Verify admin privileges
+    const { userId, error: adminError } = await verifyAdmin(req, supabase);
+    if (adminError) {
+      console.error('Unauthorized access attempt');
+      return adminError;
+    }
+
+    console.log(`Admin user ${userId} initiated MailerLite ID backfill`);
 
     const result: BackfillResult = {
       recordsUpdated: 0,

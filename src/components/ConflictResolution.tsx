@@ -92,6 +92,17 @@ export function ConflictResolution({ onStatsUpdate }: ConflictResolutionProps) {
       });
 
       if (error) {
+        // Handle authentication/authorization errors
+        if (error.message?.includes('401') || error.message?.includes('403') || 
+            error.message?.includes('Authorization') || error.message?.includes('Admin privileges')) {
+          toast({
+            title: "Authentication Error",
+            description: "You don't have permission to perform this action. Please refresh and try again.",
+            variant: "destructive",
+          });
+          setResolving(null);
+          return;
+        }
         throw error;
       }
 
