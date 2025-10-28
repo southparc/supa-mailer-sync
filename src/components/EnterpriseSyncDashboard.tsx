@@ -486,7 +486,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
     try {
       toast({
         title: "Backfill Started",
-        description: "This will take 15-30 minutes. Please keep this page open.",
+        description: "This will take 20-40 minutes. Progress will update automatically.",
       });
 
       const { data, error } = await supabase.functions.invoke('backfill-sync', {
@@ -495,23 +495,51 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
       if (error) throw error;
 
-      setBackfillStatus('completed');
-      setBackfillProgress({ 
-        phase: 'Completed', 
-        processed: data?.summary?.shadowsCreated || 0, 
-        total: totalClients 
-      });
+      // Start polling for progress
+      const progressInterval = setInterval(async () => {
+        const { data: progressData } = await supabase
+          .from('sync_state')
+          .select('value')
+          .eq('key', 'backfill_progress')
+          .maybeSingle();
 
-      await checkShadowCounts();
+        if (progressData?.value) {
+          const progress = progressData.value as any;
+          setBackfillProgress({
+            phase: progress.phase || 'Running',
+            processed: progress.totalProcessed || 0,
+            total: totalClients
+          });
 
-      toast({
-        title: "Backfill Completed!",
-        description: `Created ${data?.summary?.shadowsCreated || 0} shadow snapshots. Your sync is now fully operational.`,
-      });
+          if (progress.status === 'completed') {
+            clearInterval(progressInterval);
+            setBackfillStatus('completed');
+            await checkShadowCounts();
 
+            toast({
+              title: "Backfill Completed!",
+              description: `Created ${progress.shadowsCreated || 0} shadow snapshots. Your sync is now fully operational.`,
+            });
+
+            setTimeout(() => {
+              setBackfillStatus('idle');
+            }, 5000);
+          } else if (progress.status === 'failed') {
+            clearInterval(progressInterval);
+            setBackfillStatus('idle');
+            toast({
+              title: "Backfill Failed",
+              description: "Check the edge function logs for details.",
+              variant: "destructive",
+            });
+          }
+        }
+      }, 5000); // Poll every 5 seconds
+
+      // Stop polling after 45 minutes (safety)
       setTimeout(() => {
-        setBackfillStatus('idle');
-      }, 5000);
+        clearInterval(progressInterval);
+      }, 45 * 60 * 1000);
 
     } catch (error: any) {
       console.error('Backfill failed:', error);
@@ -550,7 +578,8 @@ const EnterpriseSyncDashboard: React.FC = () => {
                 <li>Creates shadow snapshots for all {totalClients.toLocaleString()} clients</li>
                 <li>Links Supabase records with MailerLite subscribers</li>
                 <li>Enables the sync engine to detect and process changes</li>
-                <li>One-time operation (15-30 minutes for {totalClients.toLocaleString()} records)</li>
+                <li>One-time operation (20-40 minutes, respects rate limits)</li>
+                <li>Runs in background - safe to navigate away</li>
               </ul>
             </div>
             <Button 
@@ -574,7 +603,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
               Backfill in Progress
             </CardTitle>
             <CardDescription>
-              {backfillProgress.phase} - This may take 15-30 minutes. Please keep this page open.
+              {backfillProgress.phase} - Processing {backfillProgress.processed.toLocaleString()} of ~{backfillProgress.total.toLocaleString()} records
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -585,11 +614,13 @@ const EnterpriseSyncDashboard: React.FC = () => {
             <p className="text-sm text-muted-foreground">
               {backfillProgress.processed.toLocaleString()} / {backfillProgress.total.toLocaleString()} records
             </p>
+            <p className="text-xs text-muted-foreground mt-2">
+              This process respects MailerLite rate limits (120 req/min). Estimated time: 20-40 minutes.
+            </p>
           </CardContent>
         </Card>
       )}
 
-      {/* Backfill Confirmation Dialog */}
       <AlertDialog open={showBackfillDialog} onOpenChange={setShowBackfillDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -598,11 +629,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
               <p>This process will:</p>
               <ul className="list-disc list-inside space-y-1 text-sm">
                 <li>Create shadow snapshots for ~{totalClients.toLocaleString()} client records</li>
-                <li>Take approximately 15-30 minutes to complete</li>
-                <li>Consume significant API rate limits during execution</li>
-                <li>Should only be run once (it's idempotent but resource-intensive)</li>
+                <li>Take approximately 20-40 minutes to complete</li>
+                <li>Respect MailerLite rate limits (120 req/min with delays)</li>
+                <li>Run in the background - you can navigate away from this page</li>
+                <li>Track progress automatically (refreshes every 5 seconds)</li>
               </ul>
-              <p className="font-medium mt-4">Please keep this page open during the process.</p>
+              <p className="font-medium mt-4">
+                ✅ Safe to navigate away - progress will continue in the background
+              </p>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

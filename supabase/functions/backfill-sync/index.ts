@@ -6,6 +6,61 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
+// ============================================================================
+// Rate Limiter - MailerLite allows 120 req/min
+// ============================================================================
+const MAILERLITE_RATE_LIMIT = 120; // requests per minute
+const RATE_WINDOW_MS = 60000; // 1 minute
+
+class TokenBucket {
+  tokens: number;
+  lastRefill: number;
+  tokensPerMs: number;
+  maxTokens: number;
+  
+  constructor(maxTokens: number, windowMs: number) {
+    this.maxTokens = maxTokens;
+    this.tokens = maxTokens;
+    this.lastRefill = Date.now();
+    this.tokensPerMs = maxTokens / windowMs;
+  }
+  
+  async acquire(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastRefill;
+    
+    // Refill tokens based on time elapsed
+    this.tokens = Math.min(
+      this.maxTokens,
+      this.tokens + (elapsed * this.tokensPerMs)
+    );
+    this.lastRefill = now;
+    
+    // If no tokens available, wait
+    if (this.tokens < 1) {
+      const waitMs = Math.ceil((1 - this.tokens) / this.tokensPerMs);
+      console.log(`⏳ Rate limit: waiting ${waitMs}ms for token availability...`);
+      await new Promise(r => setTimeout(r, waitMs));
+      this.tokens = 1;
+      this.lastRefill = Date.now();
+    }
+    
+    // Consume one token
+    this.tokens -= 1;
+  }
+  
+  getAvailable(): number {
+    const now = Date.now();
+    const elapsed = now - this.lastRefill;
+    return Math.min(
+      this.maxTokens,
+      this.tokens + (elapsed * this.tokensPerMs)
+    );
+  }
+}
+
+const rateLimiter = new TokenBucket(MAILERLITE_RATE_LIMIT, RATE_WINDOW_MS);
+
 // Admin verification helper
 async function verifyAdmin(req: Request, supabase: any): Promise<{ userId: string | null, error: Response | null }> {
   const authHeader = req.headers.get('Authorization');
@@ -61,6 +116,92 @@ interface BackfillResult {
   message: string
 }
 
+interface BackfillProgress {
+  phase: string
+  totalProcessed: number
+  crosswalkCreated: number
+  shadowsCreated: number
+  errors: number
+  startedAt: string
+  lastUpdatedAt: string
+  status: 'running' | 'completed' | 'failed'
+}
+
+// Helper to save progress
+async function saveProgress(supabase: any, progress: BackfillProgress): Promise<void> {
+  await supabase
+    .from('sync_state')
+    .upsert({
+      key: 'backfill_progress',
+      value: progress,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'key' });
+}
+
+// Main background task
+async function runBackfillTask(supabase: any, mailerLiteApiKey: string, userId: string): Promise<void> {
+  const progress: BackfillProgress = {
+    phase: 'Starting',
+    totalProcessed: 0,
+    crosswalkCreated: 0,
+    shadowsCreated: 0,
+    errors: 0,
+    startedAt: new Date().toISOString(),
+    lastUpdatedAt: new Date().toISOString(),
+    status: 'running'
+  };
+
+  try {
+    await saveProgress(supabase, progress);
+
+    // PHASE 1: Build crosswalk from existing clients
+    console.log('Phase 1: Building crosswalk from Supabase clients...')
+    progress.phase = 'Phase 1: Building client crosswalk';
+    await saveProgress(supabase, progress);
+    
+    const clientsResult = await buildClientCrosswalk(supabase, mailerLiteApiKey, progress)
+    progress.crosswalkCreated += clientsResult.crosswalkCreated
+    progress.totalProcessed += clientsResult.totalProcessed
+    progress.errors += clientsResult.errors
+    await saveProgress(supabase, progress);
+
+    // PHASE 2: Build crosswalk from MailerLite subscribers
+    console.log('Phase 2: Building crosswalk from MailerLite subscribers...')
+    progress.phase = 'Phase 2: Building subscriber crosswalk';
+    await saveProgress(supabase, progress);
+    
+    const subscribersResult = await buildSubscriberCrosswalk(supabase, mailerLiteApiKey, progress)
+    progress.crosswalkCreated += subscribersResult.crosswalkCreated
+    progress.totalProcessed += subscribersResult.totalProcessed
+    progress.errors += subscribersResult.errors
+    await saveProgress(supabase, progress);
+
+    // PHASE 3: Create shadow snapshots for all mapped records
+    console.log('Phase 3: Creating initial shadow snapshots...')
+    progress.phase = 'Phase 3: Creating shadow snapshots';
+    await saveProgress(supabase, progress);
+    
+    const shadowResult = await createInitialShadows(supabase, mailerLiteApiKey, progress)
+    progress.shadowsCreated = shadowResult.shadowsCreated
+    progress.errors += shadowResult.errors
+
+    // Mark as completed
+    progress.phase = 'Completed';
+    progress.status = 'completed';
+    progress.lastUpdatedAt = new Date().toISOString();
+    await saveProgress(supabase, progress);
+
+    console.log('=== BACKFILL COMPLETED ===', progress)
+  } catch (error) {
+    console.error('Backfill task error:', error);
+    progress.phase = 'Failed';
+    progress.status = 'failed';
+    progress.errors += 1;
+    progress.lastUpdatedAt = new Date().toISOString();
+    await saveProgress(supabase, progress);
+  }
+}
+
 Deno.serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
@@ -68,7 +209,7 @@ Deno.serve(async (req) => {
   }
 
   try {
-    console.log('=== ENTERPRISE BACKFILL SYNC STARTED ===')
+    console.log('=== BACKFILL SYNC REQUESTED ===')
     
     // Initialize Supabase client
     const supabase = createClient(
@@ -83,6 +224,16 @@ Deno.serve(async (req) => {
       return adminError;
     }
 
+    if (!userId) {
+      return new Response(
+        JSON.stringify({ error: 'User ID not available' }),
+        {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 401
+        }
+      );
+    }
+
     console.log(`Admin user ${userId} initiated backfill sync`);
 
     // Get MailerLite API key
@@ -91,66 +242,64 @@ Deno.serve(async (req) => {
       throw new Error('MailerLite API key not configured')
     }
 
-    const result: BackfillResult = {
-      crosswalkCreated: 0,
-      shadowsCreated: 0,
-      errors: 0,
-      totalClientsProcessed: 0,
-      totalSubscribersProcessed: 0,
-      message: 'Backfill completed successfully'
+    // Check if backfill is already running
+    const { data: existingProgress } = await supabase
+      .from('sync_state')
+      .select('value')
+      .eq('key', 'backfill_progress')
+      .maybeSingle();
+
+    if (existingProgress?.value) {
+      const progress = existingProgress.value as BackfillProgress;
+      if (progress.status === 'running') {
+        return new Response(
+          JSON.stringify({ 
+            error: 'Backfill already running',
+            progress 
+          }),
+          {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            status: 409
+          }
+        );
+      }
     }
 
-    // PHASE 1: Build crosswalk from existing clients
-    console.log('Phase 1: Building crosswalk from Supabase clients...')
-    const clientsResult = await buildClientCrosswalk(supabase, mailerLiteApiKey)
-    result.crosswalkCreated += clientsResult.crosswalkCreated
-    result.totalClientsProcessed += clientsResult.totalProcessed
-    result.errors += clientsResult.errors
-
-    // PHASE 2: Build crosswalk from MailerLite subscribers
-    console.log('Phase 2: Building crosswalk from MailerLite subscribers...')
-    const subscribersResult = await buildSubscriberCrosswalk(supabase, mailerLiteApiKey)
-    result.crosswalkCreated += subscribersResult.crosswalkCreated
-    result.totalSubscribersProcessed += subscribersResult.totalProcessed
-    result.errors += subscribersResult.errors
-
-    // PHASE 3: Create shadow snapshots for all mapped records
-    console.log('Phase 3: Creating initial shadow snapshots...')
-    const shadowResult = await createInitialShadows(supabase, mailerLiteApiKey)
-    result.shadowsCreated = shadowResult.shadowsCreated
-    result.errors += shadowResult.errors
-
-    console.log('=== ENTERPRISE BACKFILL SYNC COMPLETED ===', result)
-
-    return new Response(JSON.stringify(result), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      status: 200
-    })
-
-  } catch (error) {
-    console.error('Enterprise backfill error:', error)
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+    // Start background task (Deno Deploy supports this pattern)
+    const taskPromise = runBackfillTask(supabase, mailerLiteApiKey, userId);
+    
+    // Return immediate response
     return new Response(
       JSON.stringify({ 
-        error: errorMessage,
-        crosswalkCreated: 0,
-        shadowsCreated: 0,
-        errors: 1
+        message: 'Backfill started in background',
+        estimatedDuration: '20-40 minutes',
+        checkProgressAt: '/rest/v1/sync_state?key=eq.backfill_progress'
       }),
+      {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        status: 202
+      }
+    )
+
+  } catch (error) {
+    console.error('Backfill initialization error:', error)
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+    return new Response(
+      JSON.stringify({ error: errorMessage }),
       {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         status: 500
       }
     )
   }
-})
+});
 
-async function buildClientCrosswalk(supabase: any, apiKey: string): Promise<{crosswalkCreated: number, totalProcessed: number, errors: number}> {
+async function buildClientCrosswalk(supabase: any, apiKey: string, progress: BackfillProgress): Promise<{crosswalkCreated: number, totalProcessed: number, errors: number}> {
   let crosswalkCreated = 0
   let totalProcessed = 0
   let errors = 0
   let offset = 0
-  const limit = 100
+  const batchSize = 20 // Reduced for rate limiting
 
   while (true) {
     try {
@@ -158,13 +307,15 @@ async function buildClientCrosswalk(supabase: any, apiKey: string): Promise<{cro
       const { data: clients, error } = await supabase
         .from('clients')
         .select('id, email')
-        .range(offset, offset + limit - 1)
+        .range(offset, offset + batchSize - 1)
         .order('email')
 
       if (error) throw error
       if (!clients || clients.length === 0) break
 
-      // Process each client
+      console.log(`📦 Processing client batch: ${offset + 1}-${offset + clients.length}, rate limit tokens: ${Math.floor(rateLimiter.getAvailable())}`)
+
+      // Process each client with rate limiting
       for (const client of clients) {
         try {
           const email = client.email.toLowerCase()
@@ -179,7 +330,8 @@ async function buildClientCrosswalk(supabase: any, apiKey: string): Promise<{cro
 
           if (existing) continue // Skip if already exists
 
-          // Find MailerLite subscriber by email
+          // Rate limited API call
+          await rateLimiter.acquire();
           const subscriber = await findMailerLiteSubscriber(apiKey, email)
           
           // Create crosswalk entry
@@ -196,7 +348,9 @@ async function buildClientCrosswalk(supabase: any, apiKey: string): Promise<{cro
             errors++
           } else {
             crosswalkCreated++
-            console.log(`Created crosswalk for client ${email}`)
+            if (crosswalkCreated % 10 === 0) {
+              console.log(`✅ Created ${crosswalkCreated} crosswalk entries`)
+            }
           }
 
         } catch (error) {
@@ -205,7 +359,17 @@ async function buildClientCrosswalk(supabase: any, apiKey: string): Promise<{cro
         }
       }
 
-      offset += limit
+      offset += batchSize
+      
+      // Update progress every batch
+      progress.totalProcessed = totalProcessed;
+      progress.crosswalkCreated = crosswalkCreated;
+      progress.errors = errors;
+      progress.lastUpdatedAt = new Date().toISOString();
+      await saveProgress(supabase, progress);
+
+      // Small delay between batches
+      await new Promise(resolve => setTimeout(resolve, 500))
     } catch (error) {
       console.error('Error in client batch processing:', error)
       errors++
@@ -216,7 +380,7 @@ async function buildClientCrosswalk(supabase: any, apiKey: string): Promise<{cro
   return { crosswalkCreated, totalProcessed, errors }
 }
 
-async function buildSubscriberCrosswalk(supabase: any, apiKey: string): Promise<{crosswalkCreated: number, totalProcessed: number, errors: number}> {
+async function buildSubscriberCrosswalk(supabase: any, apiKey: string, progress: BackfillProgress): Promise<{crosswalkCreated: number, totalProcessed: number, errors: number}> {
   let crosswalkCreated = 0
   let totalProcessed = 0
   let errors = 0
@@ -224,11 +388,16 @@ async function buildSubscriberCrosswalk(supabase: any, apiKey: string): Promise<
 
   while (true) {
     try {
+      // Rate limited API call
+      await rateLimiter.acquire();
+      
       // Fetch MailerLite subscribers
-      let url = `https://connect.mailerlite.com/api/subscribers?limit=100`
+      let url = `https://connect.mailerlite.com/api/subscribers?limit=50` // Reduced batch size
       if (cursor) {
         url += `&cursor=${cursor}`
       }
+
+      console.log(`📦 Fetching subscriber batch, rate limit tokens: ${Math.floor(rateLimiter.getAvailable())}`)
 
       const response = await fetch(url, {
         headers: {
@@ -278,7 +447,9 @@ async function buildSubscriberCrosswalk(supabase: any, apiKey: string): Promise<
             errors++
           } else {
             crosswalkCreated++
-            console.log(`Updated crosswalk for subscriber ${email}`)
+            if (crosswalkCreated % 10 === 0) {
+              console.log(`✅ Upserted ${crosswalkCreated} crosswalk entries from subscribers`)
+            }
           }
 
         } catch (error) {
@@ -287,8 +458,18 @@ async function buildSubscriberCrosswalk(supabase: any, apiKey: string): Promise<
         }
       }
 
-      cursor = data.meta?.next_cursor
+      // Update progress
+      progress.totalProcessed += totalProcessed;
+      progress.crosswalkCreated += crosswalkCreated;
+      progress.errors = errors;
+      progress.lastUpdatedAt = new Date().toISOString();
+      await saveProgress(supabase, progress);
+
+      cursor = data.meta?.next_cursor || null
       if (!cursor) break
+
+      // Delay between batches
+      await new Promise(resolve => setTimeout(resolve, 500))
 
     } catch (error) {
       console.error('Error in subscriber batch processing:', error)
@@ -300,11 +481,11 @@ async function buildSubscriberCrosswalk(supabase: any, apiKey: string): Promise<
   return { crosswalkCreated, totalProcessed, errors }
 }
 
-async function createInitialShadows(supabase: any, apiKey: string): Promise<{shadowsCreated: number, errors: number}> {
+async function createInitialShadows(supabase: any, apiKey: string, progress: BackfillProgress): Promise<{shadowsCreated: number, errors: number}> {
   let shadowsCreated = 0
   let errors = 0
   let offset = 0
-  const limit = 100
+  const batchSize = 20 // Reduced for rate limiting
 
   while (true) {
     try {
@@ -314,10 +495,12 @@ async function createInitialShadows(supabase: any, apiKey: string): Promise<{sha
         .select('email, a_id, b_id')
         .not('a_id', 'is', null)
         .not('b_id', 'is', null)
-        .range(offset, offset + limit - 1)
+        .range(offset, offset + batchSize - 1)
 
       if (error) throw error
       if (!crosswalks || crosswalks.length === 0) break
+
+      console.log(`📦 Creating shadow batch: ${offset + 1}-${offset + crosswalks.length}, rate limit tokens: ${Math.floor(rateLimiter.getAvailable())}`)
 
       // Process each crosswalk entry
       for (const crosswalk of crosswalks) {
@@ -340,7 +523,8 @@ async function createInitialShadows(supabase: any, apiKey: string): Promise<{sha
             .eq('id', crosswalk.a_id)
             .single()
 
-          // Get MailerLite subscriber data
+          // Rate limited API call
+          await rateLimiter.acquire();
           const subscriber = await getMailerLiteSubscriber(apiKey, crosswalk.b_id)
 
           if (!client || !subscriber) {
@@ -378,7 +562,9 @@ async function createInitialShadows(supabase: any, apiKey: string): Promise<{sha
             errors++
           } else {
             shadowsCreated++
-            console.log(`Created shadow for ${email}`)
+            if (shadowsCreated % 10 === 0) {
+              console.log(`✅ Created ${shadowsCreated} shadows`)
+            }
           }
 
         } catch (error) {
@@ -387,7 +573,16 @@ async function createInitialShadows(supabase: any, apiKey: string): Promise<{sha
         }
       }
 
-      offset += limit
+      offset += batchSize
+      
+      // Update progress
+      progress.shadowsCreated = shadowsCreated;
+      progress.errors = errors;
+      progress.lastUpdatedAt = new Date().toISOString();
+      await saveProgress(supabase, progress);
+
+      // Delay between batches
+      await new Promise(resolve => setTimeout(resolve, 500))
     } catch (error) {
       console.error('Error in shadow creation batch:', error)
       errors++
