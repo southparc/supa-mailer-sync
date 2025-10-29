@@ -345,6 +345,72 @@ Deno.serve(async (req) => {
       }
     }
 
+    // ========== PREFLIGHT: Fast-forward check ==========
+    // Query actual database counts to determine correct phase
+    console.log('🔍 Preflight: Checking database state...')
+    
+    const { count: totalClients } = await supabase
+      .from('clients')
+      .select('*', { count: 'exact', head: true })
+    
+    const { count: crosswalkClients } = await supabase
+      .from('integration_crosswalk')
+      .select('*', { count: 'exact', head: true })
+      .not('a_id', 'is', null)
+    
+    const { count: crosswalkPairs } = await supabase
+      .from('integration_crosswalk')
+      .select('*', { count: 'exact', head: true })
+      .not('a_id', 'is', null)
+      .not('b_id', 'is', null)
+    
+    const { count: existingShadows } = await supabase
+      .from('sync_shadow')
+      .select('*', { count: 'exact', head: true })
+
+    console.log('📊 Preflight counts:', {
+      totalClients,
+      crosswalkClients,
+      crosswalkPairs,
+      existingShadows
+    })
+
+    // Decision logic
+    if (existingShadows && crosswalkPairs && existingShadows >= crosswalkPairs && crosswalkPairs > 0) {
+      // All shadows created - backfill is complete
+      console.log('✅ Preflight: All shadows created. Marking as completed.')
+      progress.status = 'completed'
+      progress.phase = 'Completed'
+      progress.shadowsCreated = existingShadows
+      progress.crosswalkCreated = crosswalkPairs
+      await saveProgress(supabase, progress)
+      
+      return new Response(
+        JSON.stringify({ 
+          message: 'Backfill already completed!',
+          progress,
+          continueBackfill: false
+        }),
+        {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 200
+        }
+      )
+    } else if (crosswalkClients && totalClients && crosswalkClients >= totalClients) {
+      // Phases 1-2 complete, jump to Phase 3
+      console.log(`🚀 Preflight: Crosswalk complete (${crosswalkClients}/${totalClients}). Fast-forwarding to Phase 3 from offset ${existingShadows || 0}`)
+      progress.phase = 'Phase 3: Creating shadow snapshots'
+      progress.status = 'running'
+      progress.shadowOffset = existingShadows || 0
+      progress.crosswalkCreated = crosswalkClients || 0
+      progress.totalProcessed = crosswalkClients || 0
+      progress.lastUpdatedAt = new Date().toISOString()
+      await saveProgress(supabase, progress)
+    } else {
+      // Phases 1 or 2 incomplete, proceed as planned
+      console.log(`📍 Preflight: Resuming from ${progress.phase}`)
+    }
+
     // Process one chunk
     const result = await processBackfillChunk(supabase, mailerLiteApiKey, progress)
     

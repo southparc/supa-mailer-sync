@@ -506,10 +506,16 @@ const EnterpriseSyncDashboard: React.FC = () => {
           const displayCount = progress.phase?.includes('Phase 3') 
             ? (progress.shadowsCreated || 0)
             : (progress.crosswalkCreated || 0);
+          
+          // For Phase 3, use crosswalk count as more accurate total
+          const displayTotal = progress.phase?.includes('Phase 3') && progress.crosswalkCreated
+            ? progress.crosswalkCreated
+            : totalClients;
+            
           setBackfillProgress({
             phase: progress.phase || 'Processing',
             processed: displayCount,
-            total: totalClients
+            total: displayTotal
           });
 
           // Check if completed
