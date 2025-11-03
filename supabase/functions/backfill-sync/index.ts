@@ -133,6 +133,7 @@ interface BackfillProgress {
   clientOffset: number
   subscriberCursor: string | null
   shadowOffset: number
+  continuationCount?: number // Track auto-continuation iterations
 }
 
 // Helper to save progress
@@ -237,6 +238,10 @@ Deno.serve(async (req) => {
   try {
     console.log('=== BACKFILL SYNC REQUESTED ===')
     
+    // Parse request body for autoContinue flag
+    const { autoContinue = false } = await req.json().catch(() => ({}))
+    console.log('🔧 Auto-continue mode:', autoContinue)
+    
     // Initialize Supabase client
     const supabase = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
@@ -304,7 +309,8 @@ Deno.serve(async (req) => {
           status: 'running',
           clientOffset: 0,
           subscriberCursor: null,
-          shadowOffset: 0
+          shadowOffset: 0,
+          continuationCount: 0
         };
       } else if (progress.status === 'completed') {
         console.log('Previous backfill completed, starting fresh')
@@ -319,7 +325,8 @@ Deno.serve(async (req) => {
           status: 'running',
           clientOffset: 0,
           subscriberCursor: null,
-          shadowOffset: 0
+          shadowOffset: 0,
+          continuationCount: 0
         }
       } else if (progress.status === 'running') {
         console.log('Resuming existing backfill from:', progress.phase)
@@ -341,7 +348,8 @@ Deno.serve(async (req) => {
         status: 'running',
         clientOffset: 0,
         subscriberCursor: null,
-        shadowOffset: 0
+        shadowOffset: 0,
+        continuationCount: 0
       }
     }
 
@@ -411,6 +419,31 @@ Deno.serve(async (req) => {
       console.log(`📍 Preflight: Resuming from ${progress.phase}`)
     }
 
+    // Safety check: max continuation limit
+    const MAX_CONTINUATIONS = 200
+    const currentCount = progress.continuationCount || 0
+    
+    if (autoContinue && currentCount >= MAX_CONTINUATIONS) {
+      console.warn(`⚠️ Max continuation limit reached (${MAX_CONTINUATIONS}). Stopping auto-continue.`)
+      return new Response(
+        JSON.stringify({ 
+          message: `Safety limit reached. Processed ${currentCount} iterations. Click "Start Backfill" to continue manually.`,
+          progress,
+          continueBackfill: false
+        }),
+        {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 200
+        }
+      )
+    }
+
+    // Increment continuation count if auto-continuing
+    if (autoContinue) {
+      progress.continuationCount = currentCount + 1
+      console.log(`🔄 Continuation ${progress.continuationCount}/${MAX_CONTINUATIONS}`)
+    }
+
     // Process one chunk
     const result = await processBackfillChunk(supabase, mailerLiteApiKey, progress)
     
@@ -426,6 +459,42 @@ Deno.serve(async (req) => {
         }
       )
     } else {
+      // Auto-continue in background if enabled
+      if (autoContinue && result.progress.status === 'running') {
+        const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
+        const projectUrl = Deno.env.get('SUPABASE_URL')
+        
+        if (EdgeRuntime?.waitUntil && serviceRoleKey && projectUrl) {
+          console.log('🔄 Auto-continuing in background...')
+          
+          EdgeRuntime.waitUntil(
+            fetch(`${projectUrl}/functions/v1/backfill-sync`, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${serviceRoleKey}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ autoContinue: true })
+            }).catch(err => {
+              console.error('❌ Background continuation failed:', err)
+            })
+          )
+          
+          return new Response(
+            JSON.stringify({ 
+              message: `Chunk processed. Auto-continuing in background (${progress.continuationCount}/${MAX_CONTINUATIONS})...`,
+              progress: result.progress,
+              continueBackfill: true,
+              autoContinuing: true
+            }),
+            {
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+              status: 200
+            }
+          )
+        }
+      }
+      
       return new Response(
         JSON.stringify({ 
           message: 'Chunk processed, call again to continue',

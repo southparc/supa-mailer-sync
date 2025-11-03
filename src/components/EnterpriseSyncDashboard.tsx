@@ -479,109 +479,59 @@ const EnterpriseSyncDashboard: React.FC = () => {
   };
 
   const handleBackfill = async () => {
-    setShowBackfillDialog(false);
-    setBackfillStatus('running');
-    setBackfillProgress({ phase: 'Starting...', processed: 0, total: totalClients });
-
-    toast({
-      title: "Backfill Started",
-      description: "Processing in chunks to avoid timeouts. This may take 20-40 minutes.",
-    });
-
-    const processChunk = async (): Promise<boolean> => {
-      try {
-        const { data, error } = await supabase.functions.invoke('backfill-sync', {
-          body: {}
-        });
-
-        if (error) {
-          console.error('Chunk processing error:', error);
-          throw error;
-        }
-
-        // Update progress from response
-        if (data?.progress) {
-          const progress = data.progress;
-          // Use crosswalkCreated in phases 1-2, shadowsCreated in phase 3
-          const displayCount = progress.phase?.includes('Phase 3') 
-            ? (progress.shadowsCreated || 0)
-            : (progress.crosswalkCreated || 0);
-          
-          // For Phase 3, use crosswalk count as more accurate total
-          const displayTotal = progress.phase?.includes('Phase 3') && progress.crosswalkCreated
-            ? progress.crosswalkCreated
-            : totalClients;
-            
-          setBackfillProgress({
-            phase: progress.phase || 'Processing',
-            processed: displayCount,
-            total: displayTotal
-          });
-
-          // Check if completed
-          if (progress.status === 'completed') {
-            setBackfillStatus('completed');
-            await checkShadowCounts();
-
-            toast({
-              title: "Backfill Completed!",
-              description: `Created ${progress.shadowsCreated || 0} shadow snapshots. Your sync is now fully operational.`,
-            });
-
-            setTimeout(() => {
-              setBackfillStatus('idle');
-            }, 5000);
-
-            return false; // Stop processing
-          }
-
-          // Check if failed
-          if (progress.status === 'failed') {
-            toast({
-              title: "Backfill Failed",
-              description: `Phase: ${progress.phase}. Check the edge function logs for details.`,
-              variant: "destructive",
-            });
-            setBackfillStatus('idle');
-            return false; // Stop processing
-          }
-        }
-
-        // Continue if response indicates more work
-        return data?.continueBackfill === true;
-      } catch (error: any) {
-        console.error('Chunk error:', error);
-        setBackfillStatus('idle');
-        
+    try {
+      setBackfillStatus('running');
+      setBackfillProgress({ phase: 'Starting...', processed: 0, total: totalClients });
+      
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
         toast({
-          title: "Backfill Failed",
-          description: error.message || "Check console and edge function logs for details.",
-          variant: "destructive",
+          title: "Sessie Verlopen",
+          description: "Log opnieuw in om door te gaan.",
+          variant: "destructive"
         });
-        
-        return false; // Stop on error
+        return;
       }
-    };
 
-    // Process chunks with delay between calls
-    const runBackfill = async () => {
-      let shouldContinue = true;
-      let chunkCount = 0;
+      console.log('🚀 Starting auto-backfill...');
+      
+      // Call backfill-sync with autoContinue enabled for automatic background processing
+      const { data, error } = await supabase.functions.invoke('backfill-sync', {
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: { autoContinue: true } // Enable auto-continue mode
+      });
 
-      while (shouldContinue) {
-        chunkCount++;
-        console.log(`Processing chunk ${chunkCount}...`);
-        
-        shouldContinue = await processChunk();
-        
-        if (shouldContinue) {
-          // Wait 2 seconds between chunks to avoid overwhelming the function
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
+      if (error) throw error;
+
+      if (data?.autoContinuing) {
+        toast({
+          title: "Backfill Gestart",
+          description: "Backfill draait automatisch op de achtergrond. Controleer hier de voortgang.",
+        });
+      } else if (data?.continueBackfill) {
+        toast({
+          title: "Backfill Actief",
+          description: "Verwerking loopt automatisch door...",
+        });
+      } else {
+        toast({
+          title: "Backfill Voltooid",
+          description: data?.message || 'Alle shadow snapshots zijn aangemaakt.',
+        });
+        setBackfillStatus('completed');
       }
-    };
 
-    runBackfill();
+    } catch (error: any) {
+      console.error('Backfill error:', error);
+      toast({
+        title: "Backfill Fout",
+        description: error.message || 'Er is een fout opgetreden tijdens de backfill.',
+        variant: "destructive"
+      });
+      setBackfillStatus('idle');
+    }
   };
 
   const hasDuplicates = duplicates.length > 0;
