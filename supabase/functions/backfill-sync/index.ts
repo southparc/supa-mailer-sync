@@ -79,7 +79,12 @@ async function verifyAdmin(req: Request, supabase: any): Promise<{ userId: strin
     };
   }
 
-  const token = authHeader.replace('Bearer ', '');
+  const token = authHeader.replace('Bearer ', '').trim();
+  // Allow internal self-invocation using service role key
+  const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+  if (serviceKey && token === serviceKey) {
+    return { userId: 'service_role', error: null };
+  }
   const { data: { user }, error: authError } = await supabase.auth.getUser(token);
   
   if (authError || !user) {
