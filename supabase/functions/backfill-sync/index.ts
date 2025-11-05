@@ -139,6 +139,7 @@ interface BackfillProgress {
   subscriberCursor: string | null
   shadowOffset: number
   continuationCount?: number // Track auto-continuation iterations
+  preflightDone?: boolean // Track if preflight logic has already run
 }
 
 // Helper to save progress
@@ -396,6 +397,7 @@ Deno.serve(async (req) => {
       progress.phase = 'Completed'
       progress.shadowsCreated = existingShadows
       progress.crosswalkCreated = crosswalkPairs
+      progress.preflightDone = true
       await saveProgress(supabase, progress)
       
       return new Response(
@@ -409,24 +411,30 @@ Deno.serve(async (req) => {
           status: 200
         }
       )
-    } else if (crosswalkClients && totalClients && crosswalkClients >= totalClients) {
-      // Phases 1-2 complete, jump to Phase 3
-      console.log(`🚀 Preflight: Crosswalk complete (${crosswalkClients}/${totalClients}). Fast-forwarding to Phase 3 from offset ${existingShadows || 0}`)
+    } else if (crosswalkClients && totalClients && crosswalkClients >= totalClients && !progress.preflightDone) {
+      // Phases 1-2 complete, jump to Phase 3 (only if preflight hasn't run yet)
+      console.log(`🚀 Preflight: Crosswalk complete (${crosswalkClients}/${totalClients}). Fast-forwarding to Phase 3 from offset ${Math.max(progress.shadowOffset || 0, existingShadows || 0)}`)
       progress.phase = 'Phase 3: Creating shadow snapshots'
       progress.status = 'running'
-      progress.shadowOffset = existingShadows || 0
+      progress.shadowOffset = Math.max(progress.shadowOffset || 0, existingShadows || 0)
       progress.crosswalkCreated = crosswalkClients || 0
       progress.totalProcessed = crosswalkClients || 0
+      progress.preflightDone = true
       progress.lastUpdatedAt = new Date().toISOString()
       await saveProgress(supabase, progress)
     } else {
-      // Phases 1 or 2 incomplete, proceed as planned
-      console.log(`📍 Preflight: Resuming from ${progress.phase}`)
+      // Phases 1 or 2 incomplete, or preflight already done - proceed as planned
+      console.log(`📍 Preflight: ${progress.preflightDone ? 'Already initialized, continuing' : 'Resuming'} from ${progress.phase}`)
     }
 
-    // Safety check: max continuation limit
-    const MAX_CONTINUATIONS = 200
+    // Safety check: max continuation limit (dynamic based on remaining work)
+    const RECORDS_PER_CHUNK = 100
+    const remainingShadows = (crosswalkPairs || 0) - (existingShadows || 0)
+    const requiredContinuations = Math.ceil(remainingShadows / RECORDS_PER_CHUNK) + 10
+    const MAX_CONTINUATIONS = Math.min(5000, Math.max(200, requiredContinuations))
     const currentCount = progress.continuationCount || 0
+    
+    console.log(`📊 Continuation limits: ${currentCount}/${MAX_CONTINUATIONS} (estimated ${requiredContinuations} needed for ${remainingShadows} shadows)`)
     
     if (autoContinue && currentCount >= MAX_CONTINUATIONS) {
       console.warn(`⚠️ Max continuation limit reached (${MAX_CONTINUATIONS}). Stopping auto-continue.`)
@@ -473,14 +481,19 @@ Deno.serve(async (req) => {
           console.log('🔄 Auto-continuing in background...')
           
           EdgeRuntime.waitUntil(
-            fetch(`${projectUrl}/functions/v1/backfill-sync`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${serviceRoleKey}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({ autoContinue: true })
-            }).catch(err => {
+            (async () => {
+              // Small delay to allow DB commits to settle
+              await new Promise(r => setTimeout(r, 250))
+              
+              await fetch(`${projectUrl}/functions/v1/backfill-sync`, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${serviceRoleKey}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ autoContinue: true })
+              })
+            })().catch(err => {
               console.error('❌ Background continuation failed:', err)
             })
           )
@@ -677,10 +690,12 @@ async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: 
       .select('email, a_id, b_id')
       .not('a_id', 'is', null)
       .not('b_id', 'is', null)
+      .order('email') // Deterministic ordering for stable RANGE + OFFSET
       .range(offset, offset + limit - 1)
 
     if (error) throw error
     if (!crosswalks || crosswalks.length === 0) {
+      console.log(`✅ Phase 3 complete - no more crosswalks at offset ${offset}`)
       return { shadowsCreated, errors, recordsProcessed: 0, hasMore: false }
     }
 
@@ -748,6 +763,7 @@ async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: 
       }
     }
 
+    console.log(`✅ Shadow batch complete: ${shadowsCreated} shadows created, ${errors} errors, ${crosswalks.length} records processed`)
     return { shadowsCreated, errors, recordsProcessed: crosswalks.length, hasMore: crosswalks.length === limit }
   } catch (error) {
     console.error('Error in shadow creation chunk:', error)
