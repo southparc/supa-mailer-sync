@@ -298,26 +298,17 @@ Deno.serve(async (req) => {
       const isStale = progress.status === 'running' && lastUpdateMs > 5 * 60 * 1000;
 
       if (isStale) {
-        console.warn('Stale backfill detected (no update in 5+ minutes). Restarting...', {
+        console.warn('⚠️ Stale backfill detected. Resuming from checkpoint...', {
           lastUpdatedAt: progress.lastUpdatedAt,
-          minutesAgo: Math.floor(lastUpdateMs / 60000)
+          minutesAgo: Math.floor(lastUpdateMs / 60000),
+          phase: progress.phase
         });
         
-        // Start fresh from beginning
-        progress = {
-          phase: 'Phase 1: Building client crosswalk',
-          totalProcessed: 0,
-          crosswalkCreated: 0,
-          shadowsCreated: 0,
-          errors: 0,
-          startedAt: new Date().toISOString(),
-          lastUpdatedAt: new Date().toISOString(),
-          status: 'running',
-          clientOffset: 0,
-          subscriberCursor: null,
-          shadowOffset: 0,
-          continuationCount: 0
-        };
+        // Resume from checkpoint: preserve phase, offsets, continuationCount, preflightDone
+        progress.status = 'running';
+        progress.lastUpdatedAt = new Date().toISOString();
+        // Don't reset to Phase 1 - keep existing progress
+        await saveProgress(supabase, progress);
       } else if (progress.status === 'completed') {
         console.log('Previous backfill completed, starting fresh')
         progress = {
@@ -417,11 +408,12 @@ Deno.serve(async (req) => {
       progress.phase = 'Phase 3: Creating shadow snapshots'
       progress.status = 'running'
       progress.shadowOffset = Math.max(progress.shadowOffset || 0, existingShadows || 0)
+      progress.shadowsCreated = existingShadows || 0 // Set cumulative count
       progress.crosswalkCreated = crosswalkClients || 0
       progress.totalProcessed = crosswalkClients || 0
       progress.preflightDone = true
-      progress.lastUpdatedAt = new Date().toISOString()
       await saveProgress(supabase, progress)
+      console.log(`✅ Preflight complete: shadowsCreated=${progress.shadowsCreated}, shadowOffset=${progress.shadowOffset}`)
     } else {
       // Phases 1 or 2 incomplete, or preflight already done - proceed as planned
       console.log(`📍 Preflight: ${progress.preflightDone ? 'Already initialized, continuing' : 'Resuming'} from ${progress.phase}`)

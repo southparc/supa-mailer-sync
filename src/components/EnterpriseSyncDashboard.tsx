@@ -70,10 +70,17 @@ const EnterpriseSyncDashboard: React.FC = () => {
   });
   const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
   const [backfillStatus, setBackfillStatus] = useState<'idle' | 'running' | 'completed'>('idle');
-  const [backfillProgress, setBackfillProgress] = useState({ phase: '', processed: 0, total: 0 });
+  const [backfillProgress, setBackfillProgress] = useState({ 
+    phase: '', 
+    shadowsCreated: 0, 
+    totalPairs: 0,
+    continuationCount: 0,
+    lastUpdatedAt: ''
+  });
   const [showBackfillDialog, setShowBackfillDialog] = useState(false);
   const [shadowCount, setShadowCount] = useState(0);
   const [totalClients, setTotalClients] = useState(0);
+  const [crosswalkPairs, setCrosswalkPairs] = useState(0);
   const { toast } = useToast();
 
   const fetchSubscriptionStats = async () => {
@@ -112,6 +119,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
     checkDuplicates();
     checkBatchState();
     checkShadowCounts();
+    loadBackfillProgress();
     
     // Set up real-time subscription to sync_state
     const channel = supabase
@@ -122,11 +130,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
           event: '*',
           schema: 'public',
           table: 'sync_state',
-          filter: 'key=in.(last_successful_sync,sync_statistics,sync_percentage_status)'
+          filter: 'key=in.(last_successful_sync,sync_statistics,sync_percentage_status,backfill_progress)'
         },
-        () => {
-          console.log('Sync state updated, reloading stats...');
+        (payload) => {
+          console.log('Sync state updated, reloading stats...', payload);
           loadSyncStats();
+          if (payload.new && (payload.new as any).key === 'backfill_progress') {
+            loadBackfillProgress();
+          }
         }
       )
       .subscribe();
@@ -466,22 +477,55 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   const checkShadowCounts = async () => {
     try {
-      const [clientsResult, shadowsResult] = await Promise.all([
+      const [clientsResult, shadowsResult, crosswalkResult] = await Promise.all([
         supabase.from('clients').select('*', { count: 'exact', head: true }),
-        supabase.from('sync_shadow').select('*', { count: 'exact', head: true })
+        supabase.from('sync_shadow').select('*', { count: 'exact', head: true }),
+        supabase.from('integration_crosswalk').select('*', { count: 'exact', head: true })
       ]);
       
       setTotalClients(clientsResult.count || 0);
       setShadowCount(shadowsResult.count || 0);
+      setCrosswalkPairs(crosswalkResult.count || 0);
     } catch (error) {
       console.error('Failed to check shadow counts:', error);
+    }
+  };
+
+  const loadBackfillProgress = async () => {
+    try {
+      const { data } = await supabase
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'backfill_progress')
+        .maybeSingle();
+      
+      if (data?.value && typeof data.value === 'object') {
+        const progress = data.value as any;
+        setBackfillProgress({
+          phase: progress.phase || '',
+          shadowsCreated: progress.shadowsCreated || 0,
+          totalPairs: crosswalkPairs || progress.crosswalkCreated || 0,
+          continuationCount: progress.continuationCount || 0,
+          lastUpdatedAt: progress.lastUpdatedAt || ''
+        });
+        
+        if (progress.status === 'running') {
+          setBackfillStatus('running');
+        } else if (progress.status === 'completed') {
+          setBackfillStatus('completed');
+        } else {
+          setBackfillStatus('idle');
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load backfill progress:', error);
     }
   };
 
   const handleBackfill = async () => {
     try {
       setBackfillStatus('running');
-      setBackfillProgress({ phase: 'Starting...', processed: 0, total: totalClients });
+      setShowBackfillDialog(false);
       
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) {
@@ -500,11 +544,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
         headers: {
           Authorization: `Bearer ${session.access_token}`,
         },
-        body: { autoContinue: true } // Enable auto-continue mode
+        body: { autoContinue: true }
       });
 
       if (error) throw error;
 
+      // Load initial progress
+      await loadBackfillProgress();
+      
       if (data?.autoContinuing) {
         toast({
           title: "Backfill Gestart",
@@ -515,7 +562,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
           title: "Backfill Actief",
           description: "Verwerking loopt automatisch door...",
         });
-      } else {
+      } else if (data?.completed) {
         toast({
           title: "Backfill Voltooid",
           description: data?.message || 'Alle shadow snapshots zijn aangemaakt.',
@@ -534,13 +581,48 @@ const EnterpriseSyncDashboard: React.FC = () => {
     }
   };
 
+  const handlePauseBackfill = async () => {
+    try {
+      // Update backfill progress status to paused
+      const { data } = await supabase
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'backfill_progress')
+        .maybeSingle();
+      
+      if (data?.value) {
+        const progress = data.value as any;
+        await supabase
+          .from('sync_state')
+          .upsert({
+            key: 'backfill_progress',
+            value: { ...progress, status: 'paused' }
+          });
+        
+        setBackfillStatus('idle');
+        toast({
+          title: "Backfill Gepauzeerd",
+          description: "De backfill is gepauzeerd. Klik op 'Resume Backfill' om door te gaan.",
+        });
+      }
+    } catch (error: any) {
+      console.error('Pause error:', error);
+      toast({
+        title: "Fout",
+        description: "Kon backfill niet pauzeren.",
+        variant: "destructive"
+      });
+    }
+  };
+
   const hasDuplicates = duplicates.length > 0;
   const needsBackfill = totalClients > 0 && shadowCount < totalClients * 0.5;
+  const showBackfillWarning = needsBackfill && (backfillStatus === 'idle' || backfillStatus === 'completed');
 
   return (
     <div className="space-y-6">
       {/* Backfill Warning & Controls */}
-      {needsBackfill && backfillStatus === 'idle' && (
+      {showBackfillWarning && (
         <Card className="border-warning bg-warning/5">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-warning">
@@ -579,24 +661,57 @@ const EnterpriseSyncDashboard: React.FC = () => {
       {backfillStatus === 'running' && (
         <Card className="border-primary">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <RefreshCw className="h-5 w-5 animate-spin" />
-              Backfill in Progress
+            <CardTitle className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <RefreshCw className="h-5 w-5 animate-spin" />
+                Backfill in Progress
+              </div>
+              <Badge variant="secondary" className="ml-2">
+                Auto-continue Running
+              </Badge>
             </CardTitle>
             <CardDescription>
-              {backfillProgress.phase} - Processing {backfillProgress.processed.toLocaleString()} of ~{backfillProgress.total.toLocaleString()} records
+              {backfillProgress.phase} - {backfillProgress.shadowsCreated.toLocaleString()} / {(backfillProgress.totalPairs || crosswalkPairs).toLocaleString()} shadows created
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-4">
             <Progress 
-              value={(backfillProgress.processed / backfillProgress.total) * 100} 
+              value={(backfillProgress.shadowsCreated / (backfillProgress.totalPairs || crosswalkPairs || 1)) * 100} 
               className="mb-2" 
             />
-            <p className="text-sm text-muted-foreground">
-              {backfillProgress.processed.toLocaleString()} / {backfillProgress.total.toLocaleString()} records
-            </p>
-            <p className="text-xs text-muted-foreground mt-2">
-              This process respects MailerLite rate limits (120 req/min). Estimated time: 20-40 minutes.
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <div>
+                <p className="text-muted-foreground">Progress</p>
+                <p className="font-medium">
+                  {backfillProgress.shadowsCreated.toLocaleString()} / {(backfillProgress.totalPairs || crosswalkPairs).toLocaleString()} 
+                  ({((backfillProgress.shadowsCreated / (backfillProgress.totalPairs || crosswalkPairs || 1)) * 100).toFixed(1)}%)
+                </p>
+              </div>
+              <div>
+                <p className="text-muted-foreground">Continuation Count</p>
+                <p className="font-medium">{backfillProgress.continuationCount}</p>
+              </div>
+              <div className="col-span-2">
+                <p className="text-muted-foreground">Last Updated</p>
+                <p className="font-medium text-xs">
+                  {backfillProgress.lastUpdatedAt 
+                    ? new Date(backfillProgress.lastUpdatedAt).toLocaleString('nl-NL')
+                    : 'N/A'
+                  }
+                </p>
+              </div>
+            </div>
+            <Button 
+              onClick={handlePauseBackfill}
+              variant="outline"
+              size="sm"
+              className="w-full"
+            >
+              <Pause className="h-4 w-4 mr-2" />
+              Pause Backfill
+            </Button>
+            <p className="text-xs text-muted-foreground">
+              This process respects MailerLite rate limits (120 req/min) and runs automatically in the background.
             </p>
           </CardContent>
         </Card>
