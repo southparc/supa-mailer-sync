@@ -20,3 +20,6 @@ verify_jwt = true
 
 [functions.backfill-subscription-status]
 verify_jwt = true
+
+[functions.diagnose-missing-shadows]
+verify_jwt = true
