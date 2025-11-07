@@ -7,7 +7,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
-import { SyncSettings } from "@/components/SyncSettings";
 import { SyncLogs } from "@/components/SyncLogs";
 import { AdvisorsManagement } from "@/components/AdvisorsManagement";
 import SmartSyncDashboard from "@/components/SmartSyncDashboard";
@@ -230,11 +229,10 @@ export default function Dashboard() {
 
         {/* Main Content Tabs */}
         <Tabs defaultValue="enterprise-sync" className="space-y-6">
-          <TabsList className="grid w-full grid-cols-5">
+          <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="enterprise-sync">Full Sync</TabsTrigger>
             <TabsTrigger value="smart-sync">Email Sync</TabsTrigger>
             <TabsTrigger value="advisors">Advisors</TabsTrigger>
-            <TabsTrigger value="settings">Settings</TabsTrigger>
             <TabsTrigger value="logs">Logs</TabsTrigger>
           </TabsList>
 
@@ -249,20 +247,6 @@ export default function Dashboard() {
 
           <TabsContent value="advisors" className="space-y-6">
             <AdvisorsManagement />
-          </TabsContent>
-
-          <TabsContent value="settings" className="space-y-6">
-            <Card>
-              <CardHeader>
-                <CardTitle>Sync Configuration</CardTitle>
-                <CardDescription>
-                  Configure field mappings and batch processing for large datasets. Note: Settings are not persisted and will reset on page refresh.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <SyncSettings />
-              </CardContent>
-            </Card>
           </TabsContent>
 
           <TabsContent value="logs" className="space-y-6">

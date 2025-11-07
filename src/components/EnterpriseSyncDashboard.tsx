@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Progress } from "@/components/ui/progress";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { 
   ArrowLeftRight, 
@@ -15,32 +16,17 @@ import {
   Database,
   Mail,
   Activity,
-  Clock,
-  Users,
-  CheckCircle,
-  XCircle,
-  RefreshCw
+  RefreshCw,
+  CheckCircle
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
+import { useSyncStats } from "@/hooks/useSyncStats";
+import { useSyncOperation } from "@/hooks/useSyncOperation";
+import { SyncButton } from "./SyncButton";
 import EnterpriseConflictResolution from './EnterpriseConflictResolution';
 import { RateLimitStatus } from './RateLimitStatus';
 import { DiagnosticMissingShadows } from './DiagnosticMissingShadows';
-
-interface SyncStats {
-  conflicts: number;
-  lastSync?: string;
-  recordsProcessed?: number;
-  updatesApplied?: number;
-}
-
-interface SyncPercentage {
-  percentage: number;
-  totalMailerLite: number;
-  totalSupabase: number;
-  matched: number;
-  lastCalculated?: string;
-}
 
 interface Duplicate {
   name: string;
@@ -48,30 +34,20 @@ interface Duplicate {
   ids: string;
 }
 
+interface BackfillProgress {
+  phase: string;
+  shadowsCreated: number;
+  totalPairs: number;
+  continuationCount: number;
+  lastUpdatedAt: string;
+}
+
 const EnterpriseSyncDashboard: React.FC = () => {
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'completed' | 'paused'>('idle');
-  const [syncProgress, setSyncProgress] = useState(0);
-  const [batchState, setBatchState] = useState<any>(null);
-  const [stats, setStats] = useState<SyncStats>({ 
-    conflicts: 0, 
-    lastSync: undefined, 
-    recordsProcessed: 0, 
-    updatesApplied: 0 
-  });
-  const [subscriptionStats, setSubscriptionStats] = useState<{
-    total: number;
-    subscribed: number;
-    unsubscribed: number;
-  }>({ total: 0, subscribed: 0, unsubscribed: 0 });
-  const [syncPercentage, setSyncPercentage] = useState<SyncPercentage>({
-    percentage: 0,
-    totalMailerLite: 0,
-    totalSupabase: 0,
-    matched: 0
-  });
+  const { stats, syncPercentage, loading: statsLoading, refresh: refreshStats } = useSyncStats();
+  const { syncing, progress, status, testConnection, runSync, stopSync } = useSyncOperation();
   const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
   const [backfillStatus, setBackfillStatus] = useState<'idle' | 'running' | 'completed'>('idle');
-  const [backfillProgress, setBackfillProgress] = useState({ 
+  const [backfillProgress, setBackfillProgress] = useState<BackfillProgress>({ 
     phase: '', 
     shadowsCreated: 0, 
     totalPairs: 0,
@@ -79,47 +55,10 @@ const EnterpriseSyncDashboard: React.FC = () => {
     lastUpdatedAt: ''
   });
   const [showBackfillDialog, setShowBackfillDialog] = useState(false);
-  const [shadowCount, setShadowCount] = useState(0);
-  const [totalClients, setTotalClients] = useState(0);
-  const [crosswalkPairs, setCrosswalkPairs] = useState(0);
   const { toast } = useToast();
 
-  const fetchSubscriptionStats = async () => {
-    try {
-      // Get total clients
-      const { count: totalCount, error: totalError } = await supabase
-        .from('clients')
-        .select('*', { count: 'exact', head: true });
-
-      if (totalError) throw totalError;
-
-      // Get subscription counts by joining clients with mappings to satisfy RLS
-      const { data: mappings, error: mappingError } = await supabase
-        .from('client_group_mappings')
-        .select('is_subscribed, clients!inner(*)')
-        .not('clients', 'is', null);
-
-      if (mappingError) throw mappingError;
-
-      const subscribedCount = mappings?.filter(m => m.is_subscribed === true).length || 0;
-      const unsubscribedCount = mappings?.filter(m => m.is_subscribed === false).length || 0;
-
-      setSubscriptionStats({
-        total: totalCount || 0,
-        subscribed: subscribedCount,
-        unsubscribed: unsubscribedCount,
-      });
-    } catch (error) {
-      console.error('Failed to fetch subscription stats:', error);
-    }
-  };
-
   useEffect(() => {
-    loadSyncStats();
-    fetchSubscriptionStats();
     checkDuplicates();
-    checkBatchState();
-    checkShadowCounts();
     loadBackfillProgress();
     
     // Set up real-time subscription to sync_state
@@ -131,14 +70,11 @@ const EnterpriseSyncDashboard: React.FC = () => {
           event: '*',
           schema: 'public',
           table: 'sync_state',
-          filter: 'key=in.(last_successful_sync,sync_statistics,sync_percentage_status,backfill_progress)'
+          filter: 'key=in.(backfill_progress,full_sync_state)'
         },
-        (payload) => {
-          console.log('Sync state updated, reloading stats...', payload);
-          loadSyncStats();
-          if (payload.new && (payload.new as any).key === 'backfill_progress') {
-            loadBackfillProgress();
-          }
+        () => {
+          refreshStats();
+          loadBackfillProgress();
         }
       )
       .subscribe();
@@ -146,349 +82,15 @@ const EnterpriseSyncDashboard: React.FC = () => {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, []);
-
-  const loadSyncStats = async () => {
-    try {
-      // Load last sync timestamp from sync_state (primary source)
-      const { data: lastSyncData } = await supabase
-        .from('sync_state')
-        .select('value')
-        .eq('key', 'last_successful_sync')
-        .maybeSingle();
-      
-      // Load persistent statistics from sync_state
-      const { data: statsData } = await supabase
-        .from('sync_state')
-        .select('value')
-        .eq('key', 'sync_statistics')
-        .maybeSingle();
-      
-      // Load sync percentage from sync_state
-      const { data: percentageData } = await supabase
-        .from('sync_state')
-        .select('value')
-        .eq('key', 'sync_percentage_status')
-        .maybeSingle();
-      
-      if (lastSyncData?.value && typeof lastSyncData.value === 'object') {
-        const syncData = lastSyncData.value as any;
-        setStats(prev => ({
-          ...prev,
-          lastSync: syncData.timestamp || syncData.lastSync
-        }));
-      }
-      
-      if (statsData?.value && typeof statsData.value === 'object') {
-        const persistedStats = statsData.value as any;
-        setStats(prev => ({
-          ...prev,
-          recordsProcessed: persistedStats.recordsProcessed || 0,
-          updatesApplied: persistedStats.updatesApplied || 0,
-          conflicts: persistedStats.conflicts || prev.conflicts
-        }));
-      }
-      
-      if (percentageData?.value && typeof percentageData.value === 'object') {
-        const percentData = percentageData.value as any;
-        setSyncPercentage({
-          percentage: percentData.percentage || 0,
-          totalMailerLite: percentData.totalMailerLite || 0,
-          totalSupabase: percentData.totalSupabase || 0,
-          matched: percentData.matched || 0,
-          lastCalculated: percentData.lastCalculated
-        });
-      }
-    } catch (error) {
-      console.error('Failed to load sync stats:', error);
-    }
-  };
+  }, [refreshStats]);
 
   const checkDuplicates = async () => {
     try {
       const { data, error } = await supabase.rpc('check_duplicate_advisors');
       if (error) throw error;
       setDuplicates(data || []);
-    } catch (error: any) {
+    } catch (error) {
       console.error('Error checking duplicates:', error);
-    }
-  };
-
-  const checkBatchState = async () => {
-    try {
-      const { data } = await supabase
-        .from('sync_state')
-        .select('value')
-        .eq('key', 'full_sync_state')
-        .maybeSingle();
-      
-      if (data?.value && typeof data.value === 'object') {
-        const state = data.value as any;
-        setBatchState(state);
-        if (state.phase !== 'done' && state.phase !== 'init') {
-          setSyncStatus('paused');
-        }
-      }
-    } catch (error) {
-      console.error('Failed to check batch state:', error);
-    }
-  };
-
-  // Map UI directions to smart-sync modes
-  const mapDirection = (d: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') =>
-    d === 'bidirectional' ? 'bidirectional' :
-    d === 'from_mailerlite' ? 'BtoA' :
-    'AtoB';
-
-  const stopSync = async () => {
-    try {
-      await supabase
-        .from('sync_state')
-        .delete()
-        .eq('key', 'mailerlite:import:cursor');
-      
-      setSyncStatus('idle');
-      setSyncProgress(0);
-      
-      toast({
-        title: "Sync Gestopt",
-        description: "De synchronisatie is handmatig gestopt.",
-      });
-    } catch (error) {
-      console.error('Failed to stop sync:', error);
-      toast({
-        title: "Fout",
-        description: "Kon sync niet stoppen. Probeer opnieuw.",
-        variant: "destructive",
-      });
-    }
-  };
-
-  const checkConnection = async () => {
-    try {
-      const { data, error } = await supabase.functions.invoke('smart-sync', {
-        body: { ping: true }
-      });
-      
-      if (error) throw error;
-      
-      toast({
-        title: "Verbinding OK",
-        description: `Edge function bereikbaar (v${data?.version || 'unknown'})`,
-      });
-      return true;
-    } catch (error: any) {
-      console.error('Connection check failed:', error);
-      toast({
-        title: "Edge Function Onbereikbaar",
-        description: "Kan smart-sync functie niet bereiken. Check console logs.",
-        variant: "destructive",
-      });
-      return false;
-    }
-  };
-
-  const handleSync = async (direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') => {
-    if (syncStatus === 'syncing') {
-      toast({
-        title: "Sync Already Running",
-        description: "Please wait for the current sync to complete.",
-      });
-      return;
-    }
-    
-    console.log('Starting sync with direction:', direction, 'mapped to:', mapDirection(direction));
-    
-    try {
-      setSyncStatus('syncing');
-      setSyncProgress(10);
-      
-      toast({
-        title: "Sync Started",
-        description: `Starting ${direction} sync...`,
-      });
-      
-      console.log('Invoking smart-sync function...');
-      const { data, error } = await supabase.functions.invoke('smart-sync', {
-        body: {
-          mode: mapDirection(direction),
-          emails: [],
-          repair: false,
-          dryRun: false,
-          batch: true,
-          maxItems: 500,
-          timeBudgetMs: 45000,
-          minRemaining: 60
-        }
-      });
-
-      console.log('Smart-sync response:', { data, error });
-
-      if (error) {
-        console.error('Smart-sync error:', error);
-        
-        // Handle authentication/authorization errors
-        if (error.message?.includes('401') || error.message?.includes('403') || 
-            error.message?.includes('Authorization') || error.message?.includes('Admin privileges')) {
-          toast({
-            title: "Authentication Error",
-            description: "Session expired or insufficient permissions. Please refresh the page.",
-            variant: "destructive",
-          });
-          setSyncStatus('idle');
-          return;
-        }
-        
-        // Check if it's a FunctionsFetchError (unreachable)
-        if (error.message?.includes('FunctionsFetchError') || error.message?.includes('Failed to fetch')) {
-          toast({
-            title: "Edge Function Onbereikbaar",
-            description: "Kan smart-sync niet aanroepen. Check netwerk/CORS.",
-            variant: "destructive",
-          });
-          setSyncStatus('idle');
-          setSyncProgress(0);
-          return;
-        }
-        
-        throw error;
-      }
-
-      setSyncProgress(90);
-      
-      const result = data || {};
-      console.log('Parsed result:', result);
-      
-      // Check if batch was paused
-      if (result.out?.paused) {
-        const pauseReason = result.out.paused === 'rate-limit' ? 'Rate Limit Bereikt' : 'Batch Limiet';
-        const nextRun = result.out.next_run_at ? ` (hervat om ${new Date(result.out.next_run_at).toLocaleTimeString()})` : '';
-        
-        setSyncStatus('idle');
-        setSyncProgress(0);
-        
-        toast({
-          title: `Sync Gepauseerd: ${pauseReason}`,
-          description: `Verwerkt: ${result.out.processed || 0} records. Phase: ${result.out.phase}.${nextRun} Roep sync opnieuw aan om te hervatten.`,
-        });
-        return;
-      }
-      
-      // Check if batch completed
-      if (result.out?.done) {
-        const syncStats = result.out.stats || {};
-        const created = syncStats.created || 0;
-        const updated = syncStats.updated || 0;
-        const errors = syncStats.errors || 0;
-        
-        setStats(prev => ({
-          ...prev,
-          lastSync: new Date().toISOString(),
-          recordsProcessed: (prev.recordsProcessed || 0) + (created + updated),
-          updatesApplied: (prev.updatesApplied || 0) + created + updated,
-        }));
-
-        setSyncStatus('completed');
-        setSyncProgress(100);
-        
-        await fetchSubscriptionStats();
-        
-        toast({
-          title: "Batch Sync Voltooid!",
-          description: `Created: ${created}, Updated: ${updated}, Errors: ${errors}`,
-        });
-
-        setTimeout(() => {
-          setSyncStatus('idle');
-          setSyncProgress(0);
-        }, 3000);
-        return;
-      }
-      
-      const recordCount = result.count || 0;
-      const syncStats = result.out?.stats || {};
-      const created = syncStats.created || 0;
-      const updated = syncStats.updated || 0;
-      const conflicts = syncStats.conflicts || 0;
-      
-      setStats(prev => ({
-        ...prev,
-        lastSync: new Date().toISOString(),
-        recordsProcessed: (prev.recordsProcessed || 0) + recordCount,
-        updatesApplied: (prev.updatesApplied || 0) + created + updated,
-        conflicts: (prev.conflicts || 0) + conflicts
-      }));
-
-      setSyncStatus('completed');
-      setSyncProgress(100);
-      
-      await fetchSubscriptionStats();
-      await loadSyncStats(); // Reload stats including sync percentage
-      
-      toast({
-        title: "Sync Completed",
-        description: `${recordCount} records. Created: ${created}, Updated: ${updated}, Conflicts: ${conflicts}`,
-      });
-
-      setTimeout(() => {
-        setSyncStatus('idle');
-        setSyncProgress(0);
-      }, 3000);
-
-    } catch (error: any) {
-      console.error('Sync failed:', error);
-      setSyncStatus('idle');
-      setSyncProgress(0);
-      
-      toast({
-        title: "Sync Failed",
-        description: error.message || "Check console for details.",
-        variant: "destructive",
-      });
-    }
-  };
-
-  const getSyncButtonProps = (direction: 'bidirectional' | 'from_mailerlite' | 'to_mailerlite') => {
-    const configs = {
-      bidirectional: {
-        icon: ArrowLeftRight,
-        label: 'Bidirectionele Sync',
-        description: 'Synchroniseert in beide richtingen tussen Supabase en MailerLite',
-        variant: 'default' as const
-      },
-      from_mailerlite: {
-        icon: ArrowRight,
-        label: 'Importeer van MailerLite',
-        description: 'Haalt data op van MailerLite naar Supabase',
-        variant: 'outline' as const
-      },
-      to_mailerlite: {
-        icon: ArrowLeft,
-        label: 'Exporteer naar MailerLite',
-        description: 'Stuurt Supabase data naar MailerLite',
-        variant: 'outline' as const
-      }
-    };
-    return configs[direction];
-  };
-
-  const updateConflictStats = (conflictStats: { conflicts: number }) => {
-    setStats(prev => ({ ...prev, conflicts: conflictStats.conflicts }));
-  };
-
-  const checkShadowCounts = async () => {
-    try {
-      const [clientsResult, shadowsResult, crosswalkResult] = await Promise.all([
-        supabase.from('clients').select('*', { count: 'exact', head: true }),
-        supabase.from('sync_shadow').select('*', { count: 'exact', head: true }),
-        supabase.from('integration_crosswalk').select('*', { count: 'exact', head: true })
-      ]);
-      
-      setTotalClients(clientsResult.count || 0);
-      setShadowCount(shadowsResult.count || 0);
-      setCrosswalkPairs(crosswalkResult.count || 0);
-    } catch (error) {
-      console.error('Failed to check shadow counts:', error);
     }
   };
 
@@ -499,27 +101,39 @@ const EnterpriseSyncDashboard: React.FC = () => {
         .select('value')
         .eq('key', 'backfill_progress')
         .maybeSingle();
-      
-      if (data?.value && typeof data.value === 'object') {
+
+      if (data?.value) {
         const progress = data.value as any;
         setBackfillProgress({
           phase: progress.phase || '',
           shadowsCreated: progress.shadowsCreated || 0,
-          totalPairs: crosswalkPairs || progress.crosswalkCreated || 0,
+          totalPairs: progress.totalPairs || 0,
           continuationCount: progress.continuationCount || 0,
-          lastUpdatedAt: progress.lastUpdatedAt || ''
+          lastUpdatedAt: progress.lastUpdatedAt || '',
         });
-        
-        if (progress.status === 'running') {
-          setBackfillStatus('running');
-        } else if (progress.status === 'completed') {
-          setBackfillStatus('completed');
-        } else {
-          setBackfillStatus('idle');
-        }
+        setBackfillStatus(
+          progress.phase === 'completed' ? 'completed' : 
+          progress.phase ? 'running' : 'idle'
+        );
       }
     } catch (error) {
-      console.error('Failed to load backfill progress:', error);
+      console.error('Error loading backfill progress:', error);
+    }
+  };
+
+  const handleSync = async (direction: 'mailerlite-to-supabase' | 'supabase-to-mailerlite' | 'bidirectional') => {
+    if (duplicates.length > 0) {
+      toast({
+        title: "Duplicates Detected",
+        description: "Please resolve duplicate advisors before syncing.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const result = await runSync({ direction, maxRecords: 500 });
+    if (result?.success) {
+      refreshStats();
     }
   };
 
@@ -528,55 +142,33 @@ const EnterpriseSyncDashboard: React.FC = () => {
       setBackfillStatus('running');
       setShowBackfillDialog(false);
       
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) {
-        toast({
-          title: "Sessie Verlopen",
-          description: "Log opnieuw in om door te gaan.",
-          variant: "destructive"
-        });
-        return;
-      }
+      toast({
+        title: "Backfill Started",
+        description: "Creating shadow records and crosswalk mappings...",
+      });
 
-      console.log('🚀 Starting auto-backfill...');
-      
-      // Call backfill-sync with autoContinue enabled for automatic background processing
       const { data, error } = await supabase.functions.invoke('backfill-sync', {
-        headers: {
-          Authorization: `Bearer ${session.access_token}`,
-        },
         body: { autoContinue: true }
       });
 
       if (error) throw error;
 
-      // Load initial progress
-      await loadBackfillProgress();
+      const result = data?.result || {};
       
-      if (data?.autoContinuing) {
-        toast({
-          title: "Backfill Gestart",
-          description: "Backfill draait automatisch op de achtergrond. Controleer hier de voortgang.",
-        });
-      } else if (data?.continueBackfill) {
-        toast({
-          title: "Backfill Actief",
-          description: "Verwerking loopt automatisch door...",
-        });
-      } else if (data?.completed) {
-        toast({
-          title: "Backfill Voltooid",
-          description: data?.message || 'Alle shadow snapshots zijn aangemaakt.',
-        });
-        setBackfillStatus('completed');
-      }
+      toast({
+        title: "Backfill Completed",
+        description: `Created ${result.shadowsCreated || 0} shadows and ${result.crosswalksCreated || 0} crosswalks`,
+      });
 
+      setBackfillStatus('completed');
+      refreshStats();
+      loadBackfillProgress();
     } catch (error: any) {
       console.error('Backfill error:', error);
       toast({
-        title: "Backfill Fout",
-        description: error.message || 'Er is een fout opgetreden tijdens de backfill.',
-        variant: "destructive"
+        title: "Backfill Failed",
+        description: error.message || 'An error occurred during backfill',
+        variant: "destructive",
       });
       setBackfillStatus('idle');
     }
@@ -584,155 +176,296 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   const handlePauseBackfill = async () => {
     try {
-      // Update backfill progress status to paused
-      const { data } = await supabase
-        .from('sync_state')
-        .select('value')
-        .eq('key', 'backfill_progress')
-        .maybeSingle();
+      await supabase.from('sync_state').upsert({
+        key: 'backfill_paused',
+        value: { paused: true, pausedAt: new Date().toISOString() }
+      });
       
-      if (data?.value) {
-        const progress = data.value as any;
-        await supabase
-          .from('sync_state')
-          .upsert({
-            key: 'backfill_progress',
-            value: { ...progress, status: 'paused' }
-          });
-        
-        setBackfillStatus('idle');
-        toast({
-          title: "Backfill Gepauzeerd",
-          description: "De backfill is gepauzeerd. Klik op 'Resume Backfill' om door te gaan.",
-        });
-      }
-    } catch (error: any) {
-      console.error('Pause error:', error);
       toast({
-        title: "Fout",
-        description: "Kon backfill niet pauzeren.",
-        variant: "destructive"
+        title: "Backfill Paused",
+        description: "The backfill will stop after the current batch.",
+      });
+    } catch (error: any) {
+      console.error('Error pausing backfill:', error);
+      toast({
+        title: "Error",
+        description: "Failed to pause backfill",
+        variant: "destructive",
       });
     }
   };
 
-  const hasDuplicates = duplicates.length > 0;
-  const needsBackfill = totalClients > 0 && shadowCount < totalClients * 0.5;
-  const showBackfillWarning = needsBackfill && (backfillStatus === 'idle' || backfillStatus === 'completed');
+  const getSyncButtonProps = (direction: string) => {
+    switch (direction) {
+      case 'mailerlite-to-supabase':
+        return {
+          icon: ArrowRight,
+          label: 'MailerLite → Supabase',
+          description: 'Import data from MailerLite',
+          variant: 'default' as const
+        };
+      case 'supabase-to-mailerlite':
+        return {
+          icon: ArrowLeft,
+          label: 'Supabase → MailerLite',
+          description: 'Export data to MailerLite',
+          variant: 'secondary' as const
+        };
+      case 'bidirectional':
+        return {
+          icon: ArrowLeftRight,
+          label: 'Bidirectional Sync',
+          description: 'Two-way synchronization',
+          variant: 'outline' as const
+        };
+      default:
+        return {
+          icon: Activity,
+          label: 'Sync',
+          description: '',
+          variant: 'default' as const
+        };
+    }
+  };
+
+  const needsBackfill = stats.totalClients > 0 && syncPercentage.percentage < 50;
 
   return (
     <div className="space-y-6">
-      {/* Backfill Warning & Controls */}
-      {showBackfillWarning && (
-        <Card className="border-warning bg-warning/5">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-warning">
-              <Database className="h-5 w-5" />
-              Initial Sync Setup Required
-            </CardTitle>
-            <CardDescription>
-              Only {shadowCount.toLocaleString()} of {totalClients.toLocaleString()} clients have shadow snapshots. 
-              Run the backfill process to enable full synchronization.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="bg-background p-4 rounded-lg space-y-2">
-              <h4 className="font-medium">What does backfill do?</h4>
-              <ul className="text-sm text-muted-foreground space-y-1 list-disc list-inside">
-                <li>Creates shadow snapshots for all {totalClients.toLocaleString()} clients</li>
-                <li>Links Supabase records with MailerLite subscribers</li>
-                <li>Enables the sync engine to detect and process changes</li>
-                <li>One-time operation (20-40 minutes, respects rate limits)</li>
-                <li>Runs in background - safe to navigate away</li>
-              </ul>
+      {/* Duplicate Advisors Warning */}
+      {duplicates.length > 0 && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <strong>Duplicate advisors detected:</strong> {duplicates.map(d => `${d.name} (${d.count}x)`).join(', ')}
+            <br />
+            <span className="text-sm">Resolve duplicates in the Advisors tab before syncing.</span>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {/* Backfill Warning */}
+      {needsBackfill && backfillStatus !== 'running' && (
+        <Alert>
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription className="flex items-center justify-between">
+            <div>
+              <strong>Initial backfill required</strong>
+              <p className="text-sm mt-1">
+                Only {syncPercentage.percentage}% of clients have shadow records ({syncPercentage.clientsWithShadow}/{syncPercentage.totalClients}).
+                Run backfill to create initial sync state.
+              </p>
             </div>
-            <Button 
-              onClick={() => setShowBackfillDialog(true)}
-              variant="default"
-              className="w-full"
-            >
-              <RefreshCw className="h-4 w-4 mr-2" />
-              Run Initial Backfill
+            <Button onClick={() => setShowBackfillDialog(true)} size="sm">
+              Start Backfill
             </Button>
-          </CardContent>
-        </Card>
+          </AlertDescription>
+        </Alert>
       )}
 
       {/* Backfill Progress */}
       {backfillStatus === 'running' && (
-        <Card className="border-primary">
+        <Card>
           <CardHeader>
             <CardTitle className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <RefreshCw className="h-5 w-5 animate-spin" />
-                Backfill in Progress
-              </div>
-              <Badge variant="secondary" className="ml-2">
-                Auto-continue Running
-              </Badge>
+              <span>Backfill in Progress</span>
+              <Button onClick={handlePauseBackfill} variant="outline" size="sm">
+                <Pause className="h-4 w-4 mr-2" />
+                Pause
+              </Button>
             </CardTitle>
             <CardDescription>
-              {backfillProgress.phase} - {backfillProgress.shadowsCreated.toLocaleString()} / {(backfillProgress.totalPairs || crosswalkPairs).toLocaleString()} shadows created
+              Creating shadow records and crosswalk mappings...
             </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-4">
-            <Progress 
-              value={(backfillProgress.shadowsCreated / (backfillProgress.totalPairs || crosswalkPairs || 1)) * 100} 
-              className="mb-2" 
-            />
-            <div className="grid grid-cols-2 gap-4 text-sm">
-              <div>
-                <p className="text-muted-foreground">Progress</p>
-                <p className="font-medium">
-                  {backfillProgress.shadowsCreated.toLocaleString()} / {(backfillProgress.totalPairs || crosswalkPairs).toLocaleString()} 
-                  ({((backfillProgress.shadowsCreated / (backfillProgress.totalPairs || crosswalkPairs || 1)) * 100).toFixed(1)}%)
-                </p>
-              </div>
-              <div>
-                <p className="text-muted-foreground">Continuation Count</p>
-                <p className="font-medium">{backfillProgress.continuationCount}</p>
-              </div>
-              <div className="col-span-2">
-                <p className="text-muted-foreground">Last Updated</p>
-                <p className="font-medium text-xs">
-                  {backfillProgress.lastUpdatedAt 
-                    ? new Date(backfillProgress.lastUpdatedAt).toLocaleString('nl-NL')
-                    : 'N/A'
-                  }
-                </p>
+          <CardContent>
+            <div className="space-y-4">
+              <Progress value={(backfillProgress.shadowsCreated / stats.totalClients) * 100} />
+              <div className="grid grid-cols-2 gap-4 text-sm">
+                <div>
+                  <p className="text-muted-foreground">Phase</p>
+                  <p className="font-medium">{backfillProgress.phase}</p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">Progress</p>
+                  <p className="font-medium">
+                    {backfillProgress.shadowsCreated} / {stats.totalClients} shadows
+                  </p>
+                </div>
               </div>
             </div>
-            <Button 
-              onClick={handlePauseBackfill}
-              variant="outline"
-              size="sm"
-              className="w-full"
-            >
-              <Pause className="h-4 w-4 mr-2" />
-              Pause Backfill
-            </Button>
-            <p className="text-xs text-muted-foreground">
-              This process respects MailerLite rate limits (120 req/min) and runs automatically in the background.
-            </p>
           </CardContent>
         </Card>
       )}
 
+      {/* Sync Status */}
+      {syncing && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center justify-between">
+              <span>Sync in Progress</span>
+              <Button onClick={stopSync} variant="outline" size="sm">
+                <Pause className="h-4 w-4 mr-2" />
+                Pause
+              </Button>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              <Progress value={progress} />
+              <p className="text-sm text-muted-foreground">{status}</p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Connection Test */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Activity className="h-5 w-5" />
+            Connection Status
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Button onClick={testConnection} variant="outline" disabled={syncing}>
+            <RefreshCw className="h-4 w-4 mr-2" />
+            Test Connection
+          </Button>
+        </CardContent>
+      </Card>
+
+      {/* Stats Overview */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <Database className="h-4 w-4" />
+              Total Clients
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{stats.totalClients}</div>
+            <p className="text-xs text-muted-foreground">
+              {syncPercentage.percentage}% synced
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <CheckCircle className="h-4 w-4" />
+              Sync Status
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{syncPercentage.clientsWithShadow}</div>
+            <p className="text-xs text-muted-foreground">with shadow records</p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4" />
+              Conflicts
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-destructive">{stats.conflictCount}</div>
+            <p className="text-xs text-muted-foreground">pending resolution</p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <Mail className="h-4 w-4" />
+              Last Sync
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-sm">
+              {stats.lastSync 
+                ? new Date(stats.lastSync).toLocaleString()
+                : 'Never'
+              }
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {stats.recordsProcessed} records processed
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+
+      <RateLimitStatus />
+
+      {/* Main Tabs */}
+      <Tabs defaultValue="sync" className="space-y-6">
+        <TabsList className="grid w-full grid-cols-3">
+          <TabsTrigger value="sync">Synchronisatie</TabsTrigger>
+          <TabsTrigger value="conflicts">Conflicten ({stats.conflictCount})</TabsTrigger>
+          <TabsTrigger value="diagnostic">Diagnostic</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="sync" className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Sync Controls</CardTitle>
+              <CardDescription>
+                Choose sync direction to synchronize data
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <SyncButton
+                onClick={() => handleSync('mailerlite-to-supabase')}
+                disabled={syncing || duplicates.length > 0}
+                loading={syncing}
+                {...getSyncButtonProps('mailerlite-to-supabase')}
+              />
+              <SyncButton
+                onClick={() => handleSync('supabase-to-mailerlite')}
+                disabled={syncing || duplicates.length > 0}
+                loading={syncing}
+                {...getSyncButtonProps('supabase-to-mailerlite')}
+              />
+              <SyncButton
+                onClick={() => handleSync('bidirectional')}
+                disabled={syncing || duplicates.length > 0}
+                loading={syncing}
+                {...getSyncButtonProps('bidirectional')}
+              />
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="conflicts">
+          <EnterpriseConflictResolution onStatsUpdate={(conflictStats) => {
+            refreshStats();
+          }} />
+        </TabsContent>
+
+        <TabsContent value="diagnostic">
+          <DiagnosticMissingShadows />
+        </TabsContent>
+      </Tabs>
+
+      {/* Backfill Confirmation Dialog */}
       <AlertDialog open={showBackfillDialog} onOpenChange={setShowBackfillDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Start Initial Backfill?</AlertDialogTitle>
-            <AlertDialogDescription className="space-y-2">
-              <p>This process will:</p>
-              <ul className="list-disc list-inside space-y-1 text-sm">
-                <li>Create shadow snapshots for ~{totalClients.toLocaleString()} client records</li>
-                <li>Take approximately 20-40 minutes to complete</li>
-                <li>Respect MailerLite rate limits (120 req/min with delays)</li>
-                <li>Run in the background - you can navigate away from this page</li>
-                <li>Track progress automatically (refreshes every 5 seconds)</li>
+            <AlertDialogDescription>
+              This will create shadow records and crosswalk mappings for all {stats.totalClients} clients.
+              This process may take several minutes and will:
+              <ul className="list-disc list-inside mt-2 space-y-1">
+                <li>Create sync_shadow entries for change tracking</li>
+                <li>Create integration_crosswalk mappings</li>
+                <li>Fetch data from MailerLite API</li>
               </ul>
-              <p className="font-medium mt-4">
-                ✅ Safe to navigate away - progress will continue in the background
+              <p className="mt-2 font-semibold">
+                You can pause the backfill at any time.
               </p>
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -744,228 +477,6 @@ const EnterpriseSyncDashboard: React.FC = () => {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-
-      {/* Duplicate Advisors Warning */}
-      {hasDuplicates && (
-        <Card className="border-destructive">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-destructive">
-              <AlertTriangle className="h-5 w-5" />
-              Duplicate Advisors Detected
-            </CardTitle>
-            <CardDescription>
-              Sync operations are blocked until duplicate advisors are resolved.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-2">
-              {duplicates.map((dup, idx) => (
-                <div key={idx} className="flex items-center justify-between p-3 bg-destructive/10 rounded-lg">
-                  <div>
-                    <p className="font-medium">{dup.name}</p>
-                    <p className="text-sm text-muted-foreground">Found {dup.count} times (IDs: {dup.ids})</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <p className="text-sm text-muted-foreground mt-4">
-              Please go to Advisors Management to resolve these duplicates before running sync operations.
-            </p>
-          </CardContent>
-        </Card>
-      )}
-      
-      {/* Sync Status */}
-      {syncStatus !== 'idle' && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Activity className="h-5 w-5 animate-pulse" />
-              {syncStatus === 'syncing' ? 'Synchroniseren...' : 'Sync Voltooid!'}
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <Progress value={syncProgress} className="mb-2" />
-            <p className="text-sm text-muted-foreground">
-              {Math.round(syncProgress)}% voltooid
-            </p>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Connection Check */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Verbinding</CardTitle>
-          <CardDescription>Test de edge function bereikbaarheid</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Button onClick={checkConnection} variant="outline" size="sm">
-            <Activity className="mr-2 h-4 w-4" />
-            Test Verbinding
-          </Button>
-        </CardContent>
-      </Card>
-
-      {/* Stats Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Totaal Clients</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <Users className="h-5 w-5 text-primary" />
-              <span className="text-2xl font-bold">{subscriptionStats.total.toLocaleString()}</span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">
-              {subscriptionStats.subscribed} geabonneerd, {subscriptionStats.unsubscribed} afgemeld
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Sync Status</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-2xl font-bold">
-                  {syncPercentage.percentage.toFixed(1)}%
-                </span>
-                {syncPercentage.percentage >= 95 ? (
-                  <CheckCircle className="h-5 w-5 text-green-500" />
-                ) : syncPercentage.percentage >= 80 ? (
-                  <AlertTriangle className="h-5 w-5 text-orange-500" />
-                ) : (
-                  <XCircle className="h-5 w-5 text-red-500" />
-                )}
-              </div>
-              <Progress 
-                value={syncPercentage.percentage} 
-                className="h-2"
-              />
-              <p className="text-xs text-muted-foreground">
-                {syncPercentage.matched} van {Math.max(syncPercentage.totalMailerLite, syncPercentage.totalSupabase)} records in sync
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-        
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Conflicten</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="h-5 w-5 text-warning" />
-              <span className="text-2xl font-bold">{stats.conflicts}</span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">
-              Actieve conflicten
-            </p>
-          </CardContent>
-        </Card>
-        
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Laatste Sync</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <Clock className="h-5 w-5 text-primary" />
-              <span className="text-sm">
-                {stats.lastSync 
-                  ? new Date(stats.lastSync).toLocaleDateString('nl-NL') + ' ' + new Date(stats.lastSync).toLocaleTimeString('nl-NL')
-                  : 'Nog niet gesynchroniseerd'
-                }
-              </span>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Verwerkte Records</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <Database className="h-5 w-5 text-primary" />
-              <span className="text-2xl font-bold">{stats.recordsProcessed || 0}</span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">
-              {stats.updatesApplied || 0} updates toegepast
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Rate Limit Monitoring */}
-      <RateLimitStatus />
-
-      <Tabs defaultValue="sync" className="space-y-4">
-        <TabsList>
-          <TabsTrigger value="sync">Synchronisatie</TabsTrigger>
-          <TabsTrigger value="conflicts">
-            Conflicten
-            {stats.conflicts > 0 && (
-              <Badge variant="destructive" className="ml-2">
-                {stats.conflicts}
-              </Badge>
-            )}
-          </TabsTrigger>
-          <TabsTrigger value="diagnostic">
-            Diagnostic
-          </TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="sync" className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Smart Sync</CardTitle>
-              <CardDescription>
-                Synchroniseer data tussen Supabase en MailerLite met automatische conflict detectie.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {/* Sync Controls */}
-              {(['bidirectional', 'from_mailerlite', 'to_mailerlite'] as const).map((direction) => {
-                const config = getSyncButtonProps(direction);
-                const IconComponent = config.icon;
-                
-                return (
-                  <div key={direction} className="flex items-center justify-between p-4 border rounded-lg hover:bg-accent/50 transition-colors">
-                    <div className="flex items-center gap-3">
-                      <IconComponent className="h-5 w-5 text-primary" />
-                      <div>
-                        <h3 className="font-medium">{config.label}</h3>
-                        <p className="text-sm text-muted-foreground">{config.description}</p>
-                      </div>
-                    </div>
-                    <Button
-                      variant={config.variant}
-                      onClick={() => handleSync(direction)}
-                      disabled={syncStatus === 'syncing' || hasDuplicates || backfillStatus === 'running'}
-                    >
-                      <Play className="h-4 w-4 mr-2" />
-                      Start
-                    </Button>
-                  </div>
-                );
-              })}
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="conflicts">
-          <EnterpriseConflictResolution onStatsUpdate={updateConflictStats} />
-        </TabsContent>
-
-        <TabsContent value="diagnostic">
-          <DiagnosticMissingShadows />
-        </TabsContent>
-      </Tabs>
     </div>
   );
 };
