@@ -1126,7 +1126,7 @@ async function updateCrosswalkB(email: string, b_id: string, dryRun = false) {
 
 async function flatFromA(email: string): Promise<FlatRecord | null> {
   const { data, error } = await supabase
-    .from("v_clients_for_ml")
+    .from("v_clients_for_ml_secure")
     .select("*")
     .eq("email", normalizeEmail(email))
     .maybeSingle();

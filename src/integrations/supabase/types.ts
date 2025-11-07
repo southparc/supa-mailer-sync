@@ -1142,6 +1142,36 @@ export type Database = {
         }
         Relationships: []
       }
+      v_clients_for_ml_secure: {
+        Row: {
+          city: string | null
+          country: string | null
+          email: string | null
+          first_name: string | null
+          groups: string[] | null
+          last_name: string | null
+          phone: string | null
+        }
+        Insert: {
+          city?: string | null
+          country?: string | null
+          email?: string | null
+          first_name?: string | null
+          groups?: never
+          last_name?: string | null
+          phone?: string | null
+        }
+        Update: {
+          city?: string | null
+          country?: string | null
+          email?: string | null
+          first_name?: string | null
+          groups?: never
+          last_name?: string | null
+          phone?: string | null
+        }
+        Relationships: []
+      }
     }
     Functions: {
       check_duplicate_advisors: {
