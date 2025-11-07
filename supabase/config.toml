@@ -15,9 +15,6 @@ verify_jwt = true
 [functions.backfill-sync]
 verify_jwt = true
 
-[functions.backfill-mailerlite-ids]
-verify_jwt = true
-
 [functions.backfill-subscription-status]
 verify_jwt = true
 
