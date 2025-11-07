@@ -25,6 +25,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import EnterpriseConflictResolution from './EnterpriseConflictResolution';
 import { RateLimitStatus } from './RateLimitStatus';
+import { DiagnosticMissingShadows } from './DiagnosticMissingShadows';
 
 interface SyncStats {
   conflicts: number;
@@ -914,6 +915,9 @@ const EnterpriseSyncDashboard: React.FC = () => {
               </Badge>
             )}
           </TabsTrigger>
+          <TabsTrigger value="diagnostic">
+            Diagnostic
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="sync" className="space-y-4">
@@ -956,6 +960,10 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
         <TabsContent value="conflicts">
           <EnterpriseConflictResolution onStatsUpdate={updateConflictStats} />
+        </TabsContent>
+
+        <TabsContent value="diagnostic">
+          <DiagnosticMissingShadows />
         </TabsContent>
       </Tabs>
     </div>
