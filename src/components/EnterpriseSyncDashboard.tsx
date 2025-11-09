@@ -423,11 +423,18 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
         <TabsContent value="sync" className="space-y-4">
           <Card>
-            <CardHeader>
-              <CardTitle>Sync Controls</CardTitle>
-              <CardDescription>
-                Choose sync direction to synchronize data
-              </CardDescription>
+            <CardHeader className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <CardTitle>Sync Controls</CardTitle>
+                <CardDescription>
+                  Choose sync direction to synchronize data
+                </CardDescription>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={() => setShowBackfillDialog(true)}>
+                  {backfillStatus === 'completed' ? 'Resume Backfill' : 'Start Backfill'}
+                </Button>
+              </div>
             </CardHeader>
             <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <SyncButton
