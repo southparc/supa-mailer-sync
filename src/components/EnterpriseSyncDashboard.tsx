@@ -139,11 +139,21 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   const handleBackfill = async () => {
     try {
+      // Reset the backfill status to allow continuation
+      await supabase.from('sync_state').upsert({
+        key: 'backfill_progress',
+        value: {
+          status: 'running',
+          phase: 'Resuming',
+          startedAt: new Date().toISOString()
+        }
+      });
+
       setBackfillStatus('running');
       setShowBackfillDialog(false);
       
       toast({
-        title: "Backfill Started",
+        title: backfillStatus === 'completed' ? "Backfill Resumed" : "Backfill Started",
         description: "Creating shadow records and crosswalk mappings...",
       });
 
@@ -250,14 +260,16 @@ const EnterpriseSyncDashboard: React.FC = () => {
           <AlertTriangle className="h-4 w-4" />
           <AlertDescription className="flex items-center justify-between">
             <div>
-              <strong>Initial backfill required</strong>
+              <strong>{backfillStatus === 'completed' ? 'Backfill incomplete' : 'Initial backfill required'}</strong>
               <p className="text-sm mt-1">
                 Only {syncPercentage.percentage}% of clients have shadow records ({syncPercentage.clientsWithShadow}/{syncPercentage.totalClients}).
-                Run backfill to create initial sync state.
+                {backfillStatus === 'completed' 
+                  ? ' Resume backfill to complete sync state.' 
+                  : ' Run backfill to create initial sync state.'}
               </p>
             </div>
             <Button onClick={() => setShowBackfillDialog(true)} size="sm">
-              Start Backfill
+              {backfillStatus === 'completed' ? 'Resume Backfill' : 'Start Backfill'}
             </Button>
           </AlertDescription>
         </Alert>
