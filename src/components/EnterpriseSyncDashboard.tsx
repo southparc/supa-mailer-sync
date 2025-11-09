@@ -107,13 +107,13 @@ const EnterpriseSyncDashboard: React.FC = () => {
         setBackfillProgress({
           phase: progress.phase || '',
           shadowsCreated: progress.shadowsCreated || 0,
-          totalPairs: progress.totalPairs || 0,
+          totalPairs: progress.crosswalkCreated || progress.totalPairs || 0,
           continuationCount: progress.continuationCount || 0,
           lastUpdatedAt: progress.lastUpdatedAt || '',
         });
         setBackfillStatus(
-          progress.phase === 'completed' ? 'completed' : 
-          progress.phase ? 'running' : 'idle'
+          progress.status === 'completed' || progress.phase === 'Completed' ? 'completed' : 
+          progress.status === 'running' || progress.phase ? 'running' : 'idle'
         );
       }
     } catch (error) {

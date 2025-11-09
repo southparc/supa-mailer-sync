@@ -380,14 +380,21 @@ Deno.serve(async (req) => {
       existingShadows
     })
 
-    // Decision logic
-    if (existingShadows && crosswalkPairs && existingShadows >= crosswalkPairs && crosswalkPairs > 0) {
+    // Decision logic: Backfill is complete only if shadows >= crosswalk pairs AND crosswalk pairs >= total clients
+    // This prevents false "completed" status when some phases haven't finished
+    const backfillComplete = existingShadows && crosswalkPairs && 
+                             existingShadows >= crosswalkPairs && 
+                             crosswalkPairs >= (totalClients || 0) &&
+                             crosswalkPairs > 0;
+    
+    if (backfillComplete) {
       // All shadows created - backfill is complete
       console.log('✅ Preflight: All shadows created. Marking as completed.')
       progress.status = 'completed'
       progress.phase = 'Completed'
       progress.shadowsCreated = existingShadows
       progress.crosswalkCreated = crosswalkPairs
+      progress.totalProcessed = crosswalkPairs
       progress.preflightDone = true
       await saveProgress(supabase, progress)
       

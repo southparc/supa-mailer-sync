@@ -26,21 +26,44 @@ export function useSyncOperation() {
   const testConnection = useCallback(async (): Promise<boolean> => {
     try {
       setStatus('Testing connection...');
-      const { data, error } = await supabase.functions.invoke('smart-sync', {
-        body: { mode: 'AtoB', emails: [], dryRun: true }
-      });
+      
+      // Simple connection test - just check if we can query the database
+      const { error: dbError } = await supabase
+        .from('clients')
+        .select('id', { count: 'exact', head: true })
+        .limit(1);
 
-      if (error) {
-        console.error('Connection test failed:', error);
+      if (dbError) {
+        console.error('Database connection failed:', dbError);
         toast({
           title: 'Connection Failed',
-          description: error.message || 'Unable to reach sync service',
+          description: 'Unable to connect to database',
           variant: 'destructive',
         });
         return false;
       }
 
-      setStatus('Connection successful');
+      // Test MailerLite API connectivity
+      const { error: apiError } = await supabase.functions.invoke('smart-sync', {
+        body: { mode: 'test', dryRun: true }
+      });
+
+      if (apiError) {
+        console.error('API connection test failed:', apiError);
+        toast({
+          title: 'API Connection Warning',
+          description: 'Database OK, but sync service may be unavailable',
+          variant: 'default',
+        });
+        setStatus('Database connected');
+        return true; // Still return true since DB works
+      }
+
+      setStatus('All connections successful');
+      toast({
+        title: 'Connection Test Passed',
+        description: 'Database and sync service are operational',
+      });
       return true;
     } catch (error: any) {
       console.error('Connection test error:', error);
@@ -50,6 +73,8 @@ export function useSyncOperation() {
         variant: 'destructive',
       });
       return false;
+    } finally {
+      setTimeout(() => setStatus(''), 3000);
     }
   }, [toast]);
 
