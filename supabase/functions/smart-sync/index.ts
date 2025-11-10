@@ -1,4 +1,30 @@
 // deno-lint-ignore-file no-explicit-any
+
+/**
+ * SMART-SYNC (Incremental Targeted Sync)
+ * 
+ * Purpose: Incremental synchronization for specific emails or small batches.
+ * Optimized for speed, resource efficiency, and real-time updates.
+ * 
+ * When to use:
+ * - Real-time user profile updates (1-100 emails)
+ * - Webhook-triggered syncs
+ * - Specific email corrections/repairs
+ * - Frequent small syncs throughout the day
+ * 
+ * Features:
+ * - Email-specific targeting
+ * - Incremental sync with last timestamp tracking
+ * - Resource protection (circuit breaker, concurrent sync prevention)
+ * - Token bucket rate limiting with persistent state
+ * - Daily record limits (5,000 max)
+ * - Managed group sync (only touches specific groups)
+ * 
+ * Performance: ~10 seconds for 100 emails, ~100-200ms for single email
+ * 
+ * See SYNC_FUNCTIONS.md for complete documentation.
+ */
+
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 

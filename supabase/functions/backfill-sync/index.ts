@@ -1,3 +1,27 @@
+/**
+ * BACKFILL-SYNC (Bulk Shadow Creation)
+ * 
+ * Purpose: Creates shadow snapshots for ALL crosswalk entries in bulk.
+ * This is the foundation that must run FIRST before other syncs work properly.
+ * 
+ * When to use:
+ * - First-time setup (initial shadow creation)
+ * - Recovery after data migration or corruption
+ * - Gap filling when shadow table has missing records
+ * 
+ * Features:
+ * - Bulk operations (fetches all crosswalks at once)
+ * - Batch processing (500 records at a time)
+ * - Memory efficient (streams data in batches)
+ * - Rate limited (respects MailerLite 120 req/min)
+ * - Background execution via EdgeRuntime.waitUntil()
+ * - Updates consolidated sync_status
+ * 
+ * Performance: ~3-5 minutes for 24,222 records (down from 58 minutes in old version)
+ * 
+ * See SYNC_FUNCTIONS.md for complete documentation.
+ */
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 // Declare EdgeRuntime for background tasks

@@ -230,8 +230,8 @@ export default function Dashboard() {
         {/* Main Content Tabs */}
         <Tabs defaultValue="enterprise-sync" className="space-y-6">
           <TabsList className="grid w-full grid-cols-4">
-            <TabsTrigger value="enterprise-sync">Full Sync</TabsTrigger>
-            <TabsTrigger value="smart-sync">Email Sync</TabsTrigger>
+            <TabsTrigger value="enterprise-sync">Full Sync (Bidirectional)</TabsTrigger>
+            <TabsTrigger value="smart-sync">Incremental Sync (Targeted)</TabsTrigger>
             <TabsTrigger value="advisors">Advisors</TabsTrigger>
             <TabsTrigger value="logs">Logs</TabsTrigger>
           </TabsList>

@@ -1,3 +1,29 @@
+/**
+ * ENTERPRISE-SYNC (Full Bidirectional Sync)
+ * 
+ * Purpose: Full bidirectional synchronization between Supabase and MailerLite.
+ * Processes records in batches with time-bounded execution and cursor-based pagination.
+ * 
+ * When to use:
+ * - Scheduled daily/hourly full syncs
+ * - Bulk updates (100-1000 records)
+ * - Data consistency enforcement
+ * - New subscriber imports from MailerLite
+ * 
+ * Features:
+ * - Bidirectional sync (MailerLite ↔ Supabase)
+ * - Time-bounded execution (max 120s, prevents timeouts)
+ * - Cursor-based pagination for resumability
+ * - Conflict detection and logging
+ * - Advisory locks (prevents concurrent processing)
+ * - Group membership sync
+ * - Partner data synchronization
+ * 
+ * Performance: ~2 minutes for 500 records
+ * 
+ * See SYNC_FUNCTIONS.md for complete documentation.
+ */
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 // CORS headers for browser requests
