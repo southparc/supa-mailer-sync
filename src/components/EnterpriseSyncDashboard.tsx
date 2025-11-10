@@ -38,14 +38,16 @@ interface Duplicate {
 interface BackfillProgress {
   phase: string;
   shadowsCreated: number;
-  crosswalkCreated: number;
-  totalPairs: number;
-  continuationCount: number;
+  currentBatch: number;
+  totalBatches: number;
   lastUpdatedAt: string;
-  status?: 'running' | 'completed' | 'paused' | 'failed';
+  status?: 'running' | 'completed' | 'paused' | 'failed' | 'idle';
   lastError?: string;
   pauseReason?: string;
   errors?: number;
+  startedAt?: string;
+  completedAt?: string;
+  paused?: boolean;
 }
 
 const EnterpriseSyncDashboard: React.FC = () => {
@@ -57,9 +59,8 @@ const EnterpriseSyncDashboard: React.FC = () => {
   const [backfillProgress, setBackfillProgress] = useState<BackfillProgress>({
     phase: '', 
     shadowsCreated: 0,
-    crosswalkCreated: 0,
-    totalPairs: 0,
-    continuationCount: 0,
+    currentBatch: 0,
+    totalBatches: 0,
     lastUpdatedAt: '',
     errors: 0
   });
@@ -70,7 +71,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
     checkDuplicates();
     loadBackfillProgress();
     
-    // Set up real-time subscription to sync_state
+    // Set up real-time subscription to sync_status (consolidated state from Phase 1)
     const channel = supabase
       .channel('sync_state_updates')
       .on(
@@ -79,9 +80,10 @@ const EnterpriseSyncDashboard: React.FC = () => {
           event: '*',
           schema: 'public',
           table: 'sync_state',
-          filter: 'key=in.(backfill_progress,full_sync_state,backfill_paused)'
+          filter: 'key=eq.sync_status'
         },
         () => {
+          console.log('📡 Sync status updated via realtime');
           refreshStats();
           loadBackfillProgress();
         }
@@ -105,43 +107,58 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   const loadBackfillProgress = async () => {
     try {
-      const { data } = await supabase
+      // Read from consolidated sync_status (Phase 1 structure)
+      const { data, error } = await supabase
         .from('sync_state')
-        .select('key, value')
-        .in('key', ['backfill_progress', 'backfill_paused']);
+        .select('value')
+        .eq('key', 'sync_status')
+        .maybeSingle();
 
-      const progressData = data?.find(d => d.key === 'backfill_progress')?.value as any;
-      const pausedData = data?.find(d => d.key === 'backfill_paused')?.value as any;
-      const isPaused = pausedData?.paused === true;
+      if (error) {
+        console.error('Error loading sync status:', error);
+        return;
+      }
 
-      if (progressData) {
-        const progress = progressData;
+      if (data?.value) {
+        const syncStatus = data.value as any;
+        const backfillData = syncStatus.backfill || {};
+
         setBackfillProgress({
-          phase: progress.phase || '',
-          shadowsCreated: progress.shadowsCreated || 0,
-          crosswalkCreated: progress.crosswalkCreated || 0,
-          totalPairs: progress.crosswalkCreated || progress.totalPairs || 0,
-          continuationCount: progress.continuationCount || 0,
-          lastUpdatedAt: progress.lastUpdatedAt || '',
-          status: progress.status,
-          lastError: progress.lastError,
-          pauseReason: progress.pauseReason,
-          errors: progress.errors || 0,
+          phase: backfillData.phase || '',
+          shadowsCreated: backfillData.shadowsCreated || 0,
+          currentBatch: backfillData.currentBatch || 0,
+          totalBatches: backfillData.totalBatches || 0,
+          lastUpdatedAt: backfillData.lastUpdatedAt || '',
+          status: backfillData.status,
+          lastError: backfillData.pauseReason, // pauseReason doubles as error message
+          pauseReason: backfillData.pauseReason,
+          errors: backfillData.errors || 0,
+          startedAt: backfillData.startedAt,
+          completedAt: backfillData.completedAt,
+          paused: backfillData.paused || false,
         });
-        
-        // Derive status with correct precedence
+
+        // Determine status with freshness check
+        const isFresh = backfillData.lastUpdatedAt && 
+          (Date.now() - new Date(backfillData.lastUpdatedAt).getTime() < 90000);
+
         let derivedStatus: 'idle' | 'running' | 'paused' | 'completed' | 'failed' = 'idle';
-        
-        if (isPaused) {
+
+        if (backfillData.paused === true) {
           derivedStatus = 'paused';
-        } else if (progress.status && ['running', 'paused', 'completed', 'failed'].includes(progress.status)) {
-          derivedStatus = progress.status;
-        } else if (progress.phase === 'Completed') {
+        } else if (backfillData.status === 'completed' || backfillData.phase === 'Completed') {
           derivedStatus = 'completed';
-        } else if (progress.phase) {
+        } else if (backfillData.status === 'failed') {
+          derivedStatus = 'failed';
+        } else if (backfillData.status === 'running' && isFresh) {
+          derivedStatus = 'running';
+        } else if (backfillData.status === 'running' && !isFresh) {
+          // Stale running state
+          derivedStatus = 'paused'; // Treat as paused for UI purposes
+        } else if (backfillData.phase) {
           derivedStatus = 'running';
         }
-        
+
         setBackfillStatus(derivedStatus);
       } else {
         setBackfillStatus('idle');
@@ -169,22 +186,12 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   const handleBackfill = async () => {
     try {
-      // Reset the backfill status to allow continuation
-      await supabase.from('sync_state').upsert({
-        key: 'backfill_progress',
-        value: {
-          status: 'running',
-          phase: 'Resuming',
-          startedAt: new Date().toISOString()
-        }
-      });
-
       setBackfillStatus('running');
       setShowBackfillDialog(false);
       
       toast({
         title: backfillStatus === 'completed' ? "Backfill Resumed" : "Backfill Started",
-        description: "Creating shadow records and crosswalk mappings...",
+        description: "Creating shadow records in bulk...",
       });
 
       const { data, error } = await supabase.functions.invoke('backfill-sync', {
@@ -193,16 +200,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
       if (error) throw error;
 
-      const result = data?.result || {};
-      
       toast({
-        title: "Backfill Completed",
-        description: `Created ${result.shadowsCreated || 0} shadows and ${result.crosswalksCreated || 0} crosswalks`,
+        title: "Backfill Started",
+        description: "Bulk shadow creation running in background. Check progress above.",
       });
 
-      setBackfillStatus('completed');
+      // Refresh immediately to show updated status
+      await loadBackfillProgress();
       refreshStats();
-      loadBackfillProgress();
     } catch (error: any) {
       console.error('Backfill error:', error);
       toast({
@@ -216,33 +221,38 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   const handlePauseBackfill = async () => {
     try {
-      // Update both backfill_paused and backfill_progress
-      const { error: pausedError } = await supabase
+      // Get current sync_status
+      const { data: currentData } = await supabase
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'sync_status')
+        .maybeSingle();
+
+      const syncStatus = currentData?.value as any || { backfill: {}, fullSync: {}, lastSync: {}, statistics: {} };
+
+      // Update consolidated sync_status
+      const { error } = await supabase
         .from('sync_state')
         .upsert({
-          key: 'backfill_paused',
-          value: { paused: true, timestamp: new Date().toISOString() }
-        });
-
-      if (pausedError) throw pausedError;
-
-      const { error: progressError } = await supabase
-        .from('sync_state')
-        .upsert({
-          key: 'backfill_progress',
+          key: 'sync_status',
           value: {
-            ...backfillProgress,
-            status: 'paused',
-            pauseReason: 'User paused',
-            lastUpdatedAt: new Date().toISOString()
-          }
-        });
+            ...syncStatus,
+            backfill: {
+              ...syncStatus.backfill,
+              status: 'paused',
+              paused: true,
+              pauseReason: 'User paused',
+              lastUpdatedAt: new Date().toISOString()
+            }
+          },
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'key' });
 
-      if (progressError) throw progressError;
+      if (error) throw error;
 
       toast({
         title: "Backfill Paused",
-        description: "The backfill process will stop after the current batch completes.",
+        description: "The backfill process will stop gracefully.",
       });
 
       await loadBackfillProgress();
@@ -259,30 +269,37 @@ const EnterpriseSyncDashboard: React.FC = () => {
   const handleForceResume = async () => {
     setResuming(true);
     try {
-      // Reset backfill state to running
+      // Get current sync_status
+      const { data: currentData } = await supabase
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'sync_status')
+        .maybeSingle();
+
+      const syncStatus = currentData?.value as any || { backfill: {}, fullSync: {}, lastSync: {}, statistics: {} };
+
+      // Update consolidated sync_status to resume
       const { error: updateError } = await supabase
         .from('sync_state')
         .upsert({
-          key: 'backfill_progress',
+          key: 'sync_status',
           value: {
-            ...backfillProgress,
-            status: 'running',
-            phase: backfillProgress?.phase === 'Completed' ? 'Phase 3: Creating shadow snapshots' : backfillProgress?.phase,
-            continuationCount: 0,
-            lastUpdatedAt: new Date().toISOString(),
-            pauseReason: undefined,
-            lastError: undefined
+            ...syncStatus,
+            backfill: {
+              ...syncStatus.backfill,
+              status: 'running',
+              phase: syncStatus.backfill?.phase === 'Completed' 
+                ? 'Bulk processing crosswalks' 
+                : syncStatus.backfill?.phase || 'Initializing bulk backfill',
+              paused: false,
+              pauseReason: undefined,
+              lastUpdatedAt: new Date().toISOString()
+            }
           },
           updated_at: new Date().toISOString()
         }, { onConflict: 'key' });
 
       if (updateError) throw updateError;
-
-      // Clear pause flag if exists
-      await supabase
-        .from('sync_state')
-        .delete()
-        .eq('key', 'backfill_paused');
 
       setBackfillStatus('running');
       
@@ -295,7 +312,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
       
       toast({
         title: "Backfill Resumed",
-        description: "Backfill process has been force-resumed and is running",
+        description: "Bulk backfill process has been force-resumed",
       });
 
       await loadBackfillProgress();
@@ -410,6 +427,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
                     {backfillProgress.shadowsCreated} / {stats.totalClients} shadows
                   </p>
                 </div>
+                {backfillProgress.totalBatches > 0 && (
+                  <div>
+                    <p className="text-muted-foreground">Batch</p>
+                    <p className="font-medium">
+                      {backfillProgress.currentBatch} / {backfillProgress.totalBatches}
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           </CardContent>
@@ -433,21 +458,25 @@ const EnterpriseSyncDashboard: React.FC = () => {
                 <span className="ml-2 font-medium">{backfillProgress.phase}</span>
               </div>
               <div>
-                <span className="text-muted-foreground">Crosswalk:</span>
-                <span className="ml-2 font-medium">{backfillProgress.crosswalkCreated}</span>
+                <span className="text-muted-foreground">Batch:</span>
+                <span className="ml-2 font-medium">
+                  {backfillProgress.currentBatch}/{backfillProgress.totalBatches}
+                </span>
               </div>
               <div>
                 <span className="text-muted-foreground">Shadows:</span>
                 <span className="ml-2 font-medium">{backfillProgress.shadowsCreated}</span>
               </div>
               <div>
-                <span className="text-muted-foreground">Iterations:</span>
-                <span className="ml-2 font-medium">{backfillProgress.continuationCount || 0}</span>
-              </div>
-              <div>
                 <span className="text-muted-foreground">Errors:</span>
                 <span className="ml-2 font-medium">{backfillProgress.errors || 0}</span>
               </div>
+              {backfillProgress.paused && (
+                <div>
+                  <span className="text-muted-foreground">Paused:</span>
+                  <span className="ml-2 font-medium text-yellow-600">Yes</span>
+                </div>
+              )}
             </div>
             {backfillProgress.lastUpdatedAt && (
               <div className="pt-2 border-t">

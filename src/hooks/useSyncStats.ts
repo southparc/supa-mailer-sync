@@ -46,13 +46,13 @@ export function useSyncStats() {
         shadowsResult,
         crosswalksResult,
         conflictsResult,
-        syncStateResult
+        syncStatusResult
       ] = await Promise.all([
         supabase.from('clients').select('id', { count: 'exact', head: true }),
         supabase.from('sync_shadow').select('id', { count: 'exact', head: true }),
         supabase.from('integration_crosswalk').select('id', { count: 'exact', head: true }),
         supabase.from('sync_conflicts').select('id', { count: 'exact', head: true }).eq('status', 'pending'),
-        supabase.from('sync_state').select('value').eq('key', 'full_sync_state').maybeSingle(),
+        supabase.from('sync_state').select('value').eq('key', 'sync_status').maybeSingle(),
       ]);
 
       const totalClients = clientsResult.count || 0;
@@ -60,16 +60,17 @@ export function useSyncStats() {
       const crosswalkCount = crosswalksResult.count || 0;
       const conflictCount = conflictsResult.count || 0;
 
-      const syncState = syncStateResult.data?.value as any;
+      // Read from consolidated sync_status (Phase 1 structure)
+      const syncStatus = syncStatusResult.data?.value as any;
       
       setStats({
         totalClients,
         shadowCount,
         crosswalkCount,
         conflictCount,
-        lastSync: syncState?.lastCompletedAt || null,
-        recordsProcessed: syncState?.totalProcessed || 0,
-        updatesApplied: syncState?.totalUpdated || 0,
+        lastSync: syncStatus?.fullSync?.lastCompletedAt || syncStatus?.lastSync?.timestamp || null,
+        recordsProcessed: syncStatus?.fullSync?.totalProcessed || syncStatus?.statistics?.recordsProcessed || 0,
+        updatesApplied: syncStatus?.fullSync?.totalUpdated || syncStatus?.statistics?.updatesApplied || 0,
       });
 
       setSyncPercentage({
