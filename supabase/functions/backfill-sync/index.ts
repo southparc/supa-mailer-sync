@@ -588,7 +588,12 @@ Deno.serve(async (req) => {
     
     // Save error to progress for diagnostics
     try {
-      const { data: currentProgress } = await supabase
+      const errorSupabase = createClient(
+        Deno.env.get('SUPABASE_URL') ?? '',
+        Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+      )
+      
+      const { data: currentProgress } = await errorSupabase
         .from('sync_state')
         .select('value')
         .eq('key', 'backfill_progress')
@@ -598,7 +603,7 @@ Deno.serve(async (req) => {
         const progress = currentProgress.value as BackfillProgress
         progress.lastError = errorMessage
         progress.status = 'failed'
-        await saveProgress(supabase, progress)
+        await saveProgress(errorSupabase, progress)
       }
     } catch (saveErr) {
       console.error('Failed to save error state:', saveErr)
@@ -758,92 +763,166 @@ async function buildSubscriberCrosswalkChunk(supabase: any, apiKey: string, curs
 async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: number, limit: number): Promise<{shadowsCreated: number, errors: number, recordsProcessed: number, hasMore: boolean}> {
   let shadowsCreated = 0
   let errors = 0
+  let skipped = 0
 
   try {
-    const { data: crosswalks, error } = await supabase
-      .from('integration_crosswalk')
-      .select('email, a_id, b_id')
-      .not('a_id', 'is', null)
-      .not('b_id', 'is', null)
-      .order('email') // Deterministic ordering for stable RANGE + OFFSET
-      .range(offset, offset + limit - 1)
+    console.log(`🔍 Phase 3: Querying crosswalks without shadows from offset ${offset}`)
+    
+    // Query to find crosswalks that DON'T have shadows yet
+    // Using NOT EXISTS subquery to efficiently find missing shadows
+    const { data: crosswalks, error } = await supabase.rpc('get_crosswalks_without_shadows', {
+      p_offset: offset,
+      p_limit: limit
+    })
 
-    if (error) throw error
-    if (!crosswalks || crosswalks.length === 0) {
-      console.log(`✅ Phase 3 complete - no more crosswalks at offset ${offset}`)
-      return { shadowsCreated, errors, recordsProcessed: 0, hasMore: false }
-    }
+    if (error) {
+      console.error('❌ RPC error, falling back to manual query:', error)
+      
+      // Fallback: fetch crosswalks and filter manually
+      const { data: allCrosswalks, error: fetchError } = await supabase
+        .from('integration_crosswalk')
+        .select('email, a_id, b_id')
+        .not('a_id', 'is', null)
+        .not('b_id', 'is', null)
+        .order('email')
+        .range(offset, offset + limit - 1)
 
-    console.log(`📦 Creating shadow batch: ${offset + 1}-${offset + crosswalks.length}`)
+      if (fetchError) throw fetchError
+      
+      if (!allCrosswalks || allCrosswalks.length === 0) {
+        console.log(`✅ Phase 3 complete - no more crosswalks at offset ${offset}`)
+        return { shadowsCreated, errors, recordsProcessed: 0, hasMore: false }
+      }
 
-    for (const crosswalk of crosswalks) {
-      try {
-        const email = crosswalk.email
-
+      console.log(`📦 Fetched ${allCrosswalks.length} crosswalks, filtering for missing shadows...`)
+      
+      // Filter out ones that already have shadows
+      const crosswalksWithoutShadows = []
+      for (const cw of allCrosswalks) {
         const { data: existingShadow } = await supabase
           .from('sync_shadow')
           .select('id')
-          .eq('email', email)
+          .eq('email', cw.email)
           .maybeSingle()
-
-        if (existingShadow) continue
-
-        const { data: client } = await supabase
-          .from('clients')
-          .select('first_name, last_name, phone, city, country')
-          .eq('id', crosswalk.a_id)
-          .maybeSingle()
-
-        await rateLimiter.acquire()
-        const subscriber = await getMailerLiteSubscriber(apiKey, crosswalk.b_id)
-
-        if (!client || !subscriber) {
-          console.warn(`Missing data for shadow creation: ${email}`)
-          continue
-        }
-
-        const snapshot = {
-          aData: {
-            first_name: client.first_name,
-            last_name: client.last_name,
-            phone: client.phone,
-            city: client.city,
-            country: client.country,
-          },
-          bData: {
-            first_name: subscriber.fields?.name || '',
-            last_name: subscriber.fields?.last_name || '',
-            phone: subscriber.fields?.phone || '',
-            city: subscriber.fields?.city || '',
-            country: subscriber.fields?.country || '',
-          }
-        }
-
-        const { error: insertError } = await supabase
-          .from('sync_shadow')
-          .insert({
-            email,
-            snapshot
-          })
-
-        if (insertError) {
-          console.error(`Error creating shadow for ${email}:`, insertError)
-          errors++
+        
+        if (!existingShadow) {
+          crosswalksWithoutShadows.push(cw)
         } else {
-          shadowsCreated++
+          skipped++
         }
-      } catch (error) {
-        console.error(`Error processing crosswalk ${crosswalk.email}:`, error)
-        errors++
+      }
+      
+      console.log(`🎯 Found ${crosswalksWithoutShadows.length} crosswalks without shadows (skipped ${skipped} with existing shadows)`)
+      
+      if (crosswalksWithoutShadows.length === 0) {
+        console.log(`⚠️ All ${allCrosswalks.length} records at offset ${offset} already have shadows. Advancing offset...`)
+        return { shadowsCreated, errors, recordsProcessed: allCrosswalks.length, hasMore: true }
+      }
+
+      await processCrosswalksForShadows(supabase, apiKey, crosswalksWithoutShadows, offset)
+      
+      return { 
+        shadowsCreated: crosswalksWithoutShadows.length, 
+        errors, 
+        recordsProcessed: allCrosswalks.length, 
+        hasMore: allCrosswalks.length === limit 
       }
     }
 
+    if (!crosswalks || crosswalks.length === 0) {
+      console.log(`✅ Phase 3 complete - no more crosswalks without shadows`)
+      return { shadowsCreated, errors, recordsProcessed: 0, hasMore: false }
+    }
+
+    console.log(`📦 Processing ${crosswalks.length} crosswalks without shadows (offset: ${offset})`)
+
+    await processCrosswalksForShadows(supabase, apiKey, crosswalks, offset)
+
     console.log(`✅ Shadow batch complete: ${shadowsCreated} shadows created, ${errors} errors, ${crosswalks.length} records processed`)
-    return { shadowsCreated, errors, recordsProcessed: crosswalks.length, hasMore: crosswalks.length === limit }
+    return { shadowsCreated: crosswalks.length, errors, recordsProcessed: crosswalks.length, hasMore: crosswalks.length === limit }
   } catch (error) {
-    console.error('Error in shadow creation chunk:', error)
+    console.error('❌ Error in shadow creation chunk:', error)
     return { shadowsCreated, errors: errors + 1, recordsProcessed: 0, hasMore: false }
   }
+}
+
+async function processCrosswalksForShadows(supabase: any, apiKey: string, crosswalks: any[], offset: number): Promise<void> {
+  let created = 0
+  let errors = 0
+  
+  for (const crosswalk of crosswalks) {
+    try {
+      const email = crosswalk.email
+      
+      console.log(`  📝 Creating shadow for: ${email} (a_id: ${crosswalk.a_id}, b_id: ${crosswalk.b_id})`)
+
+      const { data: client, error: clientError } = await supabase
+        .from('clients')
+        .select('first_name, last_name, phone, city, country')
+        .eq('id', crosswalk.a_id)
+        .maybeSingle()
+
+      if (clientError) {
+        console.error(`    ❌ Error fetching client for ${email}:`, clientError)
+        errors++
+        continue
+      }
+
+      if (!client) {
+        console.warn(`    ⚠️ No client found for ${email} (a_id: ${crosswalk.a_id})`)
+        errors++
+        continue
+      }
+
+      await rateLimiter.acquire()
+      const subscriber = await getMailerLiteSubscriber(apiKey, crosswalk.b_id)
+
+      if (!subscriber) {
+        console.warn(`    ⚠️ No MailerLite subscriber found for ${email} (b_id: ${crosswalk.b_id})`)
+        errors++
+        continue
+      }
+
+      const snapshot = {
+        aData: {
+          first_name: client.first_name || '',
+          last_name: client.last_name || '',
+          phone: client.phone || '',
+          city: client.city || '',
+          country: client.country || '',
+        },
+        bData: {
+          first_name: subscriber.fields?.name || '',
+          last_name: subscriber.fields?.last_name || '',
+          phone: subscriber.fields?.phone || '',
+          city: subscriber.fields?.city || '',
+          country: subscriber.fields?.country || '',
+        }
+      }
+
+      console.log(`    💾 Inserting shadow with snapshot:`, JSON.stringify(snapshot).substring(0, 100))
+
+      const { error: insertError } = await supabase
+        .from('sync_shadow')
+        .insert({
+          email,
+          snapshot
+        })
+
+      if (insertError) {
+        console.error(`    ❌ Error inserting shadow for ${email}:`, insertError)
+        errors++
+      } else {
+        created++
+        console.log(`    ✅ Shadow created for ${email}`)
+      }
+    } catch (error) {
+      console.error(`    ❌ Error processing crosswalk ${crosswalk.email}:`, error)
+      errors++
+    }
+  }
+  
+  console.log(`📊 Batch summary: ${created} created, ${errors} errors out of ${crosswalks.length} records`)
 }
 
 async function findMailerLiteSubscriber(apiKey: string, email: string): Promise<any | null> {
