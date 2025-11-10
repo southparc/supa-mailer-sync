@@ -52,8 +52,9 @@ const EnterpriseSyncDashboard: React.FC = () => {
   const { stats, syncPercentage, loading: statsLoading, refresh: refreshStats } = useSyncStats();
   const { syncing, progress, status, testConnection, runSync, stopSync } = useSyncOperation();
   const [duplicates, setDuplicates] = useState<Duplicate[]>([]);
-  const [backfillStatus, setBackfillStatus] = useState<'idle' | 'running' | 'completed'>('idle');
-  const [backfillProgress, setBackfillProgress] = useState<BackfillProgress>({ 
+  const [backfillStatus, setBackfillStatus] = useState<'idle' | 'running' | 'paused' | 'completed' | 'failed'>('idle');
+  const [resuming, setResuming] = useState(false);
+  const [backfillProgress, setBackfillProgress] = useState<BackfillProgress>({
     phase: '', 
     shadowsCreated: 0,
     crosswalkCreated: 0,
@@ -78,7 +79,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
           event: '*',
           schema: 'public',
           table: 'sync_state',
-          filter: 'key=in.(backfill_progress,full_sync_state)'
+          filter: 'key=in.(backfill_progress,full_sync_state,backfill_paused)'
         },
         () => {
           refreshStats();
@@ -106,12 +107,15 @@ const EnterpriseSyncDashboard: React.FC = () => {
     try {
       const { data } = await supabase
         .from('sync_state')
-        .select('value')
-        .eq('key', 'backfill_progress')
-        .maybeSingle();
+        .select('key, value')
+        .in('key', ['backfill_progress', 'backfill_paused']);
 
-      if (data?.value) {
-        const progress = data.value as any;
+      const progressData = data?.find(d => d.key === 'backfill_progress')?.value as any;
+      const pausedData = data?.find(d => d.key === 'backfill_paused')?.value as any;
+      const isPaused = pausedData?.paused === true;
+
+      if (progressData) {
+        const progress = progressData;
         setBackfillProgress({
           phase: progress.phase || '',
           shadowsCreated: progress.shadowsCreated || 0,
@@ -124,10 +128,23 @@ const EnterpriseSyncDashboard: React.FC = () => {
           pauseReason: progress.pauseReason,
           errors: progress.errors || 0,
         });
-        setBackfillStatus(
-          progress.status === 'completed' || progress.phase === 'Completed' ? 'completed' : 
-          progress.status === 'running' || progress.phase ? 'running' : 'idle'
-        );
+        
+        // Derive status with correct precedence
+        let derivedStatus: 'idle' | 'running' | 'paused' | 'completed' | 'failed' = 'idle';
+        
+        if (isPaused) {
+          derivedStatus = 'paused';
+        } else if (progress.status && ['running', 'paused', 'completed', 'failed'].includes(progress.status)) {
+          derivedStatus = progress.status;
+        } else if (progress.phase === 'Completed') {
+          derivedStatus = 'completed';
+        } else if (progress.phase) {
+          derivedStatus = 'running';
+        }
+        
+        setBackfillStatus(derivedStatus);
+      } else {
+        setBackfillStatus('idle');
       }
     } catch (error) {
       console.error('Error loading backfill progress:', error);
@@ -199,26 +216,48 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   const handlePauseBackfill = async () => {
     try {
-      await supabase.from('sync_state').upsert({
-        key: 'backfill_paused',
-        value: { paused: true, pausedAt: new Date().toISOString() }
-      });
-      
+      // Update both backfill_paused and backfill_progress
+      const { error: pausedError } = await supabase
+        .from('sync_state')
+        .upsert({
+          key: 'backfill_paused',
+          value: { paused: true, timestamp: new Date().toISOString() }
+        });
+
+      if (pausedError) throw pausedError;
+
+      const { error: progressError } = await supabase
+        .from('sync_state')
+        .upsert({
+          key: 'backfill_progress',
+          value: {
+            ...backfillProgress,
+            status: 'paused',
+            pauseReason: 'User paused',
+            lastUpdatedAt: new Date().toISOString()
+          }
+        });
+
+      if (progressError) throw progressError;
+
       toast({
         title: "Backfill Paused",
-        description: "The backfill will stop after the current batch.",
+        description: "The backfill process will stop after the current batch completes.",
       });
+
+      await loadBackfillProgress();
     } catch (error: any) {
       console.error('Error pausing backfill:', error);
       toast({
-        title: "Error",
-        description: "Failed to pause backfill",
+        title: "Failed to Pause",
+        description: error.message,
         variant: "destructive",
       });
     }
   };
 
   const handleForceResume = async () => {
+    setResuming(true);
     try {
       // Reset backfill state to running
       const { error: updateError } = await supabase
@@ -267,6 +306,8 @@ const EnterpriseSyncDashboard: React.FC = () => {
         description: error instanceof Error ? error.message : "Failed to resume backfill",
         variant: "destructive",
       });
+    } finally {
+      setResuming(false);
     }
   };
 
@@ -551,17 +592,44 @@ const EnterpriseSyncDashboard: React.FC = () => {
                 </CardDescription>
               </div>
               <div className="flex items-center gap-2">
-                <Button size="sm" onClick={() => setShowBackfillDialog(true)}>
-                  {backfillStatus === 'completed' ? 'Resume Backfill' : 'Start Backfill'}
-                </Button>
-                <Button 
-                  size="sm" 
-                  variant="outline"
-                  onClick={handleForceResume}
-                  disabled={backfillStatus === 'running'}
-                >
-                  Force Resume
-                </Button>
+                {(() => {
+                  const isFresh = backfillProgress.lastUpdatedAt && 
+                    (Date.now() - new Date(backfillProgress.lastUpdatedAt).getTime() < 90000);
+                  const isActuallyRunning = backfillStatus === 'running' && isFresh;
+                  
+                  return (
+                    <>
+                      <Button 
+                        size="sm" 
+                        onClick={() => setShowBackfillDialog(true)}
+                        disabled={isActuallyRunning}
+                      >
+                        {backfillStatus === 'completed' ? 'Resume Backfill' : 'Start Backfill'}
+                      </Button>
+                      {isActuallyRunning && !resuming && (
+                        <Button 
+                          size="sm"
+                          variant="outline"
+                          onClick={handlePauseBackfill}
+                        >
+                          <Pause className="h-4 w-4 mr-2" />
+                          Pause
+                        </Button>
+                      )}
+                      {(backfillStatus === 'running' || backfillStatus === 'paused') && (
+                        <Button 
+                          size="sm" 
+                          variant="outline"
+                          onClick={handleForceResume}
+                          disabled={isActuallyRunning || resuming}
+                        >
+                          <Play className="h-4 w-4 mr-2" />
+                          {resuming ? 'Resuming...' : 'Force Resume'}
+                        </Button>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
             </CardHeader>
             <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4">
