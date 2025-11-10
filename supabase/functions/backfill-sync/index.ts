@@ -134,12 +134,14 @@ interface BackfillProgress {
   errors: number
   startedAt: string
   lastUpdatedAt: string
-  status: 'running' | 'completed' | 'failed'
+  status: 'running' | 'completed' | 'paused' | 'failed'
   clientOffset: number
   subscriberCursor: string | null
   shadowOffset: number
   continuationCount?: number // Track auto-continuation iterations
   preflightDone?: boolean // Track if preflight logic has already run
+  lastError?: string // Track last error for diagnostics
+  pauseReason?: string // Reason for pause
 }
 
 // Helper to save progress
@@ -228,7 +230,9 @@ async function processBackfillChunk(supabase: any, mailerLiteApiKey: string, pro
     
   } catch (error) {
     console.error('Chunk processing error:', error)
+    const errorMsg = error instanceof Error ? error.message : String(error)
     progress.errors += 1
+    progress.lastError = errorMsg
     progress.lastUpdatedAt = new Date().toISOString()
     await saveProgress(supabase, progress)
     throw error
@@ -380,16 +384,41 @@ Deno.serve(async (req) => {
       existingShadows
     })
 
-    // Decision logic: Backfill is complete only if shadows >= crosswalk pairs AND crosswalk pairs >= total clients
-    // This prevents false "completed" status when some phases haven't finished
+    // Decision logic: Backfill is complete ONLY if:
+    // 1. crosswalk pairs >= total clients (all clients mapped)
+    // 2. shadows >= crosswalk pairs (all crosswalks have shadows)
+    // 3. No crosswalk entries without shadows
+    const { count: crosswalkWithoutShadow } = await supabase
+      .from('integration_crosswalk')
+      .select('*', { count: 'exact', head: true })
+      .not('a_id', 'is', null)
+      .not('b_id', 'is', null)
+      .filter('email', 'not.in', 
+        `(select email from sync_shadow)`
+      )
+    
+    console.log('🔍 Crosswalk entries without shadows:', crosswalkWithoutShadow || 0)
+    
     const backfillComplete = existingShadows && crosswalkPairs && 
                              existingShadows >= crosswalkPairs && 
                              crosswalkPairs >= (totalClients || 0) &&
-                             crosswalkPairs > 0;
+                             crosswalkPairs > 0 &&
+                             (crosswalkWithoutShadow || 0) === 0;
+    
+    // Auto-correct inconsistency: If marked completed but work remains, reset to running
+    if (progress.status === 'completed' && !backfillComplete) {
+      console.warn('⚠️ Detected inconsistency: status=completed but work remains. Auto-resetting to running.')
+      console.log(`📊 State: shadows=${existingShadows}, crosswalk=${crosswalkPairs}, clients=${totalClients}, without_shadow=${crosswalkWithoutShadow}`)
+      progress.status = 'running'
+      progress.phase = 'Phase 3: Creating shadow snapshots'
+      progress.shadowOffset = Math.max(progress.shadowOffset || 0, existingShadows || 0)
+      await saveProgress(supabase, progress)
+    }
     
     if (backfillComplete) {
       // All shadows created - backfill is complete
       console.log('✅ Preflight: All shadows created. Marking as completed.')
+      console.log(`📊 Final counts: shadows=${existingShadows}, crosswalk=${crosswalkPairs}, clients=${totalClients}`)
       progress.status = 'completed'
       progress.phase = 'Completed'
       progress.shadowsCreated = existingShadows
@@ -426,6 +455,31 @@ Deno.serve(async (req) => {
       console.log(`📍 Preflight: ${progress.preflightDone ? 'Already initialized, continuing' : 'Resuming'} from ${progress.phase}`)
     }
 
+    // Check for pause flag
+    const { data: pauseState } = await supabase
+      .from('sync_state')
+      .select('value')
+      .eq('key', 'backfill_paused')
+      .maybeSingle()
+    
+    if (pauseState?.value?.paused === true) {
+      console.log('⏸️ Backfill is paused. Stopping auto-continue.')
+      progress.status = 'paused'
+      progress.pauseReason = pauseState.value.reason || 'Manually paused'
+      await saveProgress(supabase, progress)
+      return new Response(
+        JSON.stringify({ 
+          message: 'Backfill is paused',
+          progress,
+          continueBackfill: false
+        }),
+        {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 200
+        }
+      )
+    }
+    
     // Safety check: max continuation limit (dynamic based on remaining work)
     const RECORDS_PER_CHUNK = 100
     const remainingShadows = (crosswalkPairs || 0) - (existingShadows || 0)
@@ -433,13 +487,16 @@ Deno.serve(async (req) => {
     const MAX_CONTINUATIONS = Math.min(5000, Math.max(200, requiredContinuations))
     const currentCount = progress.continuationCount || 0
     
-    console.log(`📊 Continuation limits: ${currentCount}/${MAX_CONTINUATIONS} (estimated ${requiredContinuations} needed for ${remainingShadows} shadows)`)
+    console.log(`📊 Continuation: ${currentCount}/${MAX_CONTINUATIONS} | Remaining: ${remainingShadows} shadows | Phase: ${progress.phase}`)
     
     if (autoContinue && currentCount >= MAX_CONTINUATIONS) {
-      console.warn(`⚠️ Max continuation limit reached (${MAX_CONTINUATIONS}). Stopping auto-continue.`)
+      console.warn(`⚠️ Max continuation limit reached (${MAX_CONTINUATIONS}). Pausing for safety.`)
+      progress.status = 'paused'
+      progress.pauseReason = `Continuation cap reached (${MAX_CONTINUATIONS})`
+      await saveProgress(supabase, progress)
       return new Response(
         JSON.stringify({ 
-          message: `Safety limit reached. Processed ${currentCount} iterations. Click "Start Backfill" to continue manually.`,
+          message: `Safety limit reached. Processed ${currentCount} iterations. Use "Force Resume" to continue.`,
           progress,
           continueBackfill: false
         }),
@@ -526,8 +583,27 @@ Deno.serve(async (req) => {
     }
 
   } catch (error) {
-    console.error('Backfill initialization error:', error)
+    console.error('❌ Backfill initialization error:', error)
     const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+    
+    // Save error to progress for diagnostics
+    try {
+      const { data: currentProgress } = await supabase
+        .from('sync_state')
+        .select('value')
+        .eq('key', 'backfill_progress')
+        .maybeSingle();
+      
+      if (currentProgress?.value) {
+        const progress = currentProgress.value as BackfillProgress
+        progress.lastError = errorMessage
+        progress.status = 'failed'
+        await saveProgress(supabase, progress)
+      }
+    } catch (saveErr) {
+      console.error('Failed to save error state:', saveErr)
+    }
+    
     return new Response(
       JSON.stringify({ error: errorMessage }),
       {

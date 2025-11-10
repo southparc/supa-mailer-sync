@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Progress } from "@/components/ui/progress";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { 
   ArrowLeftRight, 
@@ -13,6 +13,7 @@ import {
   Play, 
   Pause, 
   AlertTriangle,
+  AlertCircle,
   Database,
   Mail,
   Activity,
@@ -37,9 +38,14 @@ interface Duplicate {
 interface BackfillProgress {
   phase: string;
   shadowsCreated: number;
+  crosswalkCreated: number;
   totalPairs: number;
   continuationCount: number;
   lastUpdatedAt: string;
+  status?: 'running' | 'completed' | 'paused' | 'failed';
+  lastError?: string;
+  pauseReason?: string;
+  errors?: number;
 }
 
 const EnterpriseSyncDashboard: React.FC = () => {
@@ -49,10 +55,12 @@ const EnterpriseSyncDashboard: React.FC = () => {
   const [backfillStatus, setBackfillStatus] = useState<'idle' | 'running' | 'completed'>('idle');
   const [backfillProgress, setBackfillProgress] = useState<BackfillProgress>({ 
     phase: '', 
-    shadowsCreated: 0, 
+    shadowsCreated: 0,
+    crosswalkCreated: 0,
     totalPairs: 0,
     continuationCount: 0,
-    lastUpdatedAt: ''
+    lastUpdatedAt: '',
+    errors: 0
   });
   const [showBackfillDialog, setShowBackfillDialog] = useState(false);
   const { toast } = useToast();
@@ -107,9 +115,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
         setBackfillProgress({
           phase: progress.phase || '',
           shadowsCreated: progress.shadowsCreated || 0,
+          crosswalkCreated: progress.crosswalkCreated || 0,
           totalPairs: progress.crosswalkCreated || progress.totalPairs || 0,
           continuationCount: progress.continuationCount || 0,
           lastUpdatedAt: progress.lastUpdatedAt || '',
+          status: progress.status,
+          lastError: progress.lastError,
+          pauseReason: progress.pauseReason,
+          errors: progress.errors || 0,
         });
         setBackfillStatus(
           progress.status === 'completed' || progress.phase === 'Completed' ? 'completed' : 
@@ -200,6 +213,58 @@ const EnterpriseSyncDashboard: React.FC = () => {
       toast({
         title: "Error",
         description: "Failed to pause backfill",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleForceResume = async () => {
+    try {
+      // Reset backfill state to running
+      const { error: updateError } = await supabase
+        .from('sync_state')
+        .upsert({
+          key: 'backfill_progress',
+          value: {
+            ...backfillProgress,
+            status: 'running',
+            phase: backfillProgress?.phase === 'Completed' ? 'Phase 3: Creating shadow snapshots' : backfillProgress?.phase,
+            continuationCount: 0,
+            lastUpdatedAt: new Date().toISOString(),
+            pauseReason: undefined,
+            lastError: undefined
+          },
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'key' });
+
+      if (updateError) throw updateError;
+
+      // Clear pause flag if exists
+      await supabase
+        .from('sync_state')
+        .delete()
+        .eq('key', 'backfill_paused');
+
+      setBackfillStatus('running');
+      
+      // Invoke backfill with autoContinue
+      const { error } = await supabase.functions.invoke('backfill-sync', {
+        body: { autoContinue: true }
+      });
+
+      if (error) throw error;
+      
+      toast({
+        title: "Backfill Resumed",
+        description: "Backfill process has been force-resumed and is running",
+      });
+
+      await loadBackfillProgress();
+    } catch (error: any) {
+      console.error('Force resume error:', error);
+      toast({
+        title: "Resume Error",
+        description: error instanceof Error ? error.message : "Failed to resume backfill",
         variant: "destructive",
       });
     }
@@ -306,6 +371,61 @@ const EnterpriseSyncDashboard: React.FC = () => {
                 </div>
               </div>
             </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Backfill Diagnostics Panel */}
+      {backfillProgress && backfillProgress.phase && (
+        <Card className="bg-muted/50">
+          <CardHeader>
+            <CardTitle className="text-sm">Backfill Diagnostics</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <span className="text-muted-foreground">Status:</span>
+                <span className="ml-2 font-medium">{backfillProgress.status || 'unknown'}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Phase:</span>
+                <span className="ml-2 font-medium">{backfillProgress.phase}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Crosswalk:</span>
+                <span className="ml-2 font-medium">{backfillProgress.crosswalkCreated}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Shadows:</span>
+                <span className="ml-2 font-medium">{backfillProgress.shadowsCreated}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Iterations:</span>
+                <span className="ml-2 font-medium">{backfillProgress.continuationCount || 0}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Errors:</span>
+                <span className="ml-2 font-medium">{backfillProgress.errors || 0}</span>
+              </div>
+            </div>
+            {backfillProgress.lastUpdatedAt && (
+              <div className="pt-2 border-t">
+                <span className="text-muted-foreground">Last updated:</span>
+                <span className="ml-2 text-xs">{new Date(backfillProgress.lastUpdatedAt).toLocaleString()}</span>
+              </div>
+            )}
+            {backfillProgress.pauseReason && (
+              <div className="pt-2 border-t">
+                <span className="text-muted-foreground">Pause reason:</span>
+                <span className="ml-2 text-xs">{backfillProgress.pauseReason}</span>
+              </div>
+            )}
+            {backfillProgress.lastError && (
+              <div className="pt-2 border-t">
+                <span className="text-destructive">Last error:</span>
+                <span className="ml-2 text-xs text-destructive">{backfillProgress.lastError}</span>
+              </div>
+            )}
           </CardContent>
         </Card>
       )}
@@ -433,6 +553,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
               <div className="flex items-center gap-2">
                 <Button size="sm" onClick={() => setShowBackfillDialog(true)}>
                   {backfillStatus === 'completed' ? 'Resume Backfill' : 'Start Backfill'}
+                </Button>
+                <Button 
+                  size="sm" 
+                  variant="outline"
+                  onClick={handleForceResume}
+                  disabled={backfillStatus === 'running'}
+                >
+                  Force Resume
                 </Button>
               </div>
             </CardHeader>
