@@ -163,22 +163,25 @@ async function updateSyncStatus(
     }, { onConflict: 'key' });
 }
 
-// Fetch MailerLite subscribers in bulk
+// Fetch MailerLite subscribers individually (API doesn't support batch email queries)
 async function fetchMailerLiteSubscribers(
   apiKey: string,
   emails: string[]
 ): Promise<Map<string, any>> {
   const subscriberMap = new Map<string, any>();
+  let successCount = 0;
+  let notFoundCount = 0;
+  let errorCount = 0;
   
-  // Fetch subscribers in batches of 100 (MailerLite limit)
-  for (let i = 0; i < emails.length; i += 100) {
-    const batch = emails.slice(i, i + 100);
+  // Fetch subscribers individually (MailerLite doesn't support batch email filtering)
+  for (let i = 0; i < emails.length; i++) {
+    const email = emails[i];
     
     await rateLimiter.acquire();
     
     try {
       const response = await fetch(
-        `https://connect.mailerlite.com/api/subscribers?filter[email]=${batch.map(e => encodeURIComponent(e)).join(',')}`,
+        `https://connect.mailerlite.com/api/subscribers/${encodeURIComponent(email)}`,
         {
           headers: {
             'Authorization': `Bearer ${apiKey}`,
@@ -188,39 +191,52 @@ async function fetchMailerLiteSubscribers(
         }
       );
 
+      if (response.status === 404) {
+        // Subscriber doesn't exist in MailerLite - this is expected for some emails
+        notFoundCount++;
+        continue;
+      }
+
       if (!response.ok) {
-        console.error(`❌ MailerLite API error for batch ${i / 100 + 1}: ${response.status}`);
+        const errorBody = await response.text().catch(() => 'Unable to read error body');
+        console.error(`❌ MailerLite API error for ${email} (${response.status}): ${errorBody}`);
+        errorCount++;
         continue;
       }
 
       const result = await response.json();
-      const subscribers = result.data || [];
+      const subscriber = result.data;
       
-      for (const subscriber of subscribers) {
-        if (subscriber.email) {
-          subscriberMap.set(subscriber.email.toLowerCase(), subscriber);
-        }
+      if (subscriber && subscriber.email) {
+        subscriberMap.set(subscriber.email.toLowerCase(), subscriber);
+        successCount++;
       }
-
-      console.log(`✅ Fetched ${subscribers.length} subscribers from MailerLite (batch ${i / 100 + 1}/${Math.ceil(emails.length / 100)})`);
       
     } catch (error) {
-      console.error(`❌ Error fetching MailerLite batch ${i / 100 + 1}:`, error);
+      console.error(`❌ Error fetching subscriber ${email}:`, error);
+      errorCount++;
+    }
+
+    // Progress logging every 50 emails
+    if ((i + 1) % 50 === 0) {
+      console.log(`📊 MailerLite progress: ${i + 1}/${emails.length} processed (${successCount} found, ${notFoundCount} not found, ${errorCount} errors)`);
     }
   }
   
+  console.log(`✅ MailerLite fetch complete: ${successCount} found, ${notFoundCount} not in MailerLite, ${errorCount} errors`);
   return subscriberMap;
 }
 
-// Create shadows in bulk
+// Create shadows in bulk with validation
 async function createShadowsBulk(
   supabase: any,
   crosswalks: Array<{ email: string; a_id: string; b_id: string }>,
   clientsMap: Map<string, any>,
   subscribersMap: Map<string, any>
-): Promise<{ created: number; errors: number }> {
+): Promise<{ created: number; errors: number; incomplete: number }> {
   const shadows = [];
   const errors: string[] = [];
+  let incompleteCount = 0;
 
   for (const crosswalk of crosswalks) {
     const email = crosswalk.email.toLowerCase();
@@ -232,10 +248,23 @@ async function createShadowsBulk(
       continue;
     }
 
+    // Track incomplete shadows (missing either client or subscriber data)
+    const isIncomplete = !clientData || !subscriberData;
+    if (isIncomplete) {
+      incompleteCount++;
+      console.log(`⚠️  Incomplete shadow for ${email}: ${!clientData ? 'missing client data' : 'missing MailerLite data'}`);
+    }
+
     // Build snapshot with both client and subscriber data
     const snapshot: any = {
       A: {},
-      B: {}
+      B: {},
+      _metadata: {
+        hasClientData: !!clientData,
+        hasSubscriberData: !!subscriberData,
+        isComplete: !isIncomplete,
+        createdAt: new Date().toISOString()
+      }
     };
 
     if (clientData) {
@@ -283,7 +312,7 @@ async function createShadowsBulk(
         .upsert(batch, { onConflict: 'email' });
 
       if (error) {
-        console.error(`❌ Error inserting shadow batch ${i / 50 + 1}:`, error);
+        console.error(`❌ Error inserting shadow batch ${i / 50 + 1}:`, error.message, error);
         errors.push(`Batch ${i / 50 + 1} failed: ${error.message}`);
       } else {
         created += batch.length;
@@ -295,7 +324,8 @@ async function createShadowsBulk(
     }
   }
 
-  return { created, errors: errors.length };
+  console.log(`📊 Shadow creation summary: ${created} created, ${incompleteCount} incomplete (missing data from one source), ${errors.length} errors`);
+  return { created, errors: errors.length, incomplete: incompleteCount };
 }
 
 // Main bulk backfill function
@@ -420,7 +450,7 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
 
       // Step 5: Create shadows in bulk
       console.log(`💾 Step 4: Creating ${batch.length} shadows in bulk...`);
-      const { created, errors } = await createShadowsBulk(
+      const { created, errors, incomplete } = await createShadowsBulk(
         supabase,
         batch,
         clientsMap,
@@ -430,7 +460,7 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
       totalCreated += created;
       totalErrors += errors;
 
-      console.log(`✅ Batch ${batchNum + 1} complete: ${created} created, ${errors} errors`);
+      console.log(`✅ Batch ${batchNum + 1} complete: ${created} created, ${incomplete} incomplete, ${errors} errors`);
 
       await updateSyncStatus(supabase, {
         shadowsCreated: existingShadowEmails.size + totalCreated,
