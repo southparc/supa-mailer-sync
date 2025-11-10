@@ -11,6 +11,7 @@ import { SyncLogs } from "@/components/SyncLogs";
 import { AdvisorsManagement } from "@/components/AdvisorsManagement";
 import SmartSyncDashboard from "@/components/SmartSyncDashboard";
 import EnterpriseSyncDashboard from "@/components/EnterpriseSyncDashboard";
+import { MonitoringDashboard } from "@/components/MonitoringDashboard";
 import { LogOut, RefreshCw, AlertTriangle, Users, Database } from "lucide-react";
 
 interface DashboardStats {
@@ -229,9 +230,10 @@ export default function Dashboard() {
 
         {/* Main Content Tabs */}
         <Tabs defaultValue="enterprise-sync" className="space-y-6">
-          <TabsList className="grid w-full grid-cols-4">
+          <TabsList className="grid w-full grid-cols-5">
             <TabsTrigger value="enterprise-sync">Full Sync (Bidirectional)</TabsTrigger>
             <TabsTrigger value="smart-sync">Incremental Sync (Targeted)</TabsTrigger>
+            <TabsTrigger value="monitoring">Monitoring</TabsTrigger>
             <TabsTrigger value="advisors">Advisors</TabsTrigger>
             <TabsTrigger value="logs">Logs</TabsTrigger>
           </TabsList>
@@ -244,6 +246,9 @@ export default function Dashboard() {
             <SmartSyncDashboard />
           </TabsContent>
 
+          <TabsContent value="monitoring" className="space-y-6">
+            <MonitoringDashboard />
+          </TabsContent>
 
           <TabsContent value="advisors" className="space-y-6">
             <AdvisorsManagement />
