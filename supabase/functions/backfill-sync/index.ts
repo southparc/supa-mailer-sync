@@ -819,11 +819,11 @@ async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: 
         return { shadowsCreated, errors, recordsProcessed: allCrosswalks.length, hasMore: true }
       }
 
-      await processCrosswalksForShadows(supabase, apiKey, crosswalksWithoutShadows, offset)
+      const result = await processCrosswalksForShadows(supabase, apiKey, crosswalksWithoutShadows, offset)
       
       return { 
-        shadowsCreated: crosswalksWithoutShadows.length, 
-        errors, 
+        shadowsCreated: result.created, 
+        errors: errors + result.errors, 
         recordsProcessed: allCrosswalks.length, 
         hasMore: allCrosswalks.length === limit 
       }
@@ -836,17 +836,17 @@ async function createInitialShadowsChunk(supabase: any, apiKey: string, offset: 
 
     console.log(`📦 Processing ${crosswalks.length} crosswalks without shadows (offset: ${offset})`)
 
-    await processCrosswalksForShadows(supabase, apiKey, crosswalks, offset)
+    const result = await processCrosswalksForShadows(supabase, apiKey, crosswalks, offset)
 
-    console.log(`✅ Shadow batch complete: ${shadowsCreated} shadows created, ${errors} errors, ${crosswalks.length} records processed`)
-    return { shadowsCreated: crosswalks.length, errors, recordsProcessed: crosswalks.length, hasMore: crosswalks.length === limit }
+    console.log(`✅ Shadow batch complete: ${result.created} shadows created, ${result.errors} errors, ${crosswalks.length} records processed`)
+    return { shadowsCreated: result.created, errors: errors + result.errors, recordsProcessed: crosswalks.length, hasMore: crosswalks.length === limit }
   } catch (error) {
     console.error('❌ Error in shadow creation chunk:', error)
     return { shadowsCreated, errors: errors + 1, recordsProcessed: 0, hasMore: false }
   }
 }
 
-async function processCrosswalksForShadows(supabase: any, apiKey: string, crosswalks: any[], offset: number): Promise<void> {
+async function processCrosswalksForShadows(supabase: any, apiKey: string, crosswalks: any[], offset: number): Promise<{ created: number, errors: number }> {
   let created = 0
   let errors = 0
   
@@ -923,6 +923,7 @@ async function processCrosswalksForShadows(supabase: any, apiKey: string, crossw
   }
   
   console.log(`📊 Batch summary: ${created} created, ${errors} errors out of ${crosswalks.length} records`)
+  return { created, errors }
 }
 
 async function findMailerLiteSubscriber(apiKey: string, email: string): Promise<any | null> {
