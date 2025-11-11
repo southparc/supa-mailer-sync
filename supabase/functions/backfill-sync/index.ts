@@ -163,68 +163,85 @@ async function updateSyncStatus(
     }, { onConflict: 'key' });
 }
 
-// Fetch MailerLite subscribers individually (API doesn't support batch email queries)
+// Fetch MailerLite subscribers using batch API
 async function fetchMailerLiteSubscribers(
   apiKey: string,
   emails: string[]
 ): Promise<Map<string, any>> {
-  const subscriberMap = new Map<string, any>();
+  const subscribersMap = new Map<string, any>();
+  
+  console.log(`🔍 Fetching ${emails.length} MailerLite subscribers using batch API...`);
+  
   let successCount = 0;
   let notFoundCount = 0;
   let errorCount = 0;
   
-  // Fetch subscribers individually (MailerLite doesn't support batch email filtering)
-  for (let i = 0; i < emails.length; i++) {
-    const email = emails[i];
+  // Process in batches of 100 to respect API limits
+  const BATCH_SIZE = 100;
+  
+  for (let i = 0; i < emails.length; i += BATCH_SIZE) {
+    const batchEmails = emails.slice(i, i + BATCH_SIZE);
     
+    // Wait for rate limiter
     await rateLimiter.acquire();
     
     try {
-      const response = await fetch(
-        `https://connect.mailerlite.com/api/subscribers/${encodeURIComponent(email)}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-          }
-        }
-      );
-
-      if (response.status === 404) {
-        // Subscriber doesn't exist in MailerLite - this is expected for some emails
-        notFoundCount++;
-        continue;
-      }
-
-      if (!response.ok) {
-        const errorBody = await response.text().catch(() => 'Unable to read error body');
-        console.error(`❌ MailerLite API error for ${email} (${response.status}): ${errorBody}`);
-        errorCount++;
-        continue;
-      }
-
-      const result = await response.json();
-      const subscriber = result.data;
+      // Build batch request - each email gets its own GET request
+      const batchRequests = batchEmails.map(email => ({
+        method: 'GET',
+        path: `api/subscribers/${encodeURIComponent(email)}`
+      }));
       
-      if (subscriber && subscriber.email) {
-        subscriberMap.set(subscriber.email.toLowerCase(), subscriber);
-        successCount++;
+      const response = await fetch('https://connect.mailerlite.com/api/batch', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({ requests: batchRequests })
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`❌ MailerLite batch API error (${response.status}): ${errorText}`);
+        errorCount += batchEmails.length;
+        continue;
+      }
+      
+      const batchResults = await response.json();
+      
+      // Process batch results - array of responses matching our requests order
+      for (let j = 0; j < batchResults.length; j++) {
+        const result = batchResults[j];
+        const email = batchEmails[j];
+        
+        if (result.status === 200 && result.body?.data) {
+          subscribersMap.set(email.toLowerCase(), result.body.data);
+          successCount++;
+        } else if (result.status === 404) {
+          // Subscriber not found in MailerLite - expected for some emails
+          notFoundCount++;
+        } else {
+          console.error(`❌ MailerLite error for ${email} (${result.status}): ${JSON.stringify(result.body)}`);
+          errorCount++;
+        }
+      }
+      
+      // Log progress every 500 emails
+      if ((i + BATCH_SIZE) % 500 === 0 || i + BATCH_SIZE >= emails.length) {
+        console.log(`📊 Progress: ${Math.min(i + BATCH_SIZE, emails.length)}/${emails.length} emails processed (${successCount} found, ${notFoundCount} not found)`);
       }
       
     } catch (error) {
-      console.error(`❌ Error fetching subscriber ${email}:`, error);
-      errorCount++;
-    }
-
-    // Progress logging every 50 emails
-    if ((i + 1) % 50 === 0) {
-      console.log(`📊 MailerLite progress: ${i + 1}/${emails.length} processed (${successCount} found, ${notFoundCount} not found, ${errorCount} errors)`);
+      console.error(`❌ Batch fetch error:`, error);
+      errorCount += batchEmails.length;
     }
   }
   
-  console.log(`✅ MailerLite fetch complete: ${successCount} found, ${notFoundCount} not in MailerLite, ${errorCount} errors`);
-  return subscriberMap;
+  console.log(`✅ MailerLite batch fetch complete: ${successCount} found, ${notFoundCount} not in MailerLite, ${errorCount} errors`);
+  
+  return subscribersMap;
 }
 
 // Create shadows in bulk with validation
