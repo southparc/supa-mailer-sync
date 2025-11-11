@@ -70,22 +70,33 @@ export const SyncHealthIndicators: React.FC = () => {
 
       if (data?.value) {
         const syncStatus = data.value as any;
+
+        const bf = syncStatus.backfill || {};
+        const fs = syncStatus.fullSync || {};
+        const inc = syncStatus.incrementalSync || {};
+
+        const derivedBackfillStatus: HealthStatus['backfill']['status'] =
+          bf.completedAt ? 'completed' : (bf.paused ? 'paused' : (bf.status || 'idle'));
+        const derivedFullSyncStatus: HealthStatus['fullSync']['status'] =
+          fs.lastCompletedAt ? 'completed' : (fs.status || 'idle');
+        const derivedIncrementalStatus: HealthStatus['incrementalSync']['status'] =
+          inc.lastCompletedAt ? 'completed' : (inc.status || 'idle');
         
         setHealth({
           backfill: {
-            status: syncStatus.backfill?.status || 'idle',
-            progress: syncStatus.backfill?.shadowsCreated || 0,
-            lastRun: syncStatus.backfill?.lastUpdatedAt,
+            status: derivedBackfillStatus,
+            progress: bf.shadowsCreated || 0,
+            lastRun: (bf.completedAt || bf.lastUpdatedAt) || undefined,
           },
           fullSync: {
-            status: syncStatus.fullSync?.status || 'idle',
-            lastRun: syncStatus.fullSync?.lastCompletedAt,
-            recordsProcessed: syncStatus.fullSync?.totalProcessed || 0,
+            status: derivedFullSyncStatus,
+            lastRun: fs.lastCompletedAt || undefined,
+            recordsProcessed: fs.totalProcessed || 0,
           },
           incrementalSync: {
-            status: syncStatus.incrementalSync?.status || 'idle',
-            lastRun: syncStatus.incrementalSync?.lastCompletedAt,
-            updatesApplied: syncStatus.incrementalSync?.totalUpdated || 0,
+            status: derivedIncrementalStatus,
+            lastRun: inc.lastCompletedAt || undefined,
+            updatesApplied: inc.totalUpdated || 0,
           },
         });
       }
