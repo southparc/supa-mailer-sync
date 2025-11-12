@@ -506,6 +506,79 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
       }
     }
 
+    // Stage 2: Create placeholder shadows for any remaining clients without shadows
+    console.log('\n🧩 Stage 2: Creating placeholder shadows for clients without existing shadows...');
+
+    try {
+      // Fetch all clients once (only lightweight fields needed)
+      const { data: allClients, error: allClientsError } = await supabase
+        .from('clients')
+        .select('email, first_name, last_name, phone, city, country, mailerlite_id');
+
+      if (allClientsError) {
+        console.error('❌ Error fetching clients for placeholder stage:', allClientsError);
+        totalErrors += 1;
+      } else {
+        // Exclude the ones we already created in stage 1 to avoid double work
+        const firstPassEmails = new Set((crosswalksWithoutShadows || []).map((c: any) => c.email.toLowerCase()));
+        const missingClients = (allClients || []).filter((c: any) => {
+          const e = (c.email || '').toLowerCase();
+          return e && !existingShadowEmails.has(e) && !firstPassEmails.has(e);
+        });
+
+        console.log(`📊 Found ${missingClients.length} clients without shadows after stage 1`);
+
+        const totalClientBatches = Math.ceil(missingClients.length / 500);
+        for (let b = 0; b < totalClientBatches; b++) {
+          const start = b * 500;
+          const end = Math.min(start + 500, missingClients.length);
+          const clientBatch = missingClients.slice(start, end);
+
+          await updateSyncStatus(supabase, {
+            phase: `Creating placeholder shadows (${b + 1}/${totalClientBatches})`,
+            currentBatch: b + 1,
+            totalBatches: totalClientBatches
+          });
+
+          // Build maps and placeholder crosswalk entries (we only need email for shadow creation)
+          const clientsMap = new Map<string, any>(
+            clientBatch.map((c: any) => [c.email.toLowerCase(), c])
+          );
+          const placeholderCrosswalks = clientBatch.map((c: any) => ({
+            email: c.email,
+            a_id: '',
+            b_id: ''
+          }));
+
+          // No MailerLite fetch for placeholders – create A-only snapshots to reach 100% coverage fast
+          const emptySubscribers = new Map<string, any>();
+
+          const { created, errors } = await createShadowsBulk(
+            supabase,
+            placeholderCrosswalks,
+            clientsMap,
+            emptySubscribers
+          );
+
+          totalCreated += created;
+          totalErrors += errors;
+
+          await updateSyncStatus(supabase, {
+            shadowsCreated: existingShadowEmails.size + totalCreated,
+            errors: totalErrors
+          });
+
+          // Small delay between batches
+          if (b < totalClientBatches - 1) {
+            await new Promise(r => setTimeout(r, 100));
+          }
+        }
+      }
+    } catch (e) {
+      console.error('❌ Placeholder stage failed:', e);
+      totalErrors += 1;
+    }
+
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 BULK BACKFILL COMPLETE!`);
     console.log(`📊 Created ${totalCreated} new shadows`);
