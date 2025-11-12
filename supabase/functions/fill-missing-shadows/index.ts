@@ -94,6 +94,9 @@ Deno.serve(async (req) => {
     let errors = 0;
 
     const run = async () => {
+      let consecutiveErrors = 0;
+      const maxConsecutiveErrors = 3;
+
       while (true) {
         const { data: clientsPage, error: clientsErr } = await supabase
           .from('clients')
@@ -104,9 +107,16 @@ Deno.serve(async (req) => {
         if (clientsErr) {
           console.error('Error fetching clients page:', clientsErr);
           errors += 1;
-          break;
+          consecutiveErrors += 1;
+          if (consecutiveErrors >= maxConsecutiveErrors) {
+            console.error('Too many consecutive errors, stopping');
+            break;
+          }
+          offset += pageSize;
+          continue;
         }
 
+        consecutiveErrors = 0;
         if (!clientsPage || clientsPage.length === 0) break;
 
         // Collect valid emails and fetch existing shadows for these emails
@@ -166,25 +176,37 @@ Deno.serve(async (req) => {
         }
 
         offset += pageSize;
+        const progress = totalClients > 0 ? Math.round((offset / totalClients) * 100) : 0;
 
         await updateSyncStatus(supabase, {
-          phase: 'Stage 2 gap fill: scanning',
+          phase: `Stage 2 gap fill: scanning (${progress}% of clients)`,
           shadowsCreated: totalShadows + created,
+          clientsProcessed: offset,
+          totalClients,
           errors,
         });
       }
 
       const durationSec = Math.round((Date.now() - startTime) / 1000);
+      const finalShadowCount = totalShadows + created;
+      
       await updateSyncStatus(supabase, {
-        phase: 'Completed',
+        phase: created > 0 ? 'Gap fill completed' : 'No missing shadows found',
         status: 'completed',
         completedAt: new Date().toISOString(),
-        shadowsCreated: totalShadows + created,
+        shadowsCreated: finalShadowCount,
+        clientsProcessed: offset,
+        totalClients,
         errors,
-        summary: { created, errors, durationSec },
+        summary: { 
+          created, 
+          errors, 
+          durationSec,
+          finalCoverage: totalClients > 0 ? `${Math.round((finalShadowCount / totalClients) * 100)}%` : 'N/A'
+        },
       });
 
-      console.log(`Gap fill completed. Created ${created} placeholders, errors ${errors}`);
+      console.log(`✅ Gap fill completed. Created ${created} placeholders, ${errors} errors, ${durationSec}s, final coverage: ${finalShadowCount}/${totalClients}`);
     };
 
     // Run in background so we can return immediately
