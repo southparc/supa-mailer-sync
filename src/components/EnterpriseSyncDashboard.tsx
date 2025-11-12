@@ -20,8 +20,11 @@ import {
   RefreshCw,
   CheckCircle,
   CheckCircle2,
-  Users
+  Users,
+  TrendingUp,
+  Clock
 } from "lucide-react";
+import { RadialBarChart, RadialBar, PolarAngleAxis } from 'recharts';
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { useSyncStats } from "@/hooks/useSyncStats";
@@ -394,36 +397,35 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   const needsBackfill = stats.totalClients > 0 && syncPercentage.percentage < 50;
 
+  const syncCoverageData = [{ name: 'Coverage', value: syncPercentage.percentage, fill: 'hsl(var(--primary))' }];
+  const dataQualityPercent = stats.shadowCount > 0 
+    ? Math.round(((stats.shadowCount - stats.incompleteShadows) / stats.shadowCount) * 100) 
+    : 0;
+  const dataQualityData = [{ name: 'Quality', value: dataQualityPercent, fill: 'hsl(var(--chart-2))' }];
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-3">
       {/* Duplicate Advisors Warning */}
       {duplicates.length > 0 && (
-        <Alert variant="destructive">
+        <Alert variant="destructive" className="py-2">
           <AlertTriangle className="h-4 w-4" />
-          <AlertDescription>
-            <strong>Duplicate advisors detected:</strong> {duplicates.map(d => `${d.name} (${d.count}x)`).join(', ')}
-            <br />
-            <span className="text-sm">Resolve duplicates in the Advisors tab before syncing.</span>
+          <AlertDescription className="text-sm">
+            <strong>Duplicate advisors:</strong> {duplicates.map(d => `${d.name} (${d.count}x)`).join(', ')} - Resolve in Advisors tab
           </AlertDescription>
         </Alert>
       )}
 
       {/* Backfill Warning */}
       {needsBackfill && backfillStatus !== 'running' && (
-        <Alert>
+        <Alert className="py-2">
           <AlertTriangle className="h-4 w-4" />
-          <AlertDescription className="flex items-center justify-between">
-            <div>
-              <strong>{backfillStatus === 'completed' ? 'Backfill incomplete' : 'Initial backfill required'}</strong>
-              <p className="text-sm mt-1">
-                Only {syncPercentage.percentage}% of clients have shadow records ({syncPercentage.clientsWithShadow}/{syncPercentage.totalClients}).
-                {backfillStatus === 'completed' 
-                  ? ' Resume backfill to complete sync state.' 
-                  : ' Run backfill to create initial sync state.'}
-              </p>
-            </div>
+          <AlertDescription className="flex items-center justify-between text-sm">
+            <span>
+              <strong>{backfillStatus === 'completed' ? 'Backfill incomplete' : 'Initial backfill required'}</strong> - 
+              {syncPercentage.percentage}% coverage ({syncPercentage.clientsWithShadow}/{syncPercentage.totalClients})
+            </span>
             <Button onClick={() => setShowBackfillDialog(true)} size="sm">
-              {backfillStatus === 'completed' ? 'Resume Backfill' : 'Start Backfill'}
+              {backfillStatus === 'completed' ? 'Resume' : 'Start'}
             </Button>
           </AlertDescription>
         </Alert>
@@ -431,42 +433,33 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
       {/* Backfill Progress */}
       {backfillStatus === 'running' && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center justify-between">
-              <span>Backfill in Progress</span>
+        <Card className="py-2">
+          <CardHeader className="pb-2">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-base">Backfill in Progress</CardTitle>
               <Button onClick={handlePauseBackfill} variant="outline" size="sm">
-                <Pause className="h-4 w-4 mr-2" />
+                <Pause className="h-3 w-3 mr-1" />
                 Pause
               </Button>
-            </CardTitle>
-            <CardDescription>
-              Creating shadow records and crosswalk mappings...
-            </CardDescription>
+            </div>
           </CardHeader>
-          <CardContent>
-            <div className="space-y-4">
-              <Progress value={(backfillProgress.shadowsCreated / stats.totalClients) * 100} />
-              <div className="grid grid-cols-2 gap-4 text-sm">
-                <div>
-                  <p className="text-muted-foreground">Phase</p>
-                  <p className="font-medium">{backfillProgress.phase}</p>
-                </div>
-                <div>
-                  <p className="text-muted-foreground">Progress</p>
-                  <p className="font-medium">
-                    {backfillProgress.shadowsCreated} / {stats.totalClients} shadows
-                  </p>
-                </div>
-                {backfillProgress.totalBatches > 0 && (
-                  <div>
-                    <p className="text-muted-foreground">Batch</p>
-                    <p className="font-medium">
-                      {backfillProgress.currentBatch} / {backfillProgress.totalBatches}
-                    </p>
-                  </div>
-                )}
+          <CardContent className="space-y-2">
+            <Progress value={(backfillProgress.shadowsCreated / stats.totalClients) * 100} className="h-1.5" />
+            <div className="grid grid-cols-3 gap-2 text-xs">
+              <div>
+                <p className="text-muted-foreground">Phase</p>
+                <p className="font-medium truncate">{backfillProgress.phase}</p>
               </div>
+              <div>
+                <p className="text-muted-foreground">Progress</p>
+                <p className="font-medium">{backfillProgress.shadowsCreated}/{stats.totalClients}</p>
+              </div>
+              {backfillProgress.totalBatches > 0 && (
+                <div>
+                  <p className="text-muted-foreground">Batch</p>
+                  <p className="font-medium">{backfillProgress.currentBatch}/{backfillProgress.totalBatches}</p>
+                </div>
+              )}
             </div>
           </CardContent>
         </Card>
@@ -474,57 +467,25 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
       {/* Backfill Diagnostics Panel */}
       {backfillProgress && backfillProgress.phase && (
-        <Card className="bg-muted/50">
-          <CardHeader>
-            <CardTitle className="text-sm">Backfill Diagnostics</CardTitle>
+        <Card className="bg-muted/50 py-1">
+          <CardHeader className="pb-1">
+            <CardTitle className="text-xs">Diagnostics</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2 text-sm">
-            <div className="grid grid-cols-2 gap-2">
+          <CardContent className="text-xs">
+            <div className="grid grid-cols-3 gap-2">
               <div>
-                <span className="text-muted-foreground">Status:</span>
-                <span className="ml-2 font-medium">{backfillProgress.status || 'unknown'}</span>
+                <span className="text-muted-foreground">Status:</span> <span className="font-medium">{backfillProgress.status || 'unknown'}</span>
               </div>
               <div>
-                <span className="text-muted-foreground">Phase:</span>
-                <span className="ml-2 font-medium">{backfillProgress.phase}</span>
+                <span className="text-muted-foreground">Batch:</span> <span className="font-medium">{backfillProgress.currentBatch}/{backfillProgress.totalBatches}</span>
               </div>
               <div>
-                <span className="text-muted-foreground">Batch:</span>
-                <span className="ml-2 font-medium">
-                  {backfillProgress.currentBatch}/{backfillProgress.totalBatches}
-                </span>
+                <span className="text-muted-foreground">Errors:</span> <span className="font-medium">{backfillProgress.errors || 0}</span>
               </div>
-              <div>
-                <span className="text-muted-foreground">Shadows:</span>
-                <span className="ml-2 font-medium">{backfillProgress.shadowsCreated}</span>
-              </div>
-              <div>
-                <span className="text-muted-foreground">Errors:</span>
-                <span className="ml-2 font-medium">{backfillProgress.errors || 0}</span>
-              </div>
-              {backfillProgress.paused && (
-                <div>
-                  <span className="text-muted-foreground">Paused:</span>
-                  <span className="ml-2 font-medium text-yellow-600">Yes</span>
-                </div>
-              )}
             </div>
-            {backfillProgress.lastUpdatedAt && (
-              <div className="pt-2 border-t">
-                <span className="text-muted-foreground">Last updated:</span>
-                <span className="ml-2 text-xs">{new Date(backfillProgress.lastUpdatedAt).toLocaleString()}</span>
-              </div>
-            )}
-            {backfillProgress.pauseReason && (
-              <div className="pt-2 border-t">
-                <span className="text-muted-foreground">Pause reason:</span>
-                <span className="ml-2 text-xs">{backfillProgress.pauseReason}</span>
-              </div>
-            )}
             {backfillProgress.lastError && (
-              <div className="pt-2 border-t">
-                <span className="text-destructive">Last error:</span>
-                <span className="ml-2 text-xs text-destructive">{backfillProgress.lastError}</span>
+              <div className="mt-1 pt-1 border-t">
+                <span className="text-destructive text-xs">{backfillProgress.lastError}</span>
               </div>
             )}
           </CardContent>
@@ -533,170 +494,157 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
       {/* Sync Status */}
       {syncing && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center justify-between">
-              <span>Sync in Progress</span>
+        <Card className="py-2">
+          <CardHeader className="pb-2">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-base">Sync in Progress</CardTitle>
               <Button onClick={stopSync} variant="outline" size="sm">
-                <Pause className="h-4 w-4 mr-2" />
+                <Pause className="h-3 w-3 mr-1" />
                 Pause
               </Button>
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-2">
-              <Progress value={progress} />
-              <p className="text-sm text-muted-foreground">{status}</p>
             </div>
+          </CardHeader>
+          <CardContent className="space-y-1">
+            <Progress value={progress} className="h-1.5" />
+            <p className="text-xs text-muted-foreground">{status}</p>
           </CardContent>
         </Card>
       )}
 
-      {/* Connection Test */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Activity className="h-5 w-5" />
-            Connection Status
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="flex gap-2 flex-wrap">
-          <Button onClick={testConnection} variant="outline" disabled={syncing}>
-            <RefreshCw className="h-4 w-4 mr-2" />
-            Test Connection
+      {/* Quick Actions */}
+      <Card className="py-2">
+        <CardContent className="flex gap-2 flex-wrap pt-4">
+          <Button onClick={testConnection} variant="outline" size="sm" disabled={syncing}>
+            <RefreshCw className="h-3 w-3 mr-1" />
+            Test
           </Button>
-          <Button 
-            onClick={handleFullSync} 
-            variant="default" 
-            disabled={syncing || duplicates.length > 0}
-          >
-            <Database className="h-4 w-4 mr-2" />
-            Full Sync (All Subscribers)
+          <Button onClick={handleFullSync} size="sm" disabled={syncing || duplicates.length > 0}>
+            <Database className="h-3 w-3 mr-1" />
+            Full Sync
           </Button>
         </CardContent>
       </Card>
 
-      {/* Stats Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <Database className="h-4 w-4" />
-              Total Clients
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{stats.totalClients}</div>
-            <p className="text-xs text-muted-foreground">
-              All subscribers synced
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4" />
-              Shadow Records
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{stats.shadowCount}</div>
-            <p className="text-xs text-muted-foreground">
-              {syncPercentage.percentage}% coverage
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <AlertTriangle className="h-4 w-4" />
-              Data Quality
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{stats.incompleteShadows}</div>
-            <p className="text-xs text-muted-foreground">
-              Incomplete shadows
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <AlertCircle className="h-4 w-4" />
-              Conflicts
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{stats.conflictCount}</div>
-            <p className="text-xs text-muted-foreground">
-              Pending resolution
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <Mail className="h-4 w-4" />
-              Last Sync
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-sm">
-              {stats.lastSync 
-                ? new Date(stats.lastSync).toLocaleString()
-                : 'Never'
-              }
+      {/* Compact Stats with Gauges */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        {/* Sync Coverage Gauge */}
+        <Card className="py-2">
+          <CardContent className="flex items-center gap-3 pt-3">
+            <div className="h-16 w-16">
+              <RadialBarChart 
+                width={64} 
+                height={64} 
+                innerRadius="70%" 
+                outerRadius="100%" 
+                data={syncCoverageData} 
+                startAngle={90} 
+                endAngle={-270}
+              >
+                <PolarAngleAxis type="number" domain={[0, 100]} angleAxisId={0} tick={false} />
+                <RadialBar background dataKey="value" cornerRadius={10} />
+                <text x="50%" y="50%" textAnchor="middle" dominantBaseline="middle" className="fill-foreground text-xs font-bold">
+                  {syncPercentage.percentage}%
+                </text>
+              </RadialBarChart>
             </div>
-            <p className="text-xs text-muted-foreground">
-              {stats.recordsProcessed} records processed
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium text-muted-foreground">Sync Coverage</p>
+              <p className="text-lg font-bold">{stats.shadowCount.toLocaleString()}</p>
+              <p className="text-xs text-muted-foreground truncate">of {stats.totalClients.toLocaleString()}</p>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Data Quality Gauge */}
+        <Card className="py-2">
+          <CardContent className="flex items-center gap-3 pt-3">
+            <div className="h-16 w-16">
+              <RadialBarChart 
+                width={64} 
+                height={64} 
+                innerRadius="70%" 
+                outerRadius="100%" 
+                data={dataQualityData} 
+                startAngle={90} 
+                endAngle={-270}
+              >
+                <PolarAngleAxis type="number" domain={[0, 100]} angleAxisId={0} tick={false} />
+                <RadialBar background dataKey="value" cornerRadius={10} />
+                <text x="50%" y="50%" textAnchor="middle" dominantBaseline="middle" className="fill-foreground text-xs font-bold">
+                  {dataQualityPercent}%
+                </text>
+              </RadialBarChart>
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium text-muted-foreground">Data Quality</p>
+              <p className="text-lg font-bold">{stats.incompleteShadows}</p>
+              <p className="text-xs text-muted-foreground">incomplete</p>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Conflicts */}
+        <Card className="py-2">
+          <CardContent className="pt-3">
+            <div className="flex items-center gap-2 mb-1">
+              <AlertCircle className="h-4 w-4 text-muted-foreground" />
+              <p className="text-xs font-medium text-muted-foreground">Conflicts</p>
+            </div>
+            <p className="text-2xl font-bold">{stats.conflictCount}</p>
+            <p className="text-xs text-muted-foreground">pending</p>
+          </CardContent>
+        </Card>
+
+        {/* Last Sync */}
+        <Card className="py-2">
+          <CardContent className="pt-3">
+            <div className="flex items-center gap-2 mb-1">
+              <Clock className="h-4 w-4 text-muted-foreground" />
+              <p className="text-xs font-medium text-muted-foreground">Last Sync</p>
+            </div>
+            <p className="text-sm font-bold truncate">
+              {stats.lastSync ? new Date(stats.lastSync).toLocaleString('nl-NL', { 
+                day: '2-digit', 
+                month: '2-digit', 
+                hour: '2-digit', 
+                minute: '2-digit' 
+              }) : 'Never'}
             </p>
+            <p className="text-xs text-muted-foreground">{stats.recordsProcessed} records</p>
           </CardContent>
         </Card>
       </div>
 
-      {/* Subscription Status Breakdown */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Users className="h-5 w-5" />
-            Subscription Status Breakdown
+      {/* Compact Subscription Status */}
+      <Card className="py-2">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <Users className="h-4 w-4" />
+            Subscription Status ({stats.totalClients.toLocaleString()} total)
           </CardTitle>
-          <CardDescription>
-            Matches MailerLite's subscriber status distribution
-          </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-            <div className="space-y-1">
-              <p className="text-sm font-medium text-muted-foreground">Active</p>
-              <p className="text-2xl font-bold text-green-600">{stats.statusBreakdown.active.toLocaleString()}</p>
+          <div className="grid grid-cols-3 md:grid-cols-5 gap-2 text-center">
+            <div>
+              <p className="text-xs text-muted-foreground mb-0.5">Active</p>
+              <p className="text-lg font-bold text-green-600">{stats.statusBreakdown.active.toLocaleString()}</p>
             </div>
-            <div className="space-y-1">
-              <p className="text-sm font-medium text-muted-foreground">Unsubscribed</p>
-              <p className="text-2xl font-bold text-orange-600">{stats.statusBreakdown.unsubscribed.toLocaleString()}</p>
+            <div>
+              <p className="text-xs text-muted-foreground mb-0.5">Unsub</p>
+              <p className="text-lg font-bold text-orange-600">{stats.statusBreakdown.unsubscribed.toLocaleString()}</p>
             </div>
-            <div className="space-y-1">
-              <p className="text-sm font-medium text-muted-foreground">Bounced</p>
-              <p className="text-2xl font-bold text-red-600">{stats.statusBreakdown.bounced.toLocaleString()}</p>
+            <div>
+              <p className="text-xs text-muted-foreground mb-0.5">Bounced</p>
+              <p className="text-lg font-bold text-red-600">{stats.statusBreakdown.bounced.toLocaleString()}</p>
             </div>
-            <div className="space-y-1">
-              <p className="text-sm font-medium text-muted-foreground">Spam Complaints</p>
-              <p className="text-2xl font-bold text-purple-600">{stats.statusBreakdown.junk.toLocaleString()}</p>
+            <div>
+              <p className="text-xs text-muted-foreground mb-0.5">Spam</p>
+              <p className="text-lg font-bold text-purple-600">{stats.statusBreakdown.junk.toLocaleString()}</p>
             </div>
-            <div className="space-y-1">
-              <p className="text-sm font-medium text-muted-foreground">Unconfirmed</p>
-              <p className="text-2xl font-bold text-gray-600">{stats.statusBreakdown.unconfirmed.toLocaleString()}</p>
+            <div>
+              <p className="text-xs text-muted-foreground mb-0.5">Unconf</p>
+              <p className="text-lg font-bold text-muted-foreground">{stats.statusBreakdown.unconfirmed.toLocaleString()}</p>
             </div>
-          </div>
-          <div className="mt-4 pt-4 border-t">
-            <p className="text-sm text-muted-foreground">
-              Total: <span className="font-bold">{stats.totalClients.toLocaleString()}</span> subscribers
-            </p>
           </div>
         </CardContent>
       </Card>
@@ -704,23 +652,18 @@ const EnterpriseSyncDashboard: React.FC = () => {
       <RateLimitStatus />
 
       {/* Main Tabs */}
-      <Tabs defaultValue="sync" className="space-y-6">
-        <TabsList className="grid w-full grid-cols-3">
-          <TabsTrigger value="sync">Synchronisatie</TabsTrigger>
-          <TabsTrigger value="conflicts">Conflicten ({stats.conflictCount})</TabsTrigger>
-          <TabsTrigger value="diagnostic">Diagnostic</TabsTrigger>
+      <Tabs defaultValue="sync" className="space-y-3">
+        <TabsList className="grid w-full grid-cols-3 h-8">
+          <TabsTrigger value="sync" className="text-xs">Sync</TabsTrigger>
+          <TabsTrigger value="conflicts" className="text-xs">Conflicts ({stats.conflictCount})</TabsTrigger>
+          <TabsTrigger value="diagnostic" className="text-xs">Diagnostic</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="sync" className="space-y-4">
-          <Card>
-            <CardHeader className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <CardTitle>Sync Controls</CardTitle>
-                <CardDescription>
-                  Choose sync direction to synchronize data
-                </CardDescription>
-              </div>
-              <div className="flex items-center gap-2">
+        <TabsContent value="sync" className="space-y-2">
+          <Card className="py-2">
+            <CardHeader className="pb-2 flex flex-row items-center justify-between">
+              <CardTitle className="text-sm">Sync Controls</CardTitle>
+              <div className="flex items-center gap-1">
                 {(() => {
                   const isFresh = backfillProgress.lastUpdatedAt && 
                     (Date.now() - new Date(backfillProgress.lastUpdatedAt).getTime() < 90000);
@@ -732,16 +675,18 @@ const EnterpriseSyncDashboard: React.FC = () => {
                         size="sm" 
                         onClick={() => setShowBackfillDialog(true)}
                         disabled={isActuallyRunning}
+                        className="h-7 text-xs"
                       >
-                        {backfillStatus === 'completed' ? 'Resume Backfill' : 'Start Backfill'}
+                        {backfillStatus === 'completed' ? 'Resume' : 'Backfill'}
                       </Button>
                       {isActuallyRunning && !resuming && (
                         <Button 
                           size="sm"
                           variant="outline"
                           onClick={handlePauseBackfill}
+                          className="h-7 text-xs"
                         >
-                          <Pause className="h-4 w-4 mr-2" />
+                          <Pause className="h-3 w-3 mr-1" />
                           Pause
                         </Button>
                       )}
@@ -751,9 +696,10 @@ const EnterpriseSyncDashboard: React.FC = () => {
                           variant="outline"
                           onClick={handleForceResume}
                           disabled={isActuallyRunning || resuming}
+                          className="h-7 text-xs"
                         >
-                          <Play className="h-4 w-4 mr-2" />
-                          {resuming ? 'Resuming...' : 'Force Resume'}
+                          <Play className="h-3 w-3 mr-1" />
+                          {resuming ? 'Resuming...' : 'Resume'}
                         </Button>
                       )}
                     </>
@@ -761,7 +707,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
                 })()}
               </div>
             </CardHeader>
-            <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-2 pb-3">
               <SyncButton
                 onClick={() => handleSync('mailerlite-to-supabase')}
                 disabled={syncing || duplicates.length > 0}
