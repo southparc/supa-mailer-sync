@@ -170,7 +170,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
     }
   };
 
-  const handleSync = async (direction: 'mailerlite-to-supabase' | 'supabase-to-mailerlite' | 'bidirectional') => {
+  const handleSync = async (direction: 'mailerlite-to-supabase' | 'supabase-to-mailerlite' | 'bidirectional', maxRecords = 500) => {
     if (duplicates.length > 0) {
       toast({
         title: "Duplicates Detected",
@@ -180,9 +180,38 @@ const EnterpriseSyncDashboard: React.FC = () => {
       return;
     }
 
-    const result = await runSync({ direction, maxRecords: 500 });
+    const result = await runSync({ direction, maxRecords });
     if (result?.success) {
       refreshStats();
+    }
+  };
+
+  const handleFullSync = async () => {
+    if (duplicates.length > 0) {
+      toast({
+        title: "Duplicates Detected",
+        description: "Please resolve duplicate advisors before syncing.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    toast({
+      title: "Full Sync Started",
+      description: "Fetching all subscribers from MailerLite (this may take 15-20 minutes)...",
+    });
+
+    const result = await runSync({ 
+      direction: 'mailerlite-to-supabase', 
+      maxRecords: 50000 // High limit to get all ~30k subscribers
+    });
+    
+    if (result?.success) {
+      refreshStats();
+      toast({
+        title: "Full Sync Complete",
+        description: `Processed ${result.recordsProcessed} records. All subscriber statuses updated.`,
+      });
     }
   };
 
@@ -531,10 +560,18 @@ const EnterpriseSyncDashboard: React.FC = () => {
             Connection Status
           </CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex gap-2 flex-wrap">
           <Button onClick={testConnection} variant="outline" disabled={syncing}>
             <RefreshCw className="h-4 w-4 mr-2" />
             Test Connection
+          </Button>
+          <Button 
+            onClick={handleFullSync} 
+            variant="default" 
+            disabled={syncing || duplicates.length > 0}
+          >
+            <Database className="h-4 w-4 mr-2" />
+            Full Sync (All Subscribers)
           </Button>
         </CardContent>
       </Card>
