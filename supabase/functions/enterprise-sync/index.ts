@@ -278,18 +278,24 @@ async function syncFromMailerLite(supabase: any, apiKey: string, maxRecords: num
     console.log(`Retrieved cursor from sync_state: ${cursor}`)
   }
 
-  while (recordsProcessed < maxRecords) {
-    // Check time bounds - leave 10s buffer for final operations
-    if (Date.now() - startTime > maxDurationMs - 10000) {
-      console.log(`Time bound reached (${Date.now() - startTime}ms), stopping early`)
-      break
-    }
-    try {
-      // Fetch MailerLite subscribers
-      let url = `https://connect.mailerlite.com/api/subscribers?limit=100`
-      if (cursor) {
-        url += `&cursor=${cursor}`
+  // Sync ALL subscriber statuses to match MailerLite's full dataset
+  const statuses = ['active', 'unsubscribed', 'bounced', 'junk', 'unconfirmed']
+  
+  for (const status of statuses) {
+    console.log(`🔄 Syncing ${status} subscribers from MailerLite...`)
+    
+    while (recordsProcessed < maxRecords) {
+      // Check time bounds - leave 10s buffer for final operations
+      if (Date.now() - startTime > maxDurationMs - 10000) {
+        console.log(`Time bound reached (${Date.now() - startTime}ms), stopping early`)
+        break
       }
+      try {
+        // Fetch MailerLite subscribers with specific status filter
+        let url = `https://connect.mailerlite.com/api/subscribers?filter[status]=${status}&limit=100`
+        if (cursor) {
+          url += `&cursor=${cursor}`
+        }
 
       const response = await fetch(url, {
         headers: {
@@ -334,18 +340,30 @@ async function syncFromMailerLite(supabase: any, apiKey: string, maxRecords: num
         await supabase
           .from('sync_state')
           .upsert({
-            key: 'mailerlite:import:cursor',
-            value: { cursor, recordsProcessed, updatedAt: new Date().toISOString() }
+            key: `mailerlite:import:cursor:${status}`,
+            value: { cursor, recordsProcessed, status, updatedAt: new Date().toISOString() }
           })
       }
       
       if (!cursor) break
 
-    } catch (error) {
-      console.error('MailerLite batch processing error:', error)
-      errors++
-      break
+      } catch (error) {
+        console.error(`MailerLite batch processing error for ${status}:`, error)
+        errors++
+        break
+      }
     }
+    
+    // Clear cursor for this status when done
+    await supabase
+      .from('sync_state')
+      .delete()
+      .eq('key', `mailerlite:import:cursor:${status}`)
+    
+    console.log(`✅ Completed syncing ${status} subscribers`)
+    
+    // Reset cursor for next status
+    cursor = null
   }
 
   // Clear cursor if completed
@@ -485,6 +503,7 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
         age: subscriber.fields?.leeftijd ? parseInt(subscriber.fields.leeftijd) : null,
         planning_status: subscriber.fields?.planning_status || null,
         referer: subscriber.fields?.doorverwijzer || null,
+        subscription_status: subscriber.status, // Store MailerLite subscription status
         figlorawsnapshot: subscriber, // Store complete MailerLite data
       })
       .select()
@@ -598,11 +617,14 @@ async function processSubscriberSync(supabase: any, subscriber: any, dryRun: boo
     country: subscriber.fields?.country || '',
   }
 
-  // Update stored MailerLite snapshot if not dry run
+  // Update stored MailerLite snapshot and subscription status if not dry run
   if (!dryRun) {
     await supabase
       .from('clients')
-      .update({ figlorawsnapshot: subscriber })
+      .update({ 
+        figlorawsnapshot: subscriber,
+        subscription_status: subscriber.status // Update subscription status
+      })
       .eq('email', email)
   }
 

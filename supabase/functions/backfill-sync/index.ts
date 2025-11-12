@@ -163,14 +163,14 @@ async function updateSyncStatus(
     }, { onConflict: 'key' });
 }
 
-// Fetch MailerLite subscribers using batch API
+// Fetch MailerLite subscribers using batch API (all statuses)
 async function fetchMailerLiteSubscribers(
   apiKey: string,
   emails: string[]
 ): Promise<Map<string, any>> {
   const subscribersMap = new Map<string, any>();
   
-  console.log(`🔍 Fetching ${emails.length} MailerLite subscribers using batch API...`);
+  console.log(`🔍 Fetching ${emails.length} MailerLite subscribers using batch API (all statuses)...`);
   
   let successCount = 0;
   let notFoundCount = 0;

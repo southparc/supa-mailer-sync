@@ -18,7 +18,9 @@ import {
   Mail,
   Activity,
   RefreshCw,
-  CheckCircle
+  CheckCircle,
+  CheckCircle2,
+  Users
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
@@ -549,7 +551,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
           <CardContent>
             <div className="text-2xl font-bold">{stats.totalClients}</div>
             <p className="text-xs text-muted-foreground">
-              in database
+              All subscribers synced
             </p>
           </CardContent>
         </Card>
@@ -557,14 +559,29 @@ const EnterpriseSyncDashboard: React.FC = () => {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <CheckCircle className="h-4 w-4" />
+              <CheckCircle2 className="h-4 w-4" />
               Shadow Records
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{syncPercentage.clientsWithShadow}</div>
+            <div className="text-2xl font-bold">{stats.shadowCount}</div>
             <p className="text-xs text-muted-foreground">
-              {syncPercentage.percentage}% tracked
+              {syncPercentage.percentage}% coverage
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4" />
+              Data Quality
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{stats.incompleteShadows}</div>
+            <p className="text-xs text-muted-foreground">
+              Incomplete shadows
             </p>
           </CardContent>
         </Card>
@@ -573,25 +590,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <AlertCircle className="h-4 w-4" />
-              Data Quality
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold text-warning">{stats.incompleteShadows}</div>
-            <p className="text-xs text-muted-foreground">incomplete records</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <AlertTriangle className="h-4 w-4" />
               Conflicts
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold text-destructive">{stats.conflictCount}</div>
-            <p className="text-xs text-muted-foreground">pending resolution</p>
+            <div className="text-2xl font-bold">{stats.conflictCount}</div>
+            <p className="text-xs text-muted-foreground">
+              Pending resolution
+            </p>
           </CardContent>
         </Card>
 
@@ -615,6 +621,48 @@ const EnterpriseSyncDashboard: React.FC = () => {
           </CardContent>
         </Card>
       </div>
+
+      {/* Subscription Status Breakdown */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Users className="h-5 w-5" />
+            Subscription Status Breakdown
+          </CardTitle>
+          <CardDescription>
+            Matches MailerLite's subscriber status distribution
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-muted-foreground">Active</p>
+              <p className="text-2xl font-bold text-green-600">{stats.statusBreakdown.active.toLocaleString()}</p>
+            </div>
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-muted-foreground">Unsubscribed</p>
+              <p className="text-2xl font-bold text-orange-600">{stats.statusBreakdown.unsubscribed.toLocaleString()}</p>
+            </div>
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-muted-foreground">Bounced</p>
+              <p className="text-2xl font-bold text-red-600">{stats.statusBreakdown.bounced.toLocaleString()}</p>
+            </div>
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-muted-foreground">Spam Complaints</p>
+              <p className="text-2xl font-bold text-purple-600">{stats.statusBreakdown.junk.toLocaleString()}</p>
+            </div>
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-muted-foreground">Unconfirmed</p>
+              <p className="text-2xl font-bold text-gray-600">{stats.statusBreakdown.unconfirmed.toLocaleString()}</p>
+            </div>
+          </div>
+          <div className="mt-4 pt-4 border-t">
+            <p className="text-sm text-muted-foreground">
+              Total: <span className="font-bold">{stats.totalClients.toLocaleString()}</span> subscribers
+            </p>
+          </div>
+        </CardContent>
+      </Card>
 
       <RateLimitStatus />
 

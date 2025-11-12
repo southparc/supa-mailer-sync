@@ -238,6 +238,7 @@ export type Database = {
           retirement_target_age: number | null
           risk_profile: string | null
           saving_balance: number | null
+          subscription_status: string | null
           supabase_auth_id: string | null
           updated_at: string
           zip: string | null
@@ -280,6 +281,7 @@ export type Database = {
           retirement_target_age?: number | null
           risk_profile?: string | null
           saving_balance?: number | null
+          subscription_status?: string | null
           supabase_auth_id?: string | null
           updated_at?: string
           zip?: string | null
@@ -322,6 +324,7 @@ export type Database = {
           retirement_target_age?: number | null
           risk_profile?: string | null
           saving_balance?: number | null
+          subscription_status?: string | null
           supabase_auth_id?: string | null
           updated_at?: string
           zip?: string | null
