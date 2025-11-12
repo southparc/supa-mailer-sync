@@ -4,6 +4,7 @@ import { supabase } from '@/integrations/supabase/client';
 interface SyncStats {
   totalClients: number;
   shadowCount: number;
+  incompleteShadows: number;
   crosswalkCount: number;
   conflictCount: number;
   lastSync: string | null;
@@ -21,6 +22,7 @@ export function useSyncStats() {
   const [stats, setStats] = useState<SyncStats>({
     totalClients: 0,
     shadowCount: 0,
+    incompleteShadows: 0,
     crosswalkCount: 0,
     conflictCount: 0,
     lastSync: null,
@@ -44,12 +46,14 @@ export function useSyncStats() {
       const [
         clientsResult,
         shadowsResult,
+        incompleteShadowsResult,
         crosswalksResult,
         conflictsResult,
         syncStatusResult
       ] = await Promise.all([
         supabase.from('clients').select('id', { count: 'exact', head: true }),
         supabase.from('sync_shadow').select('id', { count: 'exact', head: true }),
+        supabase.from('sync_shadow').select('id', { count: 'exact', head: true }).eq('validation_status', 'incomplete'),
         supabase.from('integration_crosswalk').select('id', { count: 'exact', head: true }),
         supabase.from('sync_conflicts').select('id', { count: 'exact', head: true }).eq('status', 'pending'),
         supabase.from('sync_state').select('value').eq('key', 'sync_status').maybeSingle(),
@@ -57,6 +61,7 @@ export function useSyncStats() {
 
       const totalClients = clientsResult.count || 0;
       const shadowCount = shadowsResult.count || 0;
+      const incompleteShadows = incompleteShadowsResult.count || 0;
       const crosswalkCount = crosswalksResult.count || 0;
       const conflictCount = conflictsResult.count || 0;
 
@@ -66,6 +71,7 @@ export function useSyncStats() {
       setStats({
         totalClients,
         shadowCount,
+        incompleteShadows,
         crosswalkCount,
         conflictCount,
         lastSync: syncStatus?.fullSync?.lastCompletedAt || syncStatus?.lastSync?.timestamp || null,

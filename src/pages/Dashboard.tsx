@@ -104,7 +104,7 @@ export default function Dashboard() {
       // Load stats from available tables
       const [clientsResult, groupsResult, conflictsResult] = await Promise.all([
         supabase.from('clients').select('id', { count: 'exact' }),
-        supabase.from('mailerlite_groups').select('id', { count: 'exact' }),
+        supabase.from('managed_mailerlite_groups').select('id', { count: 'exact' }),
         supabase.from('sync_conflicts').select('id', { count: 'exact' }).eq('status', 'pending'),
       ]);
 
@@ -124,6 +124,13 @@ export default function Dashboard() {
       });
     } catch (error) {
       console.error('Error loading dashboard stats:', error);
+      // Set defaults on error to prevent broken UI
+      setStats({
+        totalClients: 0,
+        totalGroups: 0,
+        pendingConflicts: 0,
+        lastSyncAt: null
+      });
     }
   };
 

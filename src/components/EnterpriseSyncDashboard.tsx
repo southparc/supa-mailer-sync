@@ -538,7 +538,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
       </Card>
 
       {/* Stats Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
@@ -564,8 +564,21 @@ const EnterpriseSyncDashboard: React.FC = () => {
           <CardContent>
             <div className="text-2xl font-bold">{syncPercentage.clientsWithShadow}</div>
             <p className="text-xs text-muted-foreground">
-              {syncPercentage.percentage}% have tracking enabled
+              {syncPercentage.percentage}% tracked
             </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <AlertCircle className="h-4 w-4" />
+              Data Quality
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-warning">{stats.incompleteShadows}</div>
+            <p className="text-xs text-muted-foreground">incomplete records</p>
           </CardContent>
         </Card>
 

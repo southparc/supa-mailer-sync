@@ -267,9 +267,14 @@ async function createShadowsBulk(
 
     // Track incomplete shadows (missing either client or subscriber data)
     const isIncomplete = !clientData || !subscriberData;
+    const missingFields = [];
+    
+    if (!clientData) missingFields.push('client_data');
+    if (!subscriberData) missingFields.push('mailerlite_data');
+    
     if (isIncomplete) {
       incompleteCount++;
-      console.log(`⚠️  Incomplete shadow for ${email}: ${!clientData ? 'missing client data' : 'missing MailerLite data'}`);
+      console.log(`⚠️  Incomplete shadow for ${email}: ${missingFields.join(', ')}`);
     }
 
     // Build snapshot with both client and subscriber data
@@ -310,9 +315,20 @@ async function createShadowsBulk(
       };
     }
 
+    // Build data quality object
+    const dataQuality = {
+      missingFields: missingFields,
+      completenessScore: isIncomplete ? 0.5 : 1.0,
+      hasClientData: !!clientData,
+      hasSubscriberData: !!subscriberData
+    };
+
     shadows.push({
       email: email,
       snapshot: snapshot,
+      validation_status: isIncomplete ? 'incomplete' : 'complete',
+      data_quality: dataQuality,
+      last_validated_at: new Date().toISOString(),
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
     });

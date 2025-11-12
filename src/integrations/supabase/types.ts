@@ -1001,24 +1001,33 @@ export type Database = {
       sync_shadow: {
         Row: {
           created_at: string
+          data_quality: Json | null
           email: string
           id: string
+          last_validated_at: string | null
           snapshot: Json
           updated_at: string
+          validation_status: string | null
         }
         Insert: {
           created_at?: string
+          data_quality?: Json | null
           email: string
           id?: string
+          last_validated_at?: string | null
           snapshot?: Json
           updated_at?: string
+          validation_status?: string | null
         }
         Update: {
           created_at?: string
+          data_quality?: Json | null
           email?: string
           id?: string
+          last_validated_at?: string | null
           snapshot?: Json
           updated_at?: string
+          validation_status?: string | null
         }
         Relationships: []
       }
