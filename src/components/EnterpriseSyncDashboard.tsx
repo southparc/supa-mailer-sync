@@ -201,7 +201,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
     toast({
       title: "Full Sync Started",
-      description: "Fetching all subscribers from MailerLite (this may take 15-20 minutes)...",
+      description: "Fetching all subscribers from MailerLite with auto-retry (15-20 min)...",
     });
 
     const result = await runSync({ 
@@ -211,6 +211,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
     
     if (result?.success) {
       refreshStats();
+      loadBackfillProgress();
       toast({
         title: "Full Sync Complete",
         description: `Processed ${result.recordsProcessed} records. All subscriber statuses updated.`,
@@ -518,9 +519,18 @@ const EnterpriseSyncDashboard: React.FC = () => {
             <RefreshCw className="h-3 w-3 mr-1" />
             Test
           </Button>
-          <Button onClick={handleFullSync} size="sm" disabled={syncing || duplicates.length > 0}>
+          <Button 
+            onClick={() => setShowBackfillDialog(true)} 
+            size="sm" 
+            disabled={backfillStatus === 'running'}
+            variant="secondary"
+          >
             <Database className="h-3 w-3 mr-1" />
-            Full Sync
+            {backfillStatus === 'completed' ? 'Resume' : 'Run'} Backfill
+          </Button>
+          <Button onClick={handleFullSync} size="sm" disabled={syncing || duplicates.length > 0}>
+            <Mail className="h-3 w-3 mr-1" />
+            Full Sync (w/ retry)
           </Button>
         </CardContent>
       </Card>

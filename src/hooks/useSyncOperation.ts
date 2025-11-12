@@ -79,49 +79,71 @@ export function useSyncOperation() {
   }, [toast]);
 
   const runSync = useCallback(async (options: SyncOptions): Promise<SyncResult | null> => {
-    try {
-      setSyncing(true);
-      setProgress(0);
-      setStatus(`Starting ${options.direction} sync...`);
+    const maxRetries = 3;
+    let attempt = 0;
 
-      const { data, error } = await supabase.functions.invoke('enterprise-sync', {
-        body: {
-          direction: options.direction,
-          maxRecords: options.maxRecords || 500,
-          maxDurationMs: 120000,
-          dryRun: options.dryRun || false,
+    const executeWithRetry = async (): Promise<SyncResult | null> => {
+      try {
+        setSyncing(true);
+        setProgress(0);
+        setStatus(attempt > 0 
+          ? `Retrying ${options.direction} sync (attempt ${attempt + 1}/${maxRetries + 1})...`
+          : `Starting ${options.direction} sync...`
+        );
+
+        const { data, error } = await supabase.functions.invoke('enterprise-sync', {
+          body: {
+            direction: options.direction,
+            maxRecords: options.maxRecords || 500,
+            maxDurationMs: 120000,
+            dryRun: options.dryRun || false,
+          }
+        });
+
+        if (error) {
+          throw new Error(error.message || 'Sync failed');
         }
-      });
 
-      if (error) {
-        throw new Error(error.message || 'Sync failed');
+        const result = data || {};
+        setProgress(100);
+        setStatus('Sync completed');
+
+        toast({
+          title: options.dryRun ? 'Sync Preview Complete' : 'Sync Complete',
+          description: `Processed ${result.recordsProcessed || 0} records, applied ${result.updatesApplied || 0} updates`,
+        });
+
+        return {
+          success: true,
+          recordsProcessed: result.recordsProcessed || 0,
+          updatesApplied: result.updatesApplied || 0,
+          conflictsDetected: result.conflictsDetected || 0,
+          done: result.done || false,
+          message: result.message || 'Sync completed successfully',
+        };
+      } catch (error: any) {
+        console.error(`Sync error (attempt ${attempt + 1}):`, error);
+        
+        if (attempt < maxRetries) {
+          attempt++;
+          const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 8000); // Exponential backoff: 1s, 2s, 4s max
+          setStatus(`Sync failed, retrying in ${delayMs / 1000}s...`);
+          
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          return executeWithRetry();
+        }
+        
+        toast({
+          title: 'Sync Failed',
+          description: `Failed after ${maxRetries + 1} attempts: ${error.message || 'Unknown error'}`,
+          variant: 'destructive',
+        });
+        return null;
       }
+    };
 
-      const result = data || {};
-      setProgress(100);
-      setStatus('Sync completed');
-
-      toast({
-        title: options.dryRun ? 'Sync Preview Complete' : 'Sync Complete',
-        description: `Processed ${result.recordsProcessed || 0} records, applied ${result.updatesApplied || 0} updates`,
-      });
-
-      return {
-        success: true,
-        recordsProcessed: result.recordsProcessed || 0,
-        updatesApplied: result.updatesApplied || 0,
-        conflictsDetected: result.conflictsDetected || 0,
-        done: result.done || false,
-        message: result.message || 'Sync completed successfully',
-      };
-    } catch (error: any) {
-      console.error('Sync error:', error);
-      toast({
-        title: 'Sync Failed',
-        description: error.message || 'An error occurred during sync',
-        variant: 'destructive',
-      });
-      return null;
+    try {
+      return await executeWithRetry();
     } finally {
       setSyncing(false);
       setProgress(0);
