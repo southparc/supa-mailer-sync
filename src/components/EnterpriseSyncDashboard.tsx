@@ -254,6 +254,32 @@ const EnterpriseSyncDashboard: React.FC = () => {
     }
   };
 
+  const handleGapFill = async () => {
+    try {
+      toast({
+        title: "Gap Fill Started",
+        description: "Creating placeholder shadows for all remaining clients...",
+      });
+      const { error } = await supabase.functions.invoke('fill-missing-shadows', {
+        body: { batchSize: 1000 }
+      });
+      if (error) throw error;
+      await loadBackfillProgress();
+      refreshStats();
+      toast({
+        title: "Gap Fill Running",
+        description: "Placeholders are being inserted in the background.",
+      });
+    } catch (error: any) {
+      console.error('Gap fill error:', error);
+      toast({
+        title: "Gap Fill Failed",
+        description: error.message || 'Could not start gap fill',
+        variant: "destructive",
+      });
+    }
+  };
+
   const handlePauseBackfill = async () => {
     try {
       // Get current sync_status
@@ -425,9 +451,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
               <strong>{backfillStatus === 'completed' ? 'Backfill incomplete' : 'Initial backfill required'}</strong> - 
               {syncPercentage.percentage}% coverage ({syncPercentage.clientsWithShadow}/{syncPercentage.totalClients})
             </span>
-            <Button onClick={() => setShowBackfillDialog(true)} size="sm">
-              {backfillStatus === 'completed' ? 'Resume' : 'Start'}
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button onClick={() => setShowBackfillDialog(true)} size="sm">
+                {backfillStatus === 'completed' ? 'Resume' : 'Start'}
+              </Button>
+              <Button onClick={handleGapFill} size="sm" variant="secondary">
+                Fill Missing Shadows
+              </Button>
+            </div>
           </AlertDescription>
         </Alert>
       )}
