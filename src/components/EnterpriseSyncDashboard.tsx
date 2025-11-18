@@ -53,6 +53,14 @@ interface BackfillProgress {
   startedAt?: string;
   completedAt?: string;
   paused?: boolean;
+  clientsProcessed?: number;
+  totalClients?: number;
+  summary?: {
+    created?: number;
+    errors?: number;
+    durationSec?: number;
+    finalCoverage?: string;
+  };
 }
 
 const EnterpriseSyncDashboard: React.FC = () => {
@@ -141,6 +149,9 @@ const EnterpriseSyncDashboard: React.FC = () => {
           startedAt: backfillData.startedAt,
           completedAt: backfillData.completedAt,
           paused: backfillData.paused || false,
+          clientsProcessed: backfillData.clientsProcessed,
+          totalClients: backfillData.totalClients,
+          summary: backfillData.summary,
         });
 
         // Determine status with freshness check
@@ -151,7 +162,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
         if (backfillData.paused === true) {
           derivedStatus = 'paused';
-        } else if (backfillData.status === 'completed' || backfillData.phase === 'Completed') {
+        } else if (backfillData.status === 'completed' || backfillData.phase === 'Completed' || backfillData.phase === 'Gap fill completed') {
           derivedStatus = 'completed';
         } else if (backfillData.status === 'failed') {
           derivedStatus = 'failed';
@@ -165,6 +176,17 @@ const EnterpriseSyncDashboard: React.FC = () => {
         }
 
         setBackfillStatus(derivedStatus);
+
+        // Show completion toast if just completed
+        if (derivedStatus === 'completed' && backfillData.summary && backfillStatus !== 'completed') {
+          const isGapFill = backfillData.phase?.toLowerCase().includes('gap fill');
+          toast({
+            title: isGapFill ? "Gap Fill Complete" : "Backfill Complete",
+            description: isGapFill 
+              ? `Created ${backfillData.summary.created || 0} placeholder shadows. Final coverage: ${backfillData.summary.finalCoverage || 'N/A'}`
+              : `Created ${backfillData.summary.created || backfillData.shadowsCreated} shadows in ${backfillData.summary.durationSec || 0}s`,
+          });
+        }
       } else {
         setBackfillStatus('idle');
       }
@@ -463,12 +485,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
         </Alert>
       )}
 
-      {/* Backfill Progress */}
+      {/* Backfill/Gap-Fill Progress */}
       {backfillStatus === 'running' && (
         <Card className="py-2">
           <CardHeader className="pb-2">
             <div className="flex items-center justify-between">
-              <CardTitle className="text-base">Backfill in Progress</CardTitle>
+              <CardTitle className="text-base">
+                {backfillProgress.phase?.toLowerCase().includes('gap fill') ? 'Gap Fill' : 'Backfill'} in Progress
+              </CardTitle>
               <Button onClick={handlePauseBackfill} variant="outline" size="sm">
                 <Pause className="h-3 w-3 mr-1" />
                 Pause
@@ -476,7 +500,14 @@ const EnterpriseSyncDashboard: React.FC = () => {
             </div>
           </CardHeader>
           <CardContent className="space-y-2">
-            <Progress value={(backfillProgress.shadowsCreated / stats.totalClients) * 100} className="h-1.5" />
+            <Progress 
+              value={
+                (backfillProgress as any).clientsProcessed && (backfillProgress as any).totalClients
+                  ? ((backfillProgress as any).clientsProcessed / (backfillProgress as any).totalClients) * 100
+                  : (backfillProgress.shadowsCreated / stats.totalClients) * 100
+              } 
+              className="h-1.5" 
+            />
             <div className="grid grid-cols-3 gap-2 text-xs">
               <div>
                 <p className="text-muted-foreground">Phase</p>
@@ -484,14 +515,24 @@ const EnterpriseSyncDashboard: React.FC = () => {
               </div>
               <div>
                 <p className="text-muted-foreground">Progress</p>
-                <p className="font-medium">{backfillProgress.shadowsCreated}/{stats.totalClients}</p>
+                <p className="font-medium">
+                  {(backfillProgress as any).clientsProcessed && (backfillProgress as any).totalClients
+                    ? `${(backfillProgress as any).clientsProcessed}/${(backfillProgress as any).totalClients} clients`
+                    : `${backfillProgress.shadowsCreated}/${stats.totalClients}`
+                  }
+                </p>
               </div>
-              {backfillProgress.totalBatches > 0 && (
+              {backfillProgress.totalBatches > 0 ? (
                 <div>
                   <p className="text-muted-foreground">Batch</p>
                   <p className="font-medium">{backfillProgress.currentBatch}/{backfillProgress.totalBatches}</p>
                 </div>
-              )}
+              ) : (backfillProgress.errors || 0) > 0 ? (
+                <div>
+                  <p className="text-muted-foreground">Errors</p>
+                  <p className="font-medium text-destructive">{backfillProgress.errors}</p>
+                </div>
+              ) : null}
             </div>
           </CardContent>
         </Card>
