@@ -91,11 +91,11 @@ export function useSyncOperation() {
           : `Starting ${options.direction} sync...`
         );
 
-        const { data, error } = await supabase.functions.invoke('enterprise-sync', {
+        const { data, error } = await supabase.functions.invoke('smart-sync', {
           body: {
-            direction: options.direction,
-            maxRecords: options.maxRecords || 500,
-            maxDurationMs: 120000,
+            mode: options.direction === 'bidirectional' ? 'bidirectional' : 
+                  options.direction === 'mailerlite-to-supabase' ? 'BtoA' : 'AtoB',
+            emails: [], // Empty array means process all
             dryRun: options.dryRun || false,
           }
         });
