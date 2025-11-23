@@ -6,11 +6,17 @@ import { StructuredLogsViewer } from './monitoring/StructuredLogsViewer';
 import { PerformanceMetrics } from './monitoring/PerformanceMetrics';
 import { StallDetectionAlerts } from './monitoring/StallDetectionAlerts';
 import { BackfillProgressMonitor } from './monitoring/BackfillProgressMonitor';
+import { BackfillTriggerButton } from './monitoring/BackfillTriggerButton';
 import { Activity } from 'lucide-react';
 
 export const MonitoringDashboard: React.FC = () => {
   return (
     <div className="space-y-6">
+      {/* Backfill Controls */}
+      <div className="flex justify-end">
+        <BackfillTriggerButton />
+      </div>
+
       {/* Backfill Progress Monitor - Shows when active */}
       <BackfillProgressMonitor />
       
