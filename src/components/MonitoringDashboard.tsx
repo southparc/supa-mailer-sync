@@ -5,11 +5,15 @@ import { SyncHealthIndicators } from './monitoring/SyncHealthIndicators';
 import { StructuredLogsViewer } from './monitoring/StructuredLogsViewer';
 import { PerformanceMetrics } from './monitoring/PerformanceMetrics';
 import { StallDetectionAlerts } from './monitoring/StallDetectionAlerts';
+import { BackfillProgressMonitor } from './monitoring/BackfillProgressMonitor';
 import { Activity } from 'lucide-react';
 
 export const MonitoringDashboard: React.FC = () => {
   return (
     <div className="space-y-6">
+      {/* Backfill Progress Monitor - Shows when active */}
+      <BackfillProgressMonitor />
+      
       {/* Stall Detection Alerts - Always visible at top */}
       <StallDetectionAlerts />
 
