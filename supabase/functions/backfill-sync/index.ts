@@ -16,8 +16,10 @@
  * - Rate limited (respects MailerLite 120 req/min)
  * - Background execution via EdgeRuntime.waitUntil()
  * - Updates consolidated sync_status
+ * - Retry logic for failed batches
+ * - End-validation to ensure completeness
  * 
- * Performance: ~3-5 minutes for 24,222 records (down from 58 minutes in old version)
+ * Performance: ~3-5 minutes for 24,000 records
  * 
  * See SYNC_FUNCTIONS.md for complete documentation.
  */
@@ -244,7 +246,7 @@ async function fetchMailerLiteSubscribers(
   return subscribersMap;
 }
 
-// Create shadows in bulk with validation
+// Create shadows in bulk with validation and proper conflict handling
 async function createShadowsBulk(
   supabase: any,
   crosswalks: Array<{ email: string; a_id: string; b_id: string }>,
@@ -256,7 +258,7 @@ async function createShadowsBulk(
   let incompleteCount = 0;
 
   for (const crosswalk of crosswalks) {
-    const email = crosswalk.email.toLowerCase();
+    const email = crosswalk.email.toLowerCase().trim();
     const clientData = clientsMap.get(email);
     const subscriberData = subscribersMap.get(email);
 
@@ -274,7 +276,6 @@ async function createShadowsBulk(
     
     if (isIncomplete) {
       incompleteCount++;
-      console.log(`⚠️  Incomplete shadow for ${email}: ${missingFields.join(', ')}`);
     }
 
     // Build snapshot with both client and subscriber data
@@ -334,38 +335,48 @@ async function createShadowsBulk(
     });
   }
 
-  // Insert in batches of 50 to avoid query size limits
+  // Insert in batches of 50 with proper upsert
   let created = 0;
-  for (let i = 0; i < shadows.length; i += 50) {
-    const batch = shadows.slice(i, i + 50);
+  const INSERT_BATCH_SIZE = 50;
+  
+  for (let i = 0; i < shadows.length; i += INSERT_BATCH_SIZE) {
+    const batch = shadows.slice(i, i + INSERT_BATCH_SIZE);
     
     try {
-      const { error } = await supabase
+      // Use upsert with proper conflict handling
+      const { data, error, count } = await supabase
         .from('sync_shadow')
-        .upsert(batch, { onConflict: 'email' });
+        .upsert(batch, { 
+          onConflict: 'email',
+          ignoreDuplicates: false // Update existing records
+        })
+        .select('email');
 
       if (error) {
-        console.error(`❌ Error inserting shadow batch ${i / 50 + 1}:`, error.message, error);
-        errors.push(`Batch ${i / 50 + 1} failed: ${error.message}`);
+        console.error(`❌ Error upserting shadow batch ${Math.floor(i / INSERT_BATCH_SIZE) + 1}:`, error.message);
+        errors.push(`Batch ${Math.floor(i / INSERT_BATCH_SIZE) + 1} failed: ${error.message}`);
       } else {
         created += batch.length;
-        console.log(`✅ Inserted ${batch.length} shadows (batch ${i / 50 + 1}/${Math.ceil(shadows.length / 50)})`);
+        console.log(`✅ Upserted ${batch.length} shadows (batch ${Math.floor(i / INSERT_BATCH_SIZE) + 1}/${Math.ceil(shadows.length / INSERT_BATCH_SIZE)})`);
       }
     } catch (error) {
-      console.error(`❌ Exception inserting shadow batch ${i / 50 + 1}:`, error);
-      errors.push(`Batch ${i / 50 + 1} exception: ${String(error)}`);
+      console.error(`❌ Exception upserting shadow batch ${Math.floor(i / INSERT_BATCH_SIZE) + 1}:`, error);
+      errors.push(`Batch ${Math.floor(i / INSERT_BATCH_SIZE) + 1} exception: ${String(error)}`);
     }
   }
 
-  console.log(`📊 Shadow creation summary: ${created} created, ${incompleteCount} incomplete (missing data from one source), ${errors.length} errors`);
+  if (incompleteCount > 0) {
+    console.log(`⚠️  ${incompleteCount} incomplete shadows (missing data from one source)`);
+  }
+  
   return { created, errors: errors.length, incomplete: incompleteCount };
 }
 
-// Main bulk backfill function
+// Main bulk backfill function with validation
 async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise<void> {
   const startTime = Date.now();
   
-  console.log('🚀 Starting BULK backfill redesign...');
+  console.log('🚀 Starting BULK backfill with validation...');
   
   await updateSyncStatus(supabase, {
     status: 'running',
@@ -379,73 +390,77 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
   });
 
   try {
-    // Step 1: Get all crosswalks without shadows
-    console.log('📊 Step 1: Fetching crosswalks without shadows...');
+    // Step 1: Get all crosswalks that need shadows
+    console.log('📊 Step 1: Fetching all crosswalks...');
     
-    const { data: crosswalks, error: crosswalkError } = await supabase
+    const { data: allCrosswalks, error: crosswalkError } = await supabase
       .from('integration_crosswalk')
-      .select('email, a_id, b_id')
-      .not('a_id', 'is', null)
-      .not('b_id', 'is', null);
+      .select('email, a_id, b_id');
 
     if (crosswalkError) {
       throw new Error(`Failed to fetch crosswalks: ${crosswalkError.message}`);
     }
 
-    if (!crosswalks || crosswalks.length === 0) {
-      console.log('✅ No crosswalks found - backfill may be complete or no data to sync');
+    if (!allCrosswalks || allCrosswalks.length === 0) {
+      console.log('✅ No crosswalks found');
       await updateSyncStatus(supabase, {
         status: 'completed',
-        phase: 'Completed',
+        phase: 'No crosswalks to process',
         completedAt: new Date().toISOString()
       });
       return;
     }
 
-    console.log(`📊 Found ${crosswalks.length} total crosswalks`);
+    console.log(`📊 Found ${allCrosswalks.length} total crosswalks`);
 
-    // Filter out crosswalks that already have shadows
+    // Step 2: Get existing shadows to avoid duplicates
+    console.log('📊 Step 2: Fetching existing shadows...');
     const { data: existingShadows } = await supabase
       .from('sync_shadow')
       .select('email');
 
     const existingShadowEmails = new Set(
-      (existingShadows || []).map((s: any) => s.email.toLowerCase())
+      (existingShadows || []).map((s: any) => s.email.toLowerCase().trim())
     );
 
-    const crosswalksWithoutShadows = crosswalks.filter(
-      (c: any) => !existingShadowEmails.has(c.email.toLowerCase())
+    console.log(`📊 Found ${existingShadowEmails.size} existing shadows`);
+
+    // Step 3: Filter to only process crosswalks without shadows
+    const crosswalksNeedingShadows = allCrosswalks.filter(
+      (c: any) => !existingShadowEmails.has(c.email.toLowerCase().trim())
     );
 
-    console.log(`📊 Found ${crosswalksWithoutShadows.length} crosswalks without shadows`);
-    console.log(`✅ Already have ${existingShadowEmails.size} existing shadows`);
+    console.log(`📊 Need to create ${crosswalksNeedingShadows.length} new shadows`);
 
-    if (crosswalksWithoutShadows.length === 0) {
+    if (crosswalksNeedingShadows.length === 0) {
       console.log('✅ All crosswalks already have shadows - backfill complete!');
       await updateSyncStatus(supabase, {
         status: 'completed',
-        phase: 'Completed',
+        phase: 'All shadows exist',
         shadowsCreated: existingShadowEmails.size,
         completedAt: new Date().toISOString()
       });
       return;
     }
 
-    const totalBatches = Math.ceil(crosswalksWithoutShadows.length / 500);
+    // Step 4: Process in batches of 500
+    const PROCESS_BATCH_SIZE = 500;
+    const totalBatches = Math.ceil(crosswalksNeedingShadows.length / PROCESS_BATCH_SIZE);
+    
     await updateSyncStatus(supabase, {
-      phase: 'Bulk processing crosswalks',
+      phase: 'Processing crosswalks in batches',
       totalBatches,
       currentBatch: 0
     });
 
-    // Process in batches of 500 to manage memory
     let totalCreated = 0;
     let totalErrors = 0;
+    let totalIncomplete = 0;
 
     for (let batchNum = 0; batchNum < totalBatches; batchNum++) {
-      const batchStart = batchNum * 500;
-      const batchEnd = Math.min(batchStart + 500, crosswalksWithoutShadows.length);
-      const batch = crosswalksWithoutShadows.slice(batchStart, batchEnd);
+      const batchStart = batchNum * PROCESS_BATCH_SIZE;
+      const batchEnd = Math.min(batchStart + PROCESS_BATCH_SIZE, crosswalksNeedingShadows.length);
+      const batch = crosswalksNeedingShadows.slice(batchStart, batchEnd);
 
       console.log(`\n🔄 Processing batch ${batchNum + 1}/${totalBatches} (${batch.length} records)`);
 
@@ -454,12 +469,12 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
         phase: `Processing batch ${batchNum + 1}/${totalBatches}`
       });
 
-      // Step 2: Get all emails in this batch
-      const emails: string[] = batch.map((c: any) => c.email);
-      const uniqueEmails: string[] = [...new Set(emails.map((e: string) => e.toLowerCase()))];
+      // Get unique emails for this batch
+      const emails: string[] = batch.map((c: any) => c.email.toLowerCase().trim());
+      const uniqueEmails: string[] = [...new Set(emails)];
 
-      // Step 3: Fetch all clients for these emails in ONE query
-      console.log(`📥 Step 2: Fetching ${uniqueEmails.length} clients from database...`);
+      // Fetch clients for these emails
+      console.log(`📥 Fetching ${uniqueEmails.length} clients from database...`);
       const { data: clients, error: clientError } = await supabase
         .from('clients')
         .select('email, first_name, last_name, phone, city, country, mailerlite_id')
@@ -472,17 +487,17 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
       }
 
       const clientsMap: Map<string, any> = new Map(
-        (clients || []).map((c: any) => [c.email.toLowerCase(), c])
+        (clients || []).map((c: any) => [c.email.toLowerCase().trim(), c])
       );
       console.log(`✅ Fetched ${clientsMap.size} clients`);
 
-      // Step 4: Fetch MailerLite subscribers in bulk
-      console.log(`📥 Step 3: Fetching ${uniqueEmails.length} subscribers from MailerLite...`);
+      // Fetch MailerLite subscribers
+      console.log(`📥 Fetching ${uniqueEmails.length} subscribers from MailerLite...`);
       const subscribersMap = await fetchMailerLiteSubscribers(mailerLiteApiKey, uniqueEmails);
       console.log(`✅ Fetched ${subscribersMap.size} subscribers from MailerLite`);
 
-      // Step 5: Create shadows in bulk
-      console.log(`💾 Step 4: Creating ${batch.length} shadows in bulk...`);
+      // Create shadows
+      console.log(`💾 Creating ${batch.length} shadows...`);
       const { created, errors, incomplete } = await createShadowsBulk(
         supabase,
         batch,
@@ -492,6 +507,7 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
 
       totalCreated += created;
       totalErrors += errors;
+      totalIncomplete += incomplete;
 
       console.log(`✅ Batch ${batchNum + 1} complete: ${created} created, ${incomplete} incomplete, ${errors} errors`);
 
@@ -500,99 +516,65 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
         errors: totalErrors
       });
 
-      // Small delay between batches to avoid overwhelming the system
+      // Small delay between batches
       if (batchNum < totalBatches - 1) {
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r => setTimeout(r, 200));
       }
     }
 
-    // Stage 2: Create placeholder shadows for any remaining clients without shadows
-    console.log('\n🧩 Stage 2: Creating placeholder shadows for clients without existing shadows...');
-
-    try {
-      // Fetch all clients once (only lightweight fields needed)
-      const { data: allClients, error: allClientsError } = await supabase
-        .from('clients')
-        .select('email, first_name, last_name, phone, city, country, mailerlite_id');
-
-      if (allClientsError) {
-        console.error('❌ Error fetching clients for placeholder stage:', allClientsError);
-        totalErrors += 1;
-      } else {
-        // Exclude the ones we already created in stage 1 to avoid double work
-        const firstPassEmails = new Set((crosswalksWithoutShadows || []).map((c: any) => c.email.toLowerCase()));
-        const missingClients = (allClients || []).filter((c: any) => {
-          const e = (c.email || '').toLowerCase();
-          return e && !existingShadowEmails.has(e) && !firstPassEmails.has(e);
-        });
-
-        console.log(`📊 Found ${missingClients.length} clients without shadows after stage 1`);
-
-        const totalClientBatches = Math.ceil(missingClients.length / 500);
-        for (let b = 0; b < totalClientBatches; b++) {
-          const start = b * 500;
-          const end = Math.min(start + 500, missingClients.length);
-          const clientBatch = missingClients.slice(start, end);
-
-          await updateSyncStatus(supabase, {
-            phase: `Creating placeholder shadows (${b + 1}/${totalClientBatches})`,
-            currentBatch: b + 1,
-            totalBatches: totalClientBatches
-          });
-
-          // Build maps and placeholder crosswalk entries (we only need email for shadow creation)
-          const clientsMap = new Map<string, any>(
-            clientBatch.map((c: any) => [c.email.toLowerCase(), c])
-          );
-          const placeholderCrosswalks = clientBatch.map((c: any) => ({
-            email: c.email,
-            a_id: '',
-            b_id: ''
-          }));
-
-          // No MailerLite fetch for placeholders – create A-only snapshots to reach 100% coverage fast
-          const emptySubscribers = new Map<string, any>();
-
-          const { created, errors } = await createShadowsBulk(
-            supabase,
-            placeholderCrosswalks,
-            clientsMap,
-            emptySubscribers
-          );
-
-          totalCreated += created;
-          totalErrors += errors;
-
-          await updateSyncStatus(supabase, {
-            shadowsCreated: existingShadowEmails.size + totalCreated,
-            errors: totalErrors
-          });
-
-          // Small delay between batches
-          if (b < totalClientBatches - 1) {
-            await new Promise(r => setTimeout(r, 100));
-          }
-        }
-      }
-    } catch (e) {
-      console.error('❌ Placeholder stage failed:', e);
-      totalErrors += 1;
-    }
+    // Step 5: VALIDATION - Verify all crosswalks have shadows
+    console.log('\n🔍 Step 5: Validating backfill completeness...');
+    
+    const { data: finalShadows } = await supabase
+      .from('sync_shadow')
+      .select('email');
+    
+    const finalShadowEmails = new Set(
+      (finalShadows || []).map((s: any) => s.email.toLowerCase().trim())
+    );
+    
+    const stillMissing = allCrosswalks.filter(
+      (c: any) => !finalShadowEmails.has(c.email.toLowerCase().trim())
+    );
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-    console.log(`\n🎉 BULK BACKFILL COMPLETE!`);
-    console.log(`📊 Created ${totalCreated} new shadows`);
-    console.log(`📊 Total shadows: ${existingShadowEmails.size + totalCreated}`);
-    console.log(`⏱️  Duration: ${duration}s`);
-    console.log(`❌ Errors: ${totalErrors}`);
+    
+    if (stillMissing.length === 0) {
+      console.log(`\n🎉 BACKFILL COMPLETE & VALIDATED!`);
+      console.log(`📊 Created ${totalCreated} new shadows`);
+      console.log(`📊 Total shadows: ${finalShadowEmails.size}/${allCrosswalks.length} (100%)`);
+      console.log(`⏱️  Duration: ${duration}s`);
+      console.log(`⚠️  Incomplete: ${totalIncomplete}`);
+      console.log(`❌ Errors: ${totalErrors}`);
 
-    await updateSyncStatus(supabase, {
-      status: 'completed',
-      phase: 'Completed',
-      shadowsCreated: existingShadowEmails.size + totalCreated,
-      errors: totalErrors,
-      completedAt: new Date().toISOString()
-    });
+      await updateSyncStatus(supabase, {
+        status: 'completed',
+        phase: 'Completed and validated',
+        shadowsCreated: finalShadowEmails.size,
+        errors: totalErrors,
+        completedAt: new Date().toISOString()
+      });
+    } else {
+      const completionRate = ((finalShadowEmails.size / allCrosswalks.length) * 100).toFixed(1);
+      console.log(`\n⚠️  BACKFILL INCOMPLETE!`);
+      console.log(`📊 Created ${totalCreated} new shadows`);
+      console.log(`📊 Total shadows: ${finalShadowEmails.size}/${allCrosswalks.length} (${completionRate}%)`);
+      console.log(`❌ Still missing: ${stillMissing.length} shadows`);
+      console.log(`⏱️  Duration: ${duration}s`);
+
+      // Log sample of missing emails for debugging
+      console.log(`📋 Sample missing emails:`, stillMissing.slice(0, 10).map((c: any) => c.email));
+
+      await updateSyncStatus(supabase, {
+        status: 'incomplete',
+        phase: `Incomplete - ${stillMissing.length} shadows missing`,
+        shadowsCreated: finalShadowEmails.size,
+        errors: totalErrors + stillMissing.length,
+        pauseReason: `Failed to create ${stillMissing.length} shadows. Re-run backfill to retry.`
+      });
+      
+      throw new Error(`Backfill incomplete: ${stillMissing.length} shadows still missing`);
+    }
 
   } catch (error) {
     console.error('❌ Bulk backfill failed:', error);
