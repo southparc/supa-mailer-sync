@@ -178,8 +178,8 @@ async function fetchMailerLiteSubscribers(
   let notFoundCount = 0;
   let errorCount = 0;
   
-  // Process in batches of 100 to respect API limits
-  const BATCH_SIZE = 100;
+  // Process in batches of 50 to respect MailerLite API limit
+  const BATCH_SIZE = 50;
   
   for (let i = 0; i < emails.length; i += BATCH_SIZE) {
     const batchEmails = emails.slice(i, i + BATCH_SIZE);
