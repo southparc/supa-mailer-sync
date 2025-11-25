@@ -22,8 +22,15 @@ import {
   CheckCircle2,
   Users,
   TrendingUp,
-  Clock
+  Clock,
+  Info
 } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { RadialBarChart, RadialBar, PolarAngleAxis } from 'recharts';
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
@@ -630,7 +637,29 @@ const EnterpriseSyncDashboard: React.FC = () => {
               </RadialBarChart>
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-muted-foreground">Sync Coverage</p>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <p className="text-xs font-medium text-muted-foreground flex items-center gap-1 cursor-help">
+                      Sync Coverage
+                      <Info className="h-3 w-3" />
+                    </p>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-xs">
+                    <p className="font-semibold mb-1">What is Sync Coverage?</p>
+                    <p className="text-xs mb-2">
+                      The percentage of clients from <strong>integration_crosswalk</strong> that have shadow records created.
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      <strong>Why might some be missing?</strong><br/>
+                      • Backfill process hasn't completed yet<br/>
+                      • Invalid or malformed email addresses<br/>
+                      • Client not found in MailerLite<br/>
+                      • API errors during synchronization
+                    </p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
               <p className="text-lg font-bold">{stats.shadowCount.toLocaleString()}</p>
               <p className="text-xs text-muted-foreground truncate">of {stats.crosswalkCount.toLocaleString()}</p>
             </div>
