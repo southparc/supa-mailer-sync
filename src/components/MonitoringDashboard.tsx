@@ -7,6 +7,7 @@ import { PerformanceMetrics } from './monitoring/PerformanceMetrics';
 import { StallDetectionAlerts } from './monitoring/StallDetectionAlerts';
 import { BackfillProgressMonitor } from './monitoring/BackfillProgressMonitor';
 import { BackfillTriggerButton } from './monitoring/BackfillTriggerButton';
+import { DataQualityDashboard } from './monitoring/DataQualityDashboard';
 import { Activity } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { useSyncStats } from '@/hooks/useSyncStats';
@@ -99,11 +100,16 @@ export const MonitoringDashboard: React.FC = () => {
       </Card>
 
       {/* Detailed Monitoring Tabs */}
-      <Tabs defaultValue="performance" className="space-y-4">
-        <TabsList className="grid w-full grid-cols-2">
-          <TabsTrigger value="performance">Performance Metrics</TabsTrigger>
-          <TabsTrigger value="logs">Structured Logs</TabsTrigger>
+      <Tabs defaultValue="data-quality" className="space-y-4">
+        <TabsList className="grid w-full grid-cols-3">
+          <TabsTrigger value="data-quality">Data Quality</TabsTrigger>
+          <TabsTrigger value="performance">Performance</TabsTrigger>
+          <TabsTrigger value="logs">Logs</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="data-quality" className="space-y-4">
+          <DataQualityDashboard />
+        </TabsContent>
 
         <TabsContent value="performance" className="space-y-4">
           <PerformanceMetrics />
