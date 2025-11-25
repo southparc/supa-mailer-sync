@@ -135,6 +135,11 @@ async function updateSyncStatus(
     completedAt?: string;
     paused?: boolean;
     pauseReason?: string;
+    completionRate?: string;
+    incompleteCount?: number;
+    missingCount?: number;
+    missingBreakdown?: Record<string, number>;
+    sampleMissingEmails?: string[];
   }
 ): Promise<void> {
   const { data: currentStatus } = await supabase
@@ -252,10 +257,11 @@ async function createShadowsBulk(
   crosswalks: Array<{ email: string; a_id: string; b_id: string }>,
   clientsMap: Map<string, any>,
   subscribersMap: Map<string, any>
-): Promise<{ created: number; errors: number; incomplete: number }> {
+): Promise<{ created: number; errors: number; incomplete: number; missingReasons: Map<string, string[]> }> {
   const shadows = [];
   const errors: string[] = [];
   let incompleteCount = 0;
+  const missingReasons = new Map<string, string[]>(); // Track WHY shadows are incomplete
 
   for (const crosswalk of crosswalks) {
     const email = crosswalk.email.toLowerCase().trim();
@@ -264,6 +270,8 @@ async function createShadowsBulk(
 
     if (!clientData && !subscriberData) {
       errors.push(`No data found for ${email}`);
+      if (!missingReasons.has('no_data')) missingReasons.set('no_data', []);
+      missingReasons.get('no_data')!.push(email);
       continue;
     }
 
@@ -271,8 +279,23 @@ async function createShadowsBulk(
     const isIncomplete = !clientData || !subscriberData;
     const missingFields = [];
     
-    if (!clientData) missingFields.push('client_data');
-    if (!subscriberData) missingFields.push('mailerlite_data');
+    if (!clientData) {
+      missingFields.push('client_data');
+    }
+    if (!subscriberData) {
+      missingFields.push('mailerlite_data');
+      // Categorize why MailerLite data is missing
+      if (!crosswalk.b_id) {
+        if (!missingReasons.has('no_b_id')) missingReasons.set('no_b_id', []);
+        missingReasons.get('no_b_id')!.push(email);
+      } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        if (!missingReasons.has('malformed_email')) missingReasons.set('malformed_email', []);
+        missingReasons.get('malformed_email')!.push(email);
+      } else {
+        if (!missingReasons.has('not_in_mailerlite')) missingReasons.set('not_in_mailerlite', []);
+        missingReasons.get('not_in_mailerlite')!.push(email);
+      }
+    }
     
     if (isIncomplete) {
       incompleteCount++;
@@ -369,7 +392,7 @@ async function createShadowsBulk(
     console.log(`⚠️  ${incompleteCount} incomplete shadows (missing data from one source)`);
   }
   
-  return { created, errors: errors.length, incomplete: incompleteCount };
+  return { created, errors: errors.length, incomplete: incompleteCount, missingReasons };
 }
 
 // Main bulk backfill function with validation
@@ -456,6 +479,7 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
     let totalCreated = 0;
     let totalErrors = 0;
     let totalIncomplete = 0;
+    const allMissingReasons = new Map<string, string[]>(); // Aggregate missing reasons across batches
 
     for (let batchNum = 0; batchNum < totalBatches; batchNum++) {
       const batchStart = batchNum * PROCESS_BATCH_SIZE;
@@ -498,7 +522,7 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
 
       // Create shadows
       console.log(`💾 Creating ${batch.length} shadows...`);
-      const { created, errors, incomplete } = await createShadowsBulk(
+      const { created, errors, incomplete, missingReasons } = await createShadowsBulk(
         supabase,
         batch,
         clientsMap,
@@ -508,6 +532,14 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
       totalCreated += created;
       totalErrors += errors;
       totalIncomplete += incomplete;
+      
+      // Aggregate missing reasons
+      for (const [reason, emails] of missingReasons.entries()) {
+        if (!allMissingReasons.has(reason)) {
+          allMissingReasons.set(reason, []);
+        }
+        allMissingReasons.get(reason)!.push(...emails);
+      }
 
       console.log(`✅ Batch ${batchNum + 1} complete: ${created} created, ${incomplete} incomplete, ${errors} errors`);
 
@@ -522,7 +554,7 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
       }
     }
 
-    // Step 5: VALIDATION - Verify all crosswalks have shadows
+    // Step 5: VALIDATION - Verify all crosswalks have shadows (SOFT WARNING APPROACH)
     console.log('\n🔍 Step 5: Validating backfill completeness...');
     
     const { data: finalShadows } = await supabase
@@ -538,42 +570,71 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
     );
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    const completionRate = ((finalShadowEmails.size / allCrosswalks.length) * 100).toFixed(1);
     
-    if (stillMissing.length === 0) {
+    // Build detailed breakdown of missing reasons
+    const missingBreakdown: Record<string, number> = {};
+    const sampleMissingEmails: string[] = [];
+    
+    for (const [reason, emails] of allMissingReasons.entries()) {
+      missingBreakdown[reason] = emails.length;
+      // Add sample emails from this category (max 5)
+      sampleMissingEmails.push(...emails.slice(0, 5));
+    }
+    
+    // Limit sample emails to 20 total
+    const limitedSampleEmails = sampleMissingEmails.slice(0, 20);
+    
+    if (stillMissing.length === 0 && totalIncomplete === 0) {
+      // Perfect 100% completion
       console.log(`\n🎉 BACKFILL COMPLETE & VALIDATED!`);
       console.log(`📊 Created ${totalCreated} new shadows`);
       console.log(`📊 Total shadows: ${finalShadowEmails.size}/${allCrosswalks.length} (100%)`);
       console.log(`⏱️  Duration: ${duration}s`);
-      console.log(`⚠️  Incomplete: ${totalIncomplete}`);
-      console.log(`❌ Errors: ${totalErrors}`);
 
       await updateSyncStatus(supabase, {
         status: 'completed',
         phase: 'Completed and validated',
         shadowsCreated: finalShadowEmails.size,
+        completionRate: '100%',
         errors: totalErrors,
         completedAt: new Date().toISOString()
       });
     } else {
-      const completionRate = ((finalShadowEmails.size / allCrosswalks.length) * 100).toFixed(1);
-      console.log(`\n⚠️  BACKFILL INCOMPLETE!`);
+      // Completed with warnings (soft failure - job succeeded but with incomplete data)
+      console.log(`\n✅ BACKFILL COMPLETED WITH WARNINGS`);
       console.log(`📊 Created ${totalCreated} new shadows`);
       console.log(`📊 Total shadows: ${finalShadowEmails.size}/${allCrosswalks.length} (${completionRate}%)`);
-      console.log(`❌ Still missing: ${stillMissing.length} shadows`);
+      console.log(`⚠️  Incomplete shadows: ${totalIncomplete} (missing data from one source)`);
+      console.log(`❌ Still missing: ${stillMissing.length} shadows (no data from either source)`);
       console.log(`⏱️  Duration: ${duration}s`);
-
-      // Log sample of missing emails for debugging
-      console.log(`📋 Sample missing emails:`, stillMissing.slice(0, 10).map((c: any) => c.email));
+      
+      // Log breakdown of missing reasons
+      console.log(`\n📋 Missing Shadow Breakdown:`);
+      for (const [reason, count] of Object.entries(missingBreakdown)) {
+        console.log(`   - ${reason}: ${count}`);
+      }
+      
+      // Log sample of problematic emails
+      if (limitedSampleEmails.length > 0) {
+        console.log(`\n📧 Sample problematic emails (${limitedSampleEmails.length}):`, limitedSampleEmails);
+      }
 
       await updateSyncStatus(supabase, {
-        status: 'incomplete',
-        phase: `Incomplete - ${stillMissing.length} shadows missing`,
+        status: 'completed_with_warnings',
+        phase: `Completed with ${totalIncomplete} incomplete and ${stillMissing.length} missing`,
         shadowsCreated: finalShadowEmails.size,
-        errors: totalErrors + stillMissing.length,
-        pauseReason: `Failed to create ${stillMissing.length} shadows. Re-run backfill to retry.`
+        completionRate: `${completionRate}%`,
+        incompleteCount: totalIncomplete,
+        missingCount: stillMissing.length,
+        missingBreakdown,
+        sampleMissingEmails: limitedSampleEmails,
+        errors: totalErrors,
+        completedAt: new Date().toISOString()
       });
       
-      throw new Error(`Backfill incomplete: ${stillMissing.length} shadows still missing`);
+      // DO NOT THROW - Allow backfill to complete successfully with warnings
+      console.log(`\n✅ Backfill job completed. Review warnings above for data quality issues.`);
     }
 
   } catch (error) {
