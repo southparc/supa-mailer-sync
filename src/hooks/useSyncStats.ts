@@ -110,10 +110,12 @@ export function useSyncStats() {
         },
       });
 
+      // Sync Coverage should be based on crosswalk count (clients that should have shadows)
+      // not total clients count
       setSyncPercentage({
-        percentage: totalClients > 0 ? Math.round((shadowCount / totalClients) * 100) : 0,
+        percentage: crosswalkCount > 0 ? Math.round((shadowCount / crosswalkCount) * 100) : 0,
         clientsWithShadow: shadowCount,
-        totalClients,
+        totalClients: crosswalkCount, // This represents clients in crosswalk
       });
     } catch (error) {
       console.error('Error loading sync stats:', error);

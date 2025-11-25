@@ -632,7 +632,7 @@ const EnterpriseSyncDashboard: React.FC = () => {
             <div className="flex-1 min-w-0">
               <p className="text-xs font-medium text-muted-foreground">Sync Coverage</p>
               <p className="text-lg font-bold">{stats.shadowCount.toLocaleString()}</p>
-              <p className="text-xs text-muted-foreground truncate">of {stats.totalClients.toLocaleString()}</p>
+              <p className="text-xs text-muted-foreground truncate">of {stats.crosswalkCount.toLocaleString()}</p>
             </div>
           </CardContent>
         </Card>
