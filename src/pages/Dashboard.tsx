@@ -12,6 +12,7 @@ import { AdvisorsManagement } from "@/components/AdvisorsManagement";
 import SmartSyncDashboard from "@/components/SmartSyncDashboard";
 import EnterpriseSyncDashboard from "@/components/EnterpriseSyncDashboard";
 import { MonitoringDashboard } from "@/components/MonitoringDashboard";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { LogOut, RefreshCw, AlertTriangle, Users, Database } from "lucide-react";
 
 interface DashboardStats {
@@ -272,33 +273,43 @@ export default function Dashboard() {
           </TabsList>
 
           <TabsContent value="enterprise-sync" className="space-y-6">
-            <EnterpriseSyncDashboard />
+            <ErrorBoundary fallbackTitle="Enterprise Sync Error">
+              <EnterpriseSyncDashboard />
+            </ErrorBoundary>
           </TabsContent>
 
           <TabsContent value="smart-sync" className="space-y-6">
-            <SmartSyncDashboard />
+            <ErrorBoundary fallbackTitle="Smart Sync Error">
+              <SmartSyncDashboard />
+            </ErrorBoundary>
           </TabsContent>
 
           <TabsContent value="monitoring" className="space-y-6">
-            <MonitoringDashboard />
+            <ErrorBoundary fallbackTitle="Monitoring Dashboard Error">
+              <MonitoringDashboard />
+            </ErrorBoundary>
           </TabsContent>
 
           <TabsContent value="advisors" className="space-y-6">
-            <AdvisorsManagement />
+            <ErrorBoundary fallbackTitle="Advisors Management Error">
+              <AdvisorsManagement />
+            </ErrorBoundary>
           </TabsContent>
 
           <TabsContent value="logs" className="space-y-6">
-            <Card>
-              <CardHeader>
-                <CardTitle>Synchronization Logs</CardTitle>
-                <CardDescription>
-                  View detailed logs of synchronization activities
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <SyncLogs />
-              </CardContent>
-            </Card>
+            <ErrorBoundary fallbackTitle="Sync Logs Error">
+              <Card>
+                <CardHeader>
+                  <CardTitle>Synchronization Logs</CardTitle>
+                  <CardDescription>
+                    View detailed logs of synchronization activities
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <SyncLogs />
+                </CardContent>
+              </Card>
+            </ErrorBoundary>
           </TabsContent>
         </Tabs>
       </main>
