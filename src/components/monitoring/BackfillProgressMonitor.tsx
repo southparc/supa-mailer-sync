@@ -143,7 +143,7 @@ export const BackfillProgressMonitor: React.FC = () => {
             <CardTitle>Backfill Progress</CardTitle>
           </div>
           <Badge variant={isRunning ? "default" : isCompleted ? "secondary" : "destructive"}>
-            {status.status.toUpperCase()}
+            {status.status?.toUpperCase() || 'UNKNOWN'}
           </Badge>
         </div>
         <CardDescription>
