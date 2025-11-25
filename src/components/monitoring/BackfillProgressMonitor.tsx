@@ -1,9 +1,9 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { supabase } from "@/integrations/supabase/client";
-import { Database, CloudCog, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
+import { Database, CloudCog, CheckCircle2, AlertCircle, Loader2, Zap, Clock } from 'lucide-react';
 
 interface BackfillStatus {
   status: 'idle' | 'running' | 'completed' | 'failed';
@@ -20,6 +20,11 @@ interface BackfillStatus {
 export const BackfillProgressMonitor: React.FC = () => {
   const [status, setStatus] = useState<BackfillStatus | null>(null);
   const [loading, setLoading] = useState(true);
+  const [rate, setRate] = useState<number>(0);
+  const [eta, setEta] = useState<string>('');
+  
+  const prevShadowsRef = useRef<number>(0);
+  const prevTimestampRef = useRef<number>(Date.now());
 
   const fetchBackfillStatus = async () => {
     try {
@@ -32,7 +37,41 @@ export const BackfillProgressMonitor: React.FC = () => {
       if (error) throw error;
       
       if (data?.value) {
-        setStatus(data.value as unknown as BackfillStatus);
+        const newStatus = data.value as unknown as BackfillStatus;
+        setStatus(newStatus);
+        
+        // Calculate rate and ETA if backfill is running
+        if (newStatus.status === 'running' && newStatus.shadowsCreated !== undefined) {
+          const now = Date.now();
+          const timeDiff = (now - prevTimestampRef.current) / 1000; // seconds
+          const shadowsDiff = newStatus.shadowsCreated - prevShadowsRef.current;
+          
+          if (timeDiff > 0 && shadowsDiff > 0) {
+            const currentRate = shadowsDiff / timeDiff;
+            setRate(currentRate);
+            
+            // Calculate ETA
+            if (newStatus.totalCrosswalks) {
+              const remaining = newStatus.totalCrosswalks - newStatus.shadowsCreated;
+              const secondsRemaining = remaining / currentRate;
+              
+              if (secondsRemaining < 60) {
+                setEta(`${Math.round(secondsRemaining)}s`);
+              } else if (secondsRemaining < 3600) {
+                const minutes = Math.floor(secondsRemaining / 60);
+                const seconds = Math.round(secondsRemaining % 60);
+                setEta(`${minutes}m ${seconds}s`);
+              } else {
+                const hours = Math.floor(secondsRemaining / 3600);
+                const minutes = Math.floor((secondsRemaining % 3600) / 60);
+                setEta(`${hours}h ${minutes}m`);
+              }
+            }
+          }
+          
+          prevShadowsRef.current = newStatus.shadowsCreated;
+          prevTimestampRef.current = now;
+        }
       }
     } catch (error) {
       console.error('Error fetching backfill status:', error);
@@ -122,7 +161,7 @@ export const BackfillProgressMonitor: React.FC = () => {
         </div>
 
         {/* Statistics Grid */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
           {status.batchNumber !== undefined && status.totalBatches !== undefined && (
             <div className="space-y-1">
               <div className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -167,6 +206,30 @@ export const BackfillProgressMonitor: React.FC = () => {
               </div>
               <div className="text-2xl font-bold text-muted-foreground">
                 {(status.totalCrosswalks - status.shadowsCreated).toLocaleString()}
+              </div>
+            </div>
+          )}
+
+          {isRunning && rate > 0 && (
+            <div className="space-y-1">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Zap className="h-3 w-3" />
+                Rate
+              </div>
+              <div className="text-2xl font-bold text-green-500">
+                {rate.toFixed(1)}/s
+              </div>
+            </div>
+          )}
+
+          {isRunning && eta && (
+            <div className="space-y-1">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Clock className="h-3 w-3" />
+                ETA
+              </div>
+              <div className="text-2xl font-bold text-blue-500">
+                {eta}
               </div>
             </div>
           )}
