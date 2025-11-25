@@ -27,6 +27,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [isAdmin, setIsAdmin] = useState(false);
   const [checkingAdmin, setCheckingAdmin] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [stats, setStats] = useState<DashboardStats>({
     totalClients: 0,
     totalGroups: 0,
@@ -101,6 +102,8 @@ export default function Dashboard() {
 
   const loadDashboardStats = async () => {
     try {
+      setRefreshing(true);
+      
       // Load stats from available tables
       const [clientsResult, groupsResult, conflictsResult] = await Promise.all([
         supabase.from('clients').select('id', { count: 'exact' }),
@@ -122,6 +125,11 @@ export default function Dashboard() {
         pendingConflicts: conflictsResult.count || 0,
         lastSyncAt: lastSync?.created_at || null
       });
+      
+      toast({
+        title: "Stats Refreshed",
+        description: "Dashboard statistics have been updated",
+      });
     } catch (error) {
       console.error('Error loading dashboard stats:', error);
       // Set defaults on error to prevent broken UI
@@ -131,6 +139,14 @@ export default function Dashboard() {
         pendingConflicts: 0,
         lastSyncAt: null
       });
+      
+      toast({
+        title: "Refresh Failed",
+        description: "Failed to load dashboard statistics",
+        variant: "destructive",
+      });
+    } finally {
+      setRefreshing(false);
     }
   };
 
@@ -176,7 +192,17 @@ export default function Dashboard() {
             <h1 className="text-2xl font-bold">MailerLite Sync Dashboard</h1>
             <p className="text-muted-foreground">Manage data synchronization between MailerLite and Supabase</p>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            <Button 
+              variant="ghost" 
+              size="sm" 
+              onClick={loadDashboardStats}
+              disabled={refreshing}
+              className="gap-2"
+            >
+              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+              {refreshing ? 'Refreshing...' : 'Refresh'}
+            </Button>
             <Badge variant="outline">{user.email}</Badge>
             <Button variant="outline" size="sm" onClick={handleSignOut}>
               <LogOut className="h-4 w-4 mr-2" />
