@@ -11,6 +11,7 @@ import { DataQualityDashboard } from './monitoring/DataQualityDashboard';
 import { Activity } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { useSyncStats } from '@/hooks/useSyncStats';
+import { ErrorBoundary } from './ErrorBoundary';
 
 export const MonitoringDashboard: React.FC = () => {
   const [isBackfillRunning, setIsBackfillRunning] = useState(false);
@@ -74,30 +75,38 @@ export const MonitoringDashboard: React.FC = () => {
     <div className="space-y-6">
       {/* Backfill Controls */}
       <div className="flex justify-end">
-        <BackfillTriggerButton />
+        <ErrorBoundary fallbackTitle="Backfill Controls Error">
+          <BackfillTriggerButton />
+        </ErrorBoundary>
       </div>
 
       {/* Backfill Progress Monitor - Shows when active */}
-      <BackfillProgressMonitor />
+      <ErrorBoundary fallbackTitle="Backfill Progress Error">
+        <BackfillProgressMonitor />
+      </ErrorBoundary>
       
       {/* Stall Detection Alerts - Always visible at top */}
-      <StallDetectionAlerts />
+      <ErrorBoundary fallbackTitle="Stall Detection Error">
+        <StallDetectionAlerts />
+      </ErrorBoundary>
 
       {/* Health Indicators */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center gap-2">
-            <Activity className="h-5 w-5 text-primary" />
-            <CardTitle>Sync Health Overview</CardTitle>
-          </div>
-          <CardDescription>
-            Real-time status of all synchronization operations {isBackfillRunning && '• Auto-refreshing every 5s'}
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <SyncHealthIndicators />
-        </CardContent>
-      </Card>
+      <ErrorBoundary fallbackTitle="Health Indicators Error">
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Activity className="h-5 w-5 text-primary" />
+              <CardTitle>Sync Health Overview</CardTitle>
+            </div>
+            <CardDescription>
+              Real-time status of all synchronization operations {isBackfillRunning && '• Auto-refreshing every 5s'}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <SyncHealthIndicators />
+          </CardContent>
+        </Card>
+      </ErrorBoundary>
 
       {/* Detailed Monitoring Tabs */}
       <Tabs defaultValue="data-quality" className="space-y-4">
@@ -108,15 +117,21 @@ export const MonitoringDashboard: React.FC = () => {
         </TabsList>
 
         <TabsContent value="data-quality" className="space-y-4">
-          <DataQualityDashboard />
+          <ErrorBoundary fallbackTitle="Data Quality Dashboard Error">
+            <DataQualityDashboard />
+          </ErrorBoundary>
         </TabsContent>
 
         <TabsContent value="performance" className="space-y-4">
-          <PerformanceMetrics />
+          <ErrorBoundary fallbackTitle="Performance Metrics Error">
+            <PerformanceMetrics />
+          </ErrorBoundary>
         </TabsContent>
 
         <TabsContent value="logs" className="space-y-4">
-          <StructuredLogsViewer />
+          <ErrorBoundary fallbackTitle="Logs Viewer Error">
+            <StructuredLogsViewer />
+          </ErrorBoundary>
         </TabsContent>
       </Tabs>
     </div>
