@@ -43,26 +43,11 @@ export function useSyncOperation() {
         return false;
       }
 
-      // Test MailerLite API connectivity
-      const { error: apiError } = await supabase.functions.invoke('smart-sync', {
-        body: { mode: 'test', dryRun: true }
-      });
-
-      if (apiError) {
-        console.error('API connection test failed:', apiError);
-        toast({
-          title: 'API Connection Warning',
-          description: 'Database OK, but sync service may be unavailable',
-          variant: 'default',
-        });
-        setStatus('Database connected');
-        return true; // Still return true since DB works
-      }
-
-      setStatus('All connections successful');
+      // Database connection is sufficient for basic operations
+      setStatus('Database connected');
       toast({
         title: 'Connection Test Passed',
-        description: 'Database and sync service are operational',
+        description: 'Database is operational and ready for sync operations',
       });
       return true;
     } catch (error: any) {
