@@ -70,6 +70,55 @@ class TokenBucket {
 
 const rateLimiter = new TokenBucket(120, 60000);
 
+// Fetch all rows from a table with pagination (Supabase has 1000-row default limit)
+async function fetchAllRows(
+  supabase: any,
+  table: string,
+  columns: string,
+  filter?: { column: string; value: any }
+): Promise<any[]> {
+  const PAGE_SIZE = 5000; // Fetch 5000 at a time for efficiency
+  let allData: any[] = [];
+  let offset = 0;
+  let hasMore = true;
+  
+  console.log(`📥 Fetching all rows from ${table}...`);
+  
+  while (hasMore) {
+    let query = supabase
+      .from(table)
+      .select(columns)
+      .range(offset, offset + PAGE_SIZE - 1);
+    
+    if (filter) {
+      query = query.eq(filter.column, filter.value);
+    }
+    
+    const { data, error } = await query;
+    
+    if (error) {
+      throw new Error(`Failed to fetch ${table}: ${error.message}`);
+    }
+    
+    if (!data || data.length === 0) {
+      hasMore = false;
+      break;
+    }
+    
+    allData = allData.concat(data);
+    
+    if (data.length < PAGE_SIZE) {
+      hasMore = false;
+    } else {
+      offset += PAGE_SIZE;
+      console.log(`   ... fetched ${allData.length} rows so far`);
+    }
+  }
+  
+  console.log(`✅ Fetched ${allData.length} total rows from ${table}`);
+  return allData;
+}
+
 // Admin verification
 async function verifyAdmin(req: Request, supabase: any): Promise<{ userId: string | null, error: Response | null }> {
   const authHeader = req.headers.get('Authorization');
@@ -416,13 +465,7 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
     // Step 1: Get all crosswalks that need shadows
     console.log('📊 Step 1: Fetching all crosswalks...');
     
-    const { data: allCrosswalks, error: crosswalkError } = await supabase
-      .from('integration_crosswalk')
-      .select('email, a_id, b_id');
-
-    if (crosswalkError) {
-      throw new Error(`Failed to fetch crosswalks: ${crosswalkError.message}`);
-    }
+    const allCrosswalks = await fetchAllRows(supabase, 'integration_crosswalk', 'email, a_id, b_id');
 
     if (!allCrosswalks || allCrosswalks.length === 0) {
       console.log('✅ No crosswalks found');
@@ -438,9 +481,7 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
 
     // Step 2: Get existing shadows to avoid duplicates
     console.log('📊 Step 2: Fetching existing shadows...');
-    const { data: existingShadows } = await supabase
-      .from('sync_shadow')
-      .select('email');
+    const existingShadows = await fetchAllRows(supabase, 'sync_shadow', 'email');
 
     const existingShadowEmails = new Set(
       (existingShadows || []).map((s: any) => s.email.toLowerCase().trim())
@@ -557,9 +598,7 @@ async function runBulkBackfill(supabase: any, mailerLiteApiKey: string): Promise
     // Step 5: VALIDATION - Verify all crosswalks have shadows (SOFT WARNING APPROACH)
     console.log('\n🔍 Step 5: Validating backfill completeness...');
     
-    const { data: finalShadows } = await supabase
-      .from('sync_shadow')
-      .select('email');
+    const finalShadows = await fetchAllRows(supabase, 'sync_shadow', 'email');
     
     const finalShadowEmails = new Set(
       (finalShadows || []).map((s: any) => s.email.toLowerCase().trim())
