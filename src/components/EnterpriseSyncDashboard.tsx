@@ -687,7 +687,30 @@ const EnterpriseSyncDashboard: React.FC = () => {
               </RadialBarChart>
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-muted-foreground">Data Quality</p>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <p className="text-xs font-medium text-muted-foreground flex items-center gap-1 cursor-help">
+                      Data Quality
+                      <Info className="h-3 w-3" />
+                    </p>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-xs">
+                    <p className="font-semibold mb-1">What is Data Quality?</p>
+                    <p className="text-xs mb-2">
+                      Measures the completeness of shadow records. The percentage represents shadows with complete MailerLite data.
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      <strong>Why incomplete?</strong><br/>
+                      • Missing MailerLite ID (no_b_id)<br/>
+                      • Client not found in MailerLite<br/>
+                      • Malformed or invalid email addresses<br/>
+                      • API errors during data fetch<br/>
+                      • Placeholder shadows awaiting sync
+                    </p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
               <p className="text-lg font-bold">{stats.incompleteShadows}</p>
               <p className="text-xs text-muted-foreground">incomplete</p>
             </div>
@@ -699,7 +722,30 @@ const EnterpriseSyncDashboard: React.FC = () => {
           <CardContent className="pt-3">
             <div className="flex items-center gap-2 mb-1">
               <AlertCircle className="h-4 w-4 text-muted-foreground" />
-              <p className="text-xs font-medium text-muted-foreground">Conflicts</p>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <p className="text-xs font-medium text-muted-foreground flex items-center gap-1 cursor-help">
+                      Conflicts
+                      <Info className="h-3 w-3" />
+                    </p>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-xs">
+                    <p className="font-semibold mb-1">What are Conflicts?</p>
+                    <p className="text-xs mb-2">
+                      Conflicts occur when the same field has different values in Supabase and MailerLite, requiring manual resolution.
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      <strong>Common causes:</strong><br/>
+                      • Concurrent updates in both systems<br/>
+                      • Different data formats or encodings<br/>
+                      • Manual edits during sync operations<br/>
+                      • Group membership changes<br/>
+                      • Email address discrepancies
+                    </p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             </div>
             <p className="text-2xl font-bold">{stats.conflictCount}</p>
             <p className="text-xs text-muted-foreground">pending</p>
