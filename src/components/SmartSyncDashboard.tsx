@@ -9,6 +9,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, ArrowRight, ArrowLeft, ArrowLeftRight, AlertCircle, Eye, AlertTriangle } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
+import { SyncProgressIndicator } from "@/components/monitoring/SyncProgressIndicator";
 
 type SyncMode = "AtoB" | "BtoA" | "bidirectional" | "full";
 
@@ -241,6 +242,9 @@ setResp({ ...data, out: normalizeOut(data.out) });
 
   return (
     <div className="space-y-6 max-w-5xl mx-auto p-6">
+      {/* Sync Progress Indicator */}
+      <SyncProgressIndicator />
+      
       {hasDuplicates && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />

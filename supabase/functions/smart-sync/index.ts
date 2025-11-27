@@ -547,6 +547,33 @@ function shouldUseIncrementalSync(lastSync: { timestamp: string | null; syncedAt
 }
 
 /**
+ * Update sync status in sync_state table for UI tracking
+ */
+async function updateSyncStatus(status: 'idle' | 'running' | 'paused' | 'completed' | 'error', message?: string): Promise<void> {
+  try {
+    const { error } = await supabase
+      .from('sync_state')
+      .upsert({
+        key: 'sync_status',
+        value: {
+          status,
+          message,
+          timestamp: new Date().toISOString()
+        },
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'key' });
+    
+    if (error) {
+      console.error('Failed to update sync status:', error);
+    } else {
+      console.log(`✅ Updated sync status: ${status}`);
+    }
+  } catch (err) {
+    console.error('Error updating sync status:', err);
+  }
+}
+
+/**
  * Clean up old sync logs to prevent database bloat
  */
 async function cleanupOldLogs(): Promise<void> {
@@ -2256,6 +2283,11 @@ serve(async (req) => {
     
     console.log('🛡️ All resource checks passed, proceeding with sync\n');
     
+    // Set sync status to running
+    if (batch || mode === 'full') {
+      await updateSyncStatus('running', `Starting ${mode} sync in ${batch ? 'batch' : 'full'} mode`);
+    }
+    
     const out = await run(mode as SyncMode, emails, repair, dryRun, batch, { maxItems, timeBudgetMs, minRemaining });
     
     // Always persist state after any run (batch or non-batch)
@@ -2273,6 +2305,15 @@ serve(async (req) => {
         };
         await saveSyncStatistics(stats);
         await calculateAndSaveSyncPercentage();
+        
+        // Set status to completed for non-batch syncs
+        await updateSyncStatus('completed', `Processed ${out.length} records`);
+      } else if (out.ok && out.done) {
+        // Batch sync completed successfully
+        await updateSyncStatus('completed', 'Sync completed successfully');
+      } else if (out.ok && out.paused) {
+        // Batch sync paused (will resume)
+        await updateSyncStatus('paused', out.message || `Paused: ${out.paused}`);
       }
       // For batch runs, stats are already saved inside runFullSyncBatch
     }
@@ -2292,6 +2333,10 @@ serve(async (req) => {
     );
   } catch (e) {
     console.error("Smart-sync error:", e);
+    
+    // Set error status
+    await updateSyncStatus('error', e instanceof Error ? e.message : String(e));
+    
     return new Response(
       JSON.stringify({ ok: false, error: String(e), message: e instanceof Error ? e.message : String(e) }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
