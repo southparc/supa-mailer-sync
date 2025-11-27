@@ -40,6 +40,7 @@ import { SyncButton } from "./SyncButton";
 import EnterpriseConflictResolution from './EnterpriseConflictResolution';
 import { RateLimitStatus } from './RateLimitStatus';
 import { DiagnosticMissingShadows } from './DiagnosticMissingShadows';
+import { SyncProgressIndicator } from './monitoring/SyncProgressIndicator';
 
 interface Duplicate {
   name: string;
@@ -461,6 +462,9 @@ const EnterpriseSyncDashboard: React.FC = () => {
 
   return (
     <div className="space-y-3">
+      {/* Sync Progress Indicator */}
+      <SyncProgressIndicator />
+      
       {/* Duplicate Advisors Warning */}
       {duplicates.length > 0 && (
         <Alert variant="destructive" className="py-2">
