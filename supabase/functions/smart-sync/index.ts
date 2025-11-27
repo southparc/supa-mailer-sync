@@ -123,6 +123,13 @@ const MAX_DAILY_SYNC_RECORDS = 5000; // Max records to process per 24h period
 const LOG_RETENTION_DAYS = 7; // Keep logs for 7 days only
 const SHADOW_CLEANUP_DAYS = 30; // Clean up old shadow states after 30 days
 
+// Timeout protection constants
+const EDGE_FUNCTION_TIMEOUT_MS = 150000; // Edge Functions timeout at ~150s
+const TIMEOUT_SAFETY_BUFFER_MS = 30000; // Save state 30s before timeout
+const SOFT_TIMEOUT_MS = EDGE_FUNCTION_TIMEOUT_MS - TIMEOUT_SAFETY_BUFFER_MS; // 120s
+const MIN_TIME_PER_RECORD_MS = 200; // Minimum estimated time per record
+const TIME_CHECK_INTERVAL = 5; // Check timeout every N records
+
 const supabase = createClient(SB_URL, SB_KEY, { 
   auth: { persistSession: false },
   global: { headers: { 'x-client-info': 'smart-sync' } }
@@ -738,20 +745,47 @@ async function retryFetch(url: string, init: RequestInit, tries = 8, dryRun = fa
 }
 
 /**
- * Calculate optimal batch size based on available rate limit tokens
+ * Calculate optimal batch size based on available rate limit tokens and time remaining
  */
-function calculateOptimalBatchSize(operation: 'AtoB' | 'BtoA'): number {
+function calculateOptimalBatchSize(operation: 'AtoB' | 'BtoA', timeRemainingMs?: number): number {
   const availableTokens = mlRateLimiter.getAvailable();
   
+  // Calculate token-based limit
+  let tokenBasedLimit: number;
   if (operation === 'AtoB') {
     // A→B: 1-2 API calls per email (update subscriber + maybe groups)
     // Leave 30% buffer for retries and other calls
-    return Math.max(5, Math.floor(availableTokens * 0.7 / 2));
+    tokenBasedLimit = Math.max(5, Math.floor(availableTokens * 0.7 / 2));
   } else {
     // B→A: 1 API call per email (fetch subscriber)
     // Leave 30% buffer
-    return Math.max(5, Math.floor(availableTokens * 0.7));
+    tokenBasedLimit = Math.max(5, Math.floor(availableTokens * 0.7));
   }
+  
+  // If time remaining provided, also consider time-based limit
+  if (timeRemainingMs !== undefined && timeRemainingMs > 0) {
+    const timeBasedLimit = Math.floor(timeRemainingMs / MIN_TIME_PER_RECORD_MS);
+    const limit = Math.min(tokenBasedLimit, timeBasedLimit);
+    console.log(`📊 Batch size calculation: token-based=${tokenBasedLimit}, time-based=${timeBasedLimit}, final=${limit}`);
+    return Math.max(1, limit); // Always process at least 1
+  }
+  
+  return tokenBasedLimit;
+}
+
+/**
+ * Check if we're approaching timeout and should save state
+ */
+function shouldSaveAndExit(startTimeMs: number): { shouldExit: boolean; timeRemaining: number } {
+  const elapsed = Date.now() - startTimeMs;
+  const timeRemaining = SOFT_TIMEOUT_MS - elapsed;
+  const shouldExit = elapsed >= SOFT_TIMEOUT_MS;
+  
+  if (shouldExit) {
+    console.log(`⏰ Soft timeout reached: ${elapsed}ms elapsed, ${timeRemaining}ms remaining before hard timeout`);
+  }
+  
+  return { shouldExit, timeRemaining };
 }
 
 /**
@@ -1780,7 +1814,7 @@ async function runFullSyncBatch(opts: {
   minRemaining: number;
   dryRun: boolean;
 }): Promise<any> {
-  const t0 = Date.now();
+  const functionStartTime = Date.now();
   
   // Pre-flight health check
   const healthCheck = await checkDatabaseHealth();
@@ -1792,15 +1826,18 @@ async function runFullSyncBatch(opts: {
   // Get adaptive batch multiplier based on DB health
   const batchMultiplier = getAdaptiveBatchMultiplier(healthCheck.healthy);
   
-  // Adaptive batch sizing for safety (reduce resource usage)
-  const adaptiveMaxItems = Math.max(5, Math.floor(Math.min(opts.maxItems, 200) * batchMultiplier));
-  const adaptiveTimeBudget = Math.min(opts.timeBudgetMs, 45000); // Cap at 45s
+  // Smart adaptive sizing based on time remaining
+  const timeRemaining = SOFT_TIMEOUT_MS - (Date.now() - functionStartTime);
+  const maxSafeItems = Math.floor(timeRemaining / MIN_TIME_PER_RECORD_MS);
+  const adaptiveMaxItems = Math.max(5, Math.floor(Math.min(opts.maxItems, maxSafeItems, 200) * batchMultiplier));
+  const adaptiveTimeBudget = Math.min(opts.timeBudgetMs, timeRemaining - 10000); // Leave 10s buffer
   
   const tokensAvailable = mlRateLimiter.getAvailable();
   const utilization = mlRateLimiter.getUtilization();
   
   console.log(`🔧 Adaptive limits: maxItems=${adaptiveMaxItems}/${opts.maxItems} (multiplier: ${batchMultiplier.toFixed(2)}), timeBudget=${adaptiveTimeBudget}ms`);
   console.log(`🪣 Rate limit status: ${Math.floor(tokensAvailable)}/${MAILERLITE_RATE_LIMIT} tokens available (${utilization.toFixed(1)}% utilized)`);
+  console.log(`⏱️  Timeout protection: ${timeRemaining}ms remaining before soft timeout, can safely process ~${maxSafeItems} items`);
   
   let st = await getFullState();
 
@@ -1869,16 +1906,44 @@ async function runFullSyncBatch(opts: {
     const list: string[] = st[phase] ?? [];
     let processed = 0;
     
-    // Calculate optimal batch size for this phase based on operation type
+    // Calculate time remaining for this batch
+    const timeRemainingForBatch = SOFT_TIMEOUT_MS - (Date.now() - functionStartTime);
+    
+    // Calculate optimal batch size for this phase based on operation type and time
     const operationType = phase === 'onlyInSB' ? 'AtoB' : 'BtoA';
-    const optimalBatchSize = calculateOptimalBatchSize(operationType);
+    const optimalBatchSize = calculateOptimalBatchSize(operationType, timeRemainingForBatch);
     const finalBatchSize = Math.min(adaptiveMaxItems, optimalBatchSize);
     
     console.log(`\n🟢 Processing phase: ${phase} (${list.length - st.idx} remaining)`);
     console.log(`📊 Rate limit budget: ${Math.floor(mlRateLimiter.getAvailable())} tokens, processing up to ${finalBatchSize} items`);
+    console.log(`⏱️  Time remaining: ${Math.floor(timeRemainingForBatch / 1000)}s`);
+
+    const batchStartTime = Date.now();
 
     for (let i = st.idx; i < list.length; i++) {
       const email = list[i];
+
+      // Stop condition 0: Timeout protection (check every N records)
+      if (processed > 0 && processed % TIME_CHECK_INTERVAL === 0) {
+        const timeCheck = shouldSaveAndExit(functionStartTime);
+        if (timeCheck.shouldExit) {
+          st.idx = i;
+          st.last_save_reason = 'timeout-protection';
+          st.elapsed_ms = Date.now() - functionStartTime;
+          await putFullState(st);
+          console.log(`⏰ Timeout protection triggered: saving state and exiting gracefully`);
+          return {
+            ok: true,
+            paused: 'timeout-approaching',
+            phase,
+            idx: i,
+            processed,
+            timeElapsed: st.elapsed_ms,
+            timeRemaining: timeCheck.timeRemaining,
+            message: 'Approaching timeout - saved state for resume'
+          };
+        }
+      }
 
       // Stop condition 1: Proactive rate limit pause (BEFORE hitting limit)
       const tokensLeft = mlRateLimiter.getAvailable();
@@ -1887,6 +1952,7 @@ async function runFullSyncBatch(opts: {
         const nextRunMs = 60000; // Resume in 1 minute when tokens refill
         st.idx = i;
         st.next_run_at = new Date(Date.now() + nextRunMs).toISOString();
+        st.last_save_reason = 'rate-limit';
         await putFullState(st);
         console.log(`⏸️ Rate limit budget low (${Math.floor(tokensLeft)} tokens), pausing until ${st.next_run_at}`);
         return { 
@@ -1905,6 +1971,7 @@ async function runFullSyncBatch(opts: {
         const quota = await checkDailyQuota();
         if (!quota.allowed || quota.remaining < 100) {
           st.idx = i;
+          st.last_save_reason = 'quota-exhausted';
           await putFullState(st);
           console.log(`⏸️ Daily quota exhausted: ${quota.processed}/${MAX_DAILY_SYNC_RECORDS} - pausing sync`);
           return { 
@@ -1919,11 +1986,12 @@ async function runFullSyncBatch(opts: {
       }
 
       // Stop condition 3: Batch limits (time/items/rate budget)
-      const elapsed = Date.now() - t0;
-      if (processed >= finalBatchSize || elapsed > adaptiveTimeBudget) {
+      const batchElapsed = Date.now() - batchStartTime;
+      if (processed >= finalBatchSize || batchElapsed > adaptiveTimeBudget) {
         st.idx = i;
+        st.last_save_reason = 'batch-limit';
         await putFullState(st);
-        console.log(`⏸️ Batch limit reached: processed=${processed}/${finalBatchSize}, elapsed=${elapsed}ms, tokens left: ${Math.floor(mlRateLimiter.getAvailable())}`);
+        console.log(`⏸️ Batch limit reached: processed=${processed}/${finalBatchSize}, elapsed=${batchElapsed}ms, tokens left: ${Math.floor(mlRateLimiter.getAvailable())}`);
         return { ok: true, paused: 'batch-limit', phase, idx: i, processed };
       }
 
@@ -1955,11 +2023,13 @@ async function runFullSyncBatch(opts: {
 
       processed++;
       
-      // Log rate limit status every 10 records
+      // Log rate limit status and progress every 10 records
       if (processed % 10 === 0) {
         const currentTokens = mlRateLimiter.getAvailable();
         const currentUtil = mlRateLimiter.getUtilization();
-        console.log(`  📊 Progress: ${processed} items | Tokens: ${Math.floor(currentTokens)}/${MAILERLITE_RATE_LIMIT} (${currentUtil.toFixed(1)}% used)`);
+        const elapsedSinceStart = Date.now() - functionStartTime;
+        const remainingTime = SOFT_TIMEOUT_MS - elapsedSinceStart;
+        console.log(`  📊 Progress: ${processed} items | Tokens: ${Math.floor(currentTokens)}/${MAILERLITE_RATE_LIMIT} (${currentUtil.toFixed(1)}% used) | Time: ${Math.floor(remainingTime / 1000)}s remaining`);
       }
     }
 
@@ -2103,7 +2173,9 @@ serve(async (req) => {
       );
     }
 
+    const requestStartTime = Date.now();
     console.log(`\n🚀 Smart Sync Request: mode=${mode}, emails=${emails.length || 'all'}, repair=${repair}, dryRun=${dryRun}, batch=${batch}`);
+    console.log(`⏱️  Function started at: ${new Date(requestStartTime).toISOString()}, soft timeout in ${SOFT_TIMEOUT_MS / 1000}s`);
     
     // ─────────────────────────────────────────────────────────────────────────────
     // Restore Rate Limiter State
