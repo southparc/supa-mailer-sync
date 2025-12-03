@@ -5,6 +5,40 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Verify admin role for the authenticated user
+async function verifyAdmin(supabase: any, req: Request): Promise<{ success: boolean; error?: string; status?: number }> {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) {
+    return { success: false, error: 'Missing authorization header', status: 401 };
+  }
+
+  const token = authHeader.replace('Bearer ', '');
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+  
+  if (authError || !user) {
+    console.error('Auth error:', authError);
+    return { success: false, error: 'Invalid or expired token', status: 401 };
+  }
+
+  const { data: roleData, error: roleError } = await supabase
+    .from('user_roles')
+    .select('role')
+    .eq('user_id', user.id)
+    .eq('role', 'admin')
+    .maybeSingle();
+
+  if (roleError) {
+    console.error('Role check error:', roleError);
+    return { success: false, error: 'Error checking user role', status: 500 };
+  }
+
+  if (!roleData) {
+    return { success: false, error: 'Admin access required', status: 403 };
+  }
+
+  return { success: true };
+}
+
 // Helper: merge and upsert consolidated sync_status.backfill
 async function updateSyncStatus(supabase: any, patch: Record<string, any>) {
   const { data } = await supabase
@@ -59,17 +93,29 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const body = await req.json().catch(() => ({}));
-    const batchSize = Math.min(Math.max(Number(body.batchSize) || 1000, 100), 2000); // 100-2000
-    const dryRun = Boolean(body.dryRun);
-
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SERVICE_ROLE_KEY');
     if (!supabaseUrl || !serviceKey) {
-      return new Response(JSON.stringify({ error: 'Missing Supabase env vars' }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      return new Response(JSON.stringify({ error: 'Missing Supabase env vars' }), { 
+        status: 500, 
+        headers: { 'Content-Type': 'application/json', ...corsHeaders } 
+      });
     }
 
     const supabase = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } });
+
+    // Verify admin access before proceeding
+    const authResult = await verifyAdmin(supabase, req);
+    if (!authResult.success) {
+      return new Response(JSON.stringify({ error: authResult.error }), {
+        status: authResult.status || 403,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    const body = await req.json().catch(() => ({}));
+    const batchSize = Math.min(Math.max(Number(body.batchSize) || 1000, 100), 2000); // 100-2000
+    const dryRun = Boolean(body.dryRun);
 
     const startTime = Date.now();
     await updateSyncStatus(supabase, {
